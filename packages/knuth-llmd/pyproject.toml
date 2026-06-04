@@ -1,0 +1,15 @@
+[project]
+name = "knuth-llmd"
+version = "0.1.0"
+description = "LLM client layer for the Knuth agent framework"
+requires-python = ">=3.12"
+dependencies = [
+    "litellm>=1.87.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/knuth_llmd"]
