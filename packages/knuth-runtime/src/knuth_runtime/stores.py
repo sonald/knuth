@@ -36,8 +36,6 @@ class EventStore(Protocol):
         name: str,
         payload: dict[str, Any] | None = None,
         durability: EventDurability = EventDurability.DURABLE,
-        causation_id: str | None = None,
-        correlation_id: str | None = None,
     ) -> RuntimeEvent:
         ...
 
@@ -86,8 +84,6 @@ class MemoryEventStore:
         name: str,
         payload: dict[str, Any] | None = None,
         durability: EventDurability = EventDurability.DURABLE,
-        causation_id: str | None = None,
-        correlation_id: str | None = None,
     ) -> RuntimeEvent:
         events = self._events.setdefault(run_id, [])
         event = RuntimeEvent(
@@ -99,8 +95,6 @@ class MemoryEventStore:
             type=f"{namespace}.{name}",
             payload=payload or {},
             durability=durability,
-            causation_id=causation_id,
-            correlation_id=correlation_id,
             created_at=utc_now(),
         )
         events.append(event)
@@ -171,8 +165,6 @@ class JsonStore:
         name: str,
         payload: dict[str, Any] | None = None,
         durability: EventDurability = EventDurability.DURABLE,
-        causation_id: str | None = None,
-        correlation_id: str | None = None,
     ) -> RuntimeEvent:
         return await anyio.to_thread.run_sync(
             self._append_event,
@@ -181,8 +173,6 @@ class JsonStore:
             name,
             payload or {},
             durability,
-            causation_id,
-            correlation_id,
         )
 
     def _append_event(
@@ -192,8 +182,6 @@ class JsonStore:
         name: str,
         payload: dict[str, Any],
         durability: EventDurability,
-        causation_id: str | None,
-        correlation_id: str | None,
     ) -> RuntimeEvent:
         state = self._read_state()
         events = state.setdefault("events", {}).setdefault(run_id, [])
@@ -206,8 +194,6 @@ class JsonStore:
             type=f"{namespace}.{name}",
             payload=payload,
             durability=durability,
-            causation_id=causation_id,
-            correlation_id=correlation_id,
             created_at=utc_now(),
         )
         events.append(event.model_dump())
@@ -262,8 +248,6 @@ class SQLiteStore(MemoryRunStore, MemoryEventStore):
                   type text not null,
                   payload_json text not null,
                   durability text not null,
-                  causation_id text,
-                  correlation_id text,
                   created_at text not null,
                   unique(run_id, seq)
                 );
@@ -336,8 +320,6 @@ class SQLiteStore(MemoryRunStore, MemoryEventStore):
         name: str,
         payload: dict[str, Any] | None = None,
         durability: EventDurability = EventDurability.DURABLE,
-        causation_id: str | None = None,
-        correlation_id: str | None = None,
     ) -> RuntimeEvent:
         return await anyio.to_thread.run_sync(
             self._append_event,
@@ -346,8 +328,6 @@ class SQLiteStore(MemoryRunStore, MemoryEventStore):
             name,
             payload or {},
             durability,
-            causation_id,
-            correlation_id,
         )
 
     def _append_event(
@@ -357,8 +337,6 @@ class SQLiteStore(MemoryRunStore, MemoryEventStore):
         name: str,
         payload: dict[str, Any],
         durability: EventDurability,
-        causation_id: str | None,
-        correlation_id: str | None,
     ) -> RuntimeEvent:
         with self._connect() as conn:
             row = conn.execute(
@@ -375,12 +353,10 @@ class SQLiteStore(MemoryRunStore, MemoryEventStore):
                 type=f"{namespace}.{name}",
                 payload=payload,
                 durability=durability,
-                causation_id=causation_id,
-                correlation_id=correlation_id,
                 created_at=utc_now(),
             )
             conn.execute(
-                "insert into events values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "insert into events (id, run_id, seq, namespace, name, type, payload_json, durability, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     event.id,
                     event.run_id,
@@ -390,8 +366,6 @@ class SQLiteStore(MemoryRunStore, MemoryEventStore):
                     event.type,
                     json.dumps(event.payload),
                     event.durability.value,
-                    event.causation_id,
-                    event.correlation_id,
                     event.created_at,
                 ),
             )
@@ -403,7 +377,7 @@ class SQLiteStore(MemoryRunStore, MemoryEventStore):
         return await anyio.to_thread.run_sync(self._list_events, run_id, after_seq)
 
     def _list_events(self, run_id: str, after_seq: int | None = None) -> list[RuntimeEvent]:
-        sql = "select * from events where run_id = ?"
+        sql = "select id, run_id, seq, namespace, name, type, payload_json, durability, created_at from events where run_id = ?"
         params: tuple[Any, ...] = (run_id,)
         if after_seq is not None:
             sql += " and seq > ?"
@@ -421,9 +395,7 @@ class SQLiteStore(MemoryRunStore, MemoryEventStore):
                 type=row[5],
                 payload=json.loads(row[6]),
                 durability=EventDurability(row[7]),
-                causation_id=row[8],
-                correlation_id=row[9],
-                created_at=row[10],
+                created_at=row[8],
             )
             for row in rows
         ]

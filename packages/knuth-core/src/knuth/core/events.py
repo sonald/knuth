@@ -16,6 +16,4 @@ class RuntimeEvent(KnuthModel):
     type: str
     payload: dict[str, Any] = Field(default_factory=dict)
     durability: EventDurability = EventDurability.DURABLE
-    causation_id: str | None = None
-    correlation_id: str | None = None
     created_at: str
