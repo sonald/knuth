@@ -65,12 +65,79 @@ class InferenceClient(Protocol):
         ...
 
 
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
+
+
+def _suffix_overlap(text: str, marker: str) -> int:
+    """Longest suffix of ``text`` that is a proper prefix of ``marker``."""
+    max_k = min(len(text), len(marker) - 1)
+    for k in range(max_k, 0, -1):
+        if marker.startswith(text[-k:]):
+            return k
+    return 0
+
+
+class _ThinkTagSplitter:
+    """Split a streamed content channel into answer vs ``<think>`` reasoning.
+
+    Some providers (e.g. MiniMax, DeepSeek-R1 via OpenAI-compatible endpoints)
+    inline chain-of-thought inside the ``content`` field wrapped in
+    ``<think>...</think>`` rather than emitting a separate ``reasoning_content``.
+    This normalizes that into the canonical reasoning/content split, holding
+    back just enough of the buffer to handle a tag split across chunks.
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._in_think = False
+
+    def feed(self, text: str) -> list[tuple[str, str]]:
+        self._buf += text
+        out: list[tuple[str, str]] = []
+        while True:
+            if not self._in_think:
+                idx = self._buf.find(_THINK_OPEN)
+                if idx != -1:
+                    if idx > 0:
+                        out.append(("content", self._buf[:idx]))
+                    self._buf = self._buf[idx + len(_THINK_OPEN) :]
+                    self._in_think = True
+                    continue
+                hold = _suffix_overlap(self._buf, _THINK_OPEN)
+                if len(self._buf) > hold:
+                    out.append(("content", self._buf[: len(self._buf) - hold]))
+                    self._buf = self._buf[len(self._buf) - hold :]
+                break
+            idx = self._buf.find(_THINK_CLOSE)
+            if idx != -1:
+                if idx > 0:
+                    out.append(("reasoning", self._buf[:idx]))
+                self._buf = self._buf[idx + len(_THINK_CLOSE) :]
+                self._in_think = False
+                continue
+            hold = _suffix_overlap(self._buf, _THINK_CLOSE)
+            if len(self._buf) > hold:
+                out.append(("reasoning", self._buf[: len(self._buf) - hold]))
+                self._buf = self._buf[len(self._buf) - hold :]
+            break
+        return [(channel, chunk) for channel, chunk in out if chunk]
+
+    def flush(self) -> list[tuple[str, str]]:
+        if not self._buf:
+            return []
+        channel = "reasoning" if self._in_think else "content"
+        text, self._buf = self._buf, ""
+        return [(channel, text)]
+
+
 class StreamAccumulator:
     def __init__(self) -> None:
         self.content_parts: list[str] = []
         self.reasoning_parts: list[str] = []
         self.tool_calls: dict[int, dict[str, Any]] = {}
         self.finish_reason: str | None = None
+        self._think = _ThinkTagSplitter()
 
     def feed_chunk(self, chunk: object) -> list[tuple[InferenceEventType, dict[str, Any]]]:
         events: list[tuple[InferenceEventType, dict[str, Any]]] = []
@@ -87,8 +154,17 @@ class StreamAccumulator:
 
         content = _get(delta, "content")
         if isinstance(content, str) and content:
-            self.content_parts.append(content)
-            events.append((InferenceEventType.CONTENT_DELTA, {"delta": content}))
+            for channel, text in self._think.feed(content):
+                if channel == "reasoning":
+                    self.reasoning_parts.append(text)
+                    events.append(
+                        (InferenceEventType.REASONING_DELTA, {"delta": text})
+                    )
+                else:
+                    self.content_parts.append(text)
+                    events.append(
+                        (InferenceEventType.CONTENT_DELTA, {"delta": text})
+                    )
 
         reasoning = _get(delta, "reasoning_content") or _get(delta, "reasoning")
         if isinstance(reasoning, str) and reasoning:
@@ -119,6 +195,13 @@ class StreamAccumulator:
 
     def finish(self) -> list[tuple[InferenceEventType, dict[str, Any]]]:
         events: list[tuple[InferenceEventType, dict[str, Any]]] = []
+        for channel, text in self._think.flush():
+            if channel == "reasoning":
+                self.reasoning_parts.append(text)
+                events.append((InferenceEventType.REASONING_DELTA, {"delta": text}))
+            else:
+                self.content_parts.append(text)
+                events.append((InferenceEventType.CONTENT_DELTA, {"delta": text}))
         content = "".join(self.content_parts)
         reasoning = "".join(self.reasoning_parts)
         if content:

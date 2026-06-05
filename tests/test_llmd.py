@@ -155,6 +155,49 @@ class LiteLLMInferenceClientTests(unittest.TestCase):
         self.assertEqual(kwargs["parallel_tool_calls"], False)
         self.assertEqual(kwargs["tool_choice"], "auto")
 
+    def test_stream_splits_inline_think_tags_into_reasoning(self) -> None:
+        # Reasoning arrives inline in `content` wrapped in <think> tags, with the
+        # closing tag split across two chunks to exercise the buffered splitter.
+        completion = CapturingStreamCompletion(
+            [
+                {"choices": [{"delta": {"content": "<think>17*23="}}]},
+                {"choices": [{"delta": {"content": "391</thi"}}]},
+                {"choices": [{"delta": {"content": "nk>The answer is 391."}}]},
+            ]
+        )
+        client = LiteLLMInferenceClient(
+            model="test-model", completion_fn=completion
+        )
+
+        async def collect():
+            return [
+                event
+                async for event in client.stream(
+                    messages=[InferenceMessage(role=InferenceRole.USER, content="hi")],
+                    tools=[],
+                    config=InferenceConfig(model="test-model"),
+                )
+            ]
+
+        events = anyio.run(collect)
+
+        reasoning = "".join(
+            e.payload["delta"]
+            for e in events
+            if e.type == InferenceEventType.REASONING_DELTA
+        )
+        content = "".join(
+            e.payload["delta"]
+            for e in events
+            if e.type == InferenceEventType.CONTENT_DELTA
+        )
+        self.assertEqual(reasoning, "17*23=391")
+        self.assertEqual(content, "The answer is 391.")
+        # The materialized assistant message must not leak think tags.
+        self.assertEqual(
+            events[-1].payload["message"]["content"], "The answer is 391."
+        )
+
     def test_stream_uses_inference_messages_without_tools(self) -> None:
         completion = CapturingStreamCompletion(
             [{"choices": [{"delta": {"content": "real response"}}]}]

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from knuth.core.events import RuntimeEvent
+from knuth.core.messages import InferenceMessage, InferenceRole
 from knuth.core.types import RunStatus
 from knuth_llmd import (
     InferenceConfig,
+    InferenceEvent,
     LiteLLMInferenceClient,
     load_llm_config,
 )
@@ -77,6 +80,94 @@ class AgentRuntime:
             answer=_answer_from_events(events),
             run_id=run_id,
             status=status,
+        )
+
+    async def run_streaming(
+        self,
+        prompt: str | None,
+        on_event: Callable[[InferenceEvent | RuntimeEvent], Awaitable[None]],
+        *,
+        run_id: str | None = None,
+    ) -> RunResult:
+        """Drive a run while forwarding live events to ``on_event``.
+
+        - ``run_id is None``: start a fresh run from ``prompt``.
+        - ``run_id`` set with ``prompt``: continue the same run with a new user
+          turn (multi-turn memory), or answer a pending ``ask_user`` request.
+        - ``run_id`` set with ``prompt is None``: resume a paused/awaiting run
+          (e.g. after an approval is resolved).
+        """
+        if self._services is None or self._inference_config is None:
+            raise RuntimeError("runtime is not configured")
+
+        if run_id is None:
+            if prompt is None:
+                raise ValueError("prompt is required to start a new run")
+            run = await self._services.run_store.create(prompt)
+            await self._services.event_store.append(
+                run.id,
+                namespace="run",
+                name="created",
+                payload=run.model_dump(),
+            )
+            await self._services.event_store.append(
+                run.id,
+                namespace="user",
+                name="message",
+                payload={"content": prompt},
+            )
+            run_id = run.id
+        elif prompt is not None:
+            run = await self._services.run_store.get(run_id)
+            if run.status == RunStatus.WAITING_USER:
+                await self._record_user_answer(run_id, prompt)
+            else:
+                await self._services.event_store.append(
+                    run_id,
+                    namespace="user",
+                    name="message",
+                    payload={"content": prompt},
+                )
+            await self._services.run_store.set_status(run_id, RunStatus.RUNNING)
+        else:
+            run = await self._services.run_store.get(run_id)
+            if run.status in {RunStatus.WAITING_APPROVAL, RunStatus.PAUSED}:
+                await self._services.run_store.set_status(run_id, RunStatus.RUNNING)
+
+        status = await run_agent_loop(
+            run_id,
+            self._services,
+            self._inference_config,
+            on_event=on_event,
+        )
+        events = await self._services.event_store.list_events(run_id)
+        return RunResult(
+            answer=_answer_from_events(events),
+            run_id=run_id,
+            status=status,
+        )
+
+    async def _record_user_answer(self, run_id: str, answer: str) -> None:
+        events = await self._services.event_store.list_events(run_id)
+        tool_call_id: str | None = None
+        for event in reversed(events):
+            if event.namespace == "user_input" and event.name == "requested":
+                tool_call_id = event.payload.get("tool_call_id")
+                break
+        message = InferenceMessage(
+            role=InferenceRole.TOOL_RESULT,
+            tool_call_id=tool_call_id,
+            tool_name="knuth.ask_user",
+            content=answer,
+        )
+        await self._services.event_store.append(
+            run_id,
+            namespace="tool",
+            name="completed",
+            payload={
+                "intent": {"name": "knuth.ask_user", "id": tool_call_id},
+                "message": message.model_dump(),
+            },
         )
 
     async def approve(self, approval_id: str) -> Approval:

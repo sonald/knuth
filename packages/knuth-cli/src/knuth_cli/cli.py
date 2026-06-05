@@ -2,13 +2,13 @@ import argparse
 import json
 import sys
 from collections.abc import Awaitable, Callable
-from typing import TextIO
 
 import anyio
+from rich.console import Console
 
-from knuth.core.types import RunStatus
 from knuth_cli import __version__
-from knuth_runtime import AgentRuntime, RunResult, build_default_runtime
+from knuth_cli.repl import run_interactive, run_single
+from knuth_runtime import AgentRuntime, build_default_runtime
 
 CommandHandler = Callable[[AgentRuntime, argparse.Namespace], Awaitable[int]]
 
@@ -21,11 +21,11 @@ def main(
 
 
 async def _handle_run(runtime: AgentRuntime, args: argparse.Namespace) -> int:
+    console = Console()
     prompt = args.once if args.once is not None else args.prompt
     if prompt is not None:
-        await _print_turn(await runtime.run_once(prompt), sys.stdout)
-        return 0
-    return await _run_repl(runtime, sys.stdin, sys.stdout)
+        return await run_single(runtime, console, prompt)
+    return await run_interactive(runtime, console)
 
 
 async def _handle_events(runtime: AgentRuntime, args: argparse.Namespace) -> int:
@@ -62,48 +62,13 @@ async def _handle_deny(runtime: AgentRuntime, args: argparse.Namespace) -> int:
 
 
 async def _handle_resume(runtime: AgentRuntime, args: argparse.Namespace) -> int:
-    await _print_turn(await runtime.resume(args.run_id), sys.stdout)
-    return 0
-
-
-async def _print_turn(turn: RunResult, output_stream: TextIO) -> None:
-    await _write(output_stream, f"{turn.answer}\n")
+    turn = await runtime.resume(args.run_id)
+    sys.stdout.write(f"{turn.answer}\n")
     if turn.run_id is not None:
-        await _write(output_stream, f"run_id={turn.run_id}\n")
+        sys.stdout.write(f"run_id={turn.run_id}\n")
     if turn.status is not None:
-        await _write(output_stream, f"status={turn.status.value}\n")
-    await _flush(output_stream)
-
-
-async def _run_repl(
-    runtime: AgentRuntime, input_stream: TextIO, output_stream: TextIO
-) -> int:
-    await _write(output_stream, "Knuth agent ready. Type /exit to quit.\n")
-    while True:
-        await _write(output_stream, "knuth> ")
-        await _flush(output_stream)
-        line = await anyio.to_thread.run_sync(input_stream.readline)
-        if line == "":
-            await _write(output_stream, "\n")
-            return 0
-        prompt = line.strip()
-        if prompt in {"/exit", "/quit"}:
-            return 0
-        if not prompt:
-            continue
-        turn = await runtime.run_once(prompt)
-        await _write(output_stream, f"{turn.answer}\n")
-        if turn.status in {RunStatus.WAITING_APPROVAL, RunStatus.WAITING_USER}:
-            await _write(output_stream, f"[{turn.status.value}] run_id={turn.run_id}\n")
-        await _flush(output_stream)
-
-
-async def _write(stream: TextIO, value: str) -> None:
-    await anyio.to_thread.run_sync(stream.write, value)
-
-
-async def _flush(stream: TextIO) -> None:
-    await anyio.to_thread.run_sync(stream.flush)
+        sys.stdout.write(f"status={turn.status.value}\n")
+    return 0
 
 
 _COMMAND_HANDLERS: dict[str, CommandHandler] = {

@@ -7,21 +7,40 @@ from unittest.mock import patch
 from knuth.core.events import RuntimeEvent
 from knuth.core.types import RunStatus
 from knuth_cli.cli import main
+from knuth_llmd import InferenceEvent, InferenceEventType
 from knuth_runtime import RunResult
 
 
+class _StreamingFakeRuntime:
+    """Fake runtime that emits a content stream for ``run_streaming``."""
+
+    async def run_streaming(self, prompt, on_event, *, run_id=None) -> RunResult:
+        answer = f"real-ish: {prompt}"
+        await on_event(
+            InferenceEvent(
+                type=InferenceEventType.CONTENT_DELTA,
+                generation_id="gen-1",
+                seq=1,
+                payload={"delta": answer},
+            )
+        )
+        await on_event(
+            InferenceEvent(
+                type=InferenceEventType.GENERATION_END,
+                generation_id="gen-1",
+                seq=2,
+                payload={"finish_reason": "stop"},
+            )
+        )
+        return RunResult(answer=answer, run_id=run_id or "run-1", status=RunStatus.SUCCEEDED)
+
+
 class CliTests(unittest.TestCase):
-    def test_run_once_calls_injected_runtime_factory_without_workspace(self) -> None:
+    def test_run_once_streams_answer_to_stdout(self) -> None:
         output = io.StringIO()
 
-        class FakeRuntime:
-            async def run_once(self, prompt: str) -> RunResult:
-                return RunResult(
-                    answer=f"real-ish: {prompt}",
-                )
-
-        async def runtime_factory() -> FakeRuntime:
-            return FakeRuntime()
+        async def runtime_factory() -> _StreamingFakeRuntime:
+            return _StreamingFakeRuntime()
 
         with contextlib.redirect_stdout(output):
             exit_code = main(
@@ -36,14 +55,8 @@ class CliTests(unittest.TestCase):
         output = io.StringIO()
         input_stream = io.StringIO("hello\n/exit\n")
 
-        class FakeRuntime:
-            async def run_once(self, prompt: str) -> RunResult:
-                return RunResult(
-                    answer=f"repl: {prompt}",
-                )
-
-        async def runtime_factory() -> FakeRuntime:
-            return FakeRuntime()
+        async def runtime_factory() -> _StreamingFakeRuntime:
+            return _StreamingFakeRuntime()
 
         with (
             patch("sys.stdin", input_stream),
@@ -53,7 +66,7 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertIn("Knuth agent ready", output.getvalue())
-        self.assertIn("repl: hello", output.getvalue())
+        self.assertIn("real-ish: hello", output.getvalue())
 
     def test_run_help_does_not_expose_workspace_option(self) -> None:
         output = io.StringIO()

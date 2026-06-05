@@ -1,11 +1,24 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+
+from knuth.core.events import RuntimeEvent
 from knuth.core.messages import InferenceMessage, InferenceRole
 from knuth.core.types import RunStatus
-from knuth_llmd import InferenceConfig, InferenceEventType, InferenceRuntimeOptions
+from knuth_llmd import (
+    InferenceConfig,
+    InferenceEvent,
+    InferenceEventType,
+    InferenceRuntimeOptions,
+)
 from knuth_runtime.context import RunContext
 from knuth_runtime.services import RuntimeServices
 from knuth_toold import ToolIntent, ToolProposalStatus
+
+# Optional async sink for live observation of a run. Receives streamed
+# InferenceEvents and the durable RuntimeEvents emitted for tool/approval
+# lifecycle. Defaults to None, in which case the loop behaves exactly as before.
+EventSink = Callable[[InferenceEvent | RuntimeEvent], Awaitable[None]]
 
 
 async def run_agent_loop(
@@ -13,6 +26,7 @@ async def run_agent_loop(
     services: RuntimeServices,
     inference_config: InferenceConfig,
     runtime_options: InferenceRuntimeOptions | None = None,
+    on_event: EventSink | None = None,
 ) -> RunStatus:
     turns = 0
     while True:
@@ -32,7 +46,9 @@ async def run_agent_loop(
 
         pending_message = await _pending_assistant_tool_message(run_id, services)
         if pending_message is not None:
-            status = await handle_tool_calls(run_id, pending_message, services)
+            status = await handle_tool_calls(
+                run_id, pending_message, services, on_event
+            )
             if status is not None:
                 return status
             continue
@@ -74,6 +90,8 @@ async def run_agent_loop(
             config=inference_config.model_copy(update={"run_id": run_id}),
             runtime=runtime_options,
         ):
+            if on_event is not None:
+                await on_event(event)
             if event.type == InferenceEventType.ERROR:
                 stream_error = event.payload
                 break
@@ -119,7 +137,9 @@ async def run_agent_loop(
         )
 
         if assistant_message.tool_calls:
-            status = await handle_tool_calls(run_id, assistant_message, services)
+            status = await handle_tool_calls(
+                run_id, assistant_message, services, on_event
+            )
             if status is not None:
                 return status
             continue
@@ -146,15 +166,23 @@ async def handle_tool_calls(
     run_id: str,
     assistant_message: InferenceMessage,
     services: RuntimeServices,
+    on_event: EventSink | None = None,
 ) -> RunStatus | None:
+    async def emit(namespace: str, name: str, payload: dict) -> RuntimeEvent:
+        event = await services.event_store.append(
+            run_id, namespace=namespace, name=name, payload=payload
+        )
+        if on_event is not None:
+            await on_event(event)
+        return event
+
     intents = [ToolIntent.from_tool_call(call) for call in assistant_message.tool_calls]
     for intent in intents:
         if intent.name == "knuth.ask_user":
-            await services.event_store.append(
-                run_id,
-                namespace="user_input",
-                name="requested",
-                payload={
+            await emit(
+                "user_input",
+                "requested",
+                {
                     "question": intent.arguments.get("question", ""),
                     "tool_call_id": intent.id,
                 },
@@ -164,19 +192,9 @@ async def handle_tool_calls(
 
     proposals = []
     for intent in intents:
-        await services.event_store.append(
-            run_id,
-            namespace="tool",
-            name="intent",
-            payload=intent.model_dump(),
-        )
+        await emit("tool", "intent", intent.model_dump())
         proposal = await services.tool_broker.propose(run_id, intent)
-        await services.event_store.append(
-            run_id,
-            namespace="tool",
-            name="proposed",
-            payload=proposal.model_dump(),
-        )
+        await emit("tool", "proposed", proposal.model_dump())
         if proposal.status == ToolProposalStatus.DENIED:
             error_message = InferenceMessage(
                 role=InferenceRole.TOOL_RESULT,
@@ -184,11 +202,10 @@ async def handle_tool_calls(
                 tool_name=intent.name,
                 content=f"Tool call denied: {proposal.error.message if proposal.error else 'unknown'}",
             )
-            await services.event_store.append(
-                run_id,
-                namespace="tool",
-                name="completed",
-                payload={
+            await emit(
+                "tool",
+                "completed",
+                {
                     "intent": intent.model_dump(),
                     "message": error_message.model_dump(),
                     "denied": True,
@@ -200,29 +217,18 @@ async def handle_tool_calls(
                 await services.run_store.set_status(run_id, RunStatus.FAILED)
                 return RunStatus.FAILED
             approval = await services.approvals.request(proposal.approval)
-            await services.event_store.append(
-                run_id,
-                namespace="approval",
-                name="requested",
-                payload=approval.model_dump(),
-            )
+            await emit("approval", "requested", approval.model_dump())
             await services.run_store.set_status(run_id, RunStatus.WAITING_APPROVAL)
             return RunStatus.WAITING_APPROVAL
         proposals.append(proposal)
 
     for proposal in proposals:
-        await services.event_store.append(
-            run_id,
-            namespace="tool",
-            name="started",
-            payload={"intent": proposal.intent.model_dump()},
-        )
+        await emit("tool", "started", {"intent": proposal.intent.model_dump()})
         record = await services.tool_broker.execute(run_id, proposal)
-        await services.event_store.append(
-            run_id,
-            namespace="tool",
-            name="completed",
-            payload={
+        await emit(
+            "tool",
+            "completed",
+            {
                 "intent": proposal.intent.model_dump(),
                 "result": record.result.model_dump(),
                 "message": record.to_tool_result_message().model_dump(),
