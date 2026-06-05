@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import anyio
 
-from knuth_llmd.types import ToolSpec
 from knuth_toold.base import (
     ToolBase,
     ToolContext,
@@ -20,10 +19,13 @@ from knuth_toold.registry import ToolRegistry
 
 class ExecutionContextTool(ToolBase):
     def __init__(self, cwd: Path | str | None = None) -> None:
-        super().__init__(default_workspace_uri=str(Path.cwd().resolve() if cwd is None else Path(cwd).resolve()))
+        path = Path.cwd() if cwd is None else Path(cwd)
+        super().__init__(default_workspace_uri=str(path.resolve()))
 
     def _base_path(self, ctx: ToolContext) -> Path:
-        return ctx.workspace_path if ctx.workspace_uri else Path(self.default_workspace_uri or ".").resolve()
+        if ctx.workspace_uri:
+            return ctx.workspace_path
+        return Path(self.default_workspace_uri or ".").resolve()
 
     def _execution_path(self, ctx: ToolContext, raw_path: object) -> Path:
         if not isinstance(raw_path, str) or not raw_path:
@@ -109,7 +111,9 @@ class ShellTool(ExecutionContextTool):
         stdout = completed.stdout.decode()
         stderr = completed.stderr.decode().strip()
         return ToolResult(
-            status=ToolResultStatus.SUCCESS if completed.returncode == 0 else ToolResultStatus.ERROR,
+            status=ToolResultStatus.SUCCESS
+            if completed.returncode == 0
+            else ToolResultStatus.ERROR,
             content=stdout,
             error=None
             if completed.returncode == 0
@@ -135,14 +139,16 @@ class PythonTool(ExecutionContextTool):
             raise ValueError("code must be a non-empty string")
         with anyio.fail_after(30):
             completed = await anyio.run_process(
-            [sys.executable, "-c", code],
-            cwd=self._base_path(ctx),
-            check=False,
+                [sys.executable, "-c", code],
+                cwd=self._base_path(ctx),
+                check=False,
             )
         stdout = completed.stdout.decode()
         stderr = completed.stderr.decode().strip()
         return ToolResult(
-            status=ToolResultStatus.SUCCESS if completed.returncode == 0 else ToolResultStatus.ERROR,
+            status=ToolResultStatus.SUCCESS
+            if completed.returncode == 0
+            else ToolResultStatus.ERROR,
             content=stdout,
             error=None
             if completed.returncode == 0

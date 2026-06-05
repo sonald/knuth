@@ -8,7 +8,7 @@ import anyio
 
 from knuth.core.types import RunStatus
 from knuth_cli import __version__
-from knuth_runtime import AgentRuntime, AgentTurn, build_default_runtime
+from knuth_runtime import AgentRuntime, RunResult, build_default_runtime
 
 CommandHandler = Callable[[AgentRuntime, argparse.Namespace], Awaitable[int]]
 
@@ -66,7 +66,7 @@ async def _handle_resume(runtime: AgentRuntime, args: argparse.Namespace) -> int
     return 0
 
 
-async def _print_turn(turn: AgentTurn, output_stream: TextIO) -> None:
+async def _print_turn(turn: RunResult, output_stream: TextIO) -> None:
     await _write(output_stream, f"{turn.answer}\n")
     if turn.run_id is not None:
         await _write(output_stream, f"run_id={turn.run_id}\n")
@@ -138,7 +138,7 @@ async def async_main(
         help="Run one agent turn and exit. Kept for compatibility.",
     )
     subparsers.add_parser("tools", help="Tool commands").add_argument(
-        "tool_command", choices=["list", "refresh"], help="Tool subcommand"
+        "tool_command", choices=["list"], help="Tool subcommand"
     )
     events_parser = subparsers.add_parser("events", help="Print run events")
     events_parser.add_argument("run_id")

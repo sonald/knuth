@@ -3,12 +3,11 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from pydantic import ConfigDict, Field
 
 from knuth.core.types import ErrorInfo, KnuthModel
-from knuth_llmd.types import ToolSpec
 
 
 class ToolRisk(StrEnum):
@@ -44,14 +43,6 @@ class ToolManifest(KnuthModel):
                 "parameters": self.parameters,
             },
         }
-
-    def to_legacy_spec(self) -> ToolSpec:
-        return ToolSpec(
-            name=self.name,
-            description=self.description,
-            input_schema=self.parameters,
-        )
-
 
 class ToolContext(KnuthModel):
     run_id: str
@@ -123,20 +114,8 @@ class ToolBase(KnuthModel, ABC):
             provider="builtin",
         )
 
-    @property
-    def spec(self) -> ToolSpec:
-        return self.manifest().to_legacy_spec()
-
     def to_func_spec(self) -> dict[str, Any]:
         return self.manifest().to_func_spec()
-
-    async def run(self, arguments: Mapping[str, Any]) -> ToolResult:
-        ctx = ToolContext(
-            run_id="legacy",
-            tool_call_id="legacy",
-            workspace_uri=self.default_workspace_uri,
-        )
-        return await self(ctx, **dict(arguments))
 
     @abstractmethod
     async def __call__(self, ctx: ToolContext, **kwargs: Any) -> ToolResult:

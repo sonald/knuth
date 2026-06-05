@@ -6,12 +6,10 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "anyio>=4.12.0",
-    "knuth-agentfsd",
     "knuth-core",
     "knuth-llmd",
     "knuth-runtime",
     "knuth-toold",
-    "python-dotenv>=1.2.2",
 ]
 
 [tool.uv.workspace]
@@ -21,7 +19,6 @@ members = ["packages/*"]
 package = false
 
 [tool.uv.sources]
-knuth-agentfsd = { workspace = true }
 knuth-core = { workspace = true }
 knuth-llmd = { workspace = true }
 knuth-runtime = { workspace = true }

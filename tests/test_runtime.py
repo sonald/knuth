@@ -11,72 +11,20 @@ from knuth_llmd import (
     InferenceConfig,
     InferenceEvent,
     InferenceEventType,
-    InferenceResult,
 )
 from knuth_runtime import (
-    AgentLoop,
     MemoryEventStore,
     MemoryRunStore,
     build_default_runtime,
     build_memory_runtime,
 )
 from knuth_runtime.approval import MemoryApprovalService
-from knuth_runtime.artifact_store import MemoryArtifactStore
 from knuth_runtime.context import reconstruct_messages_from_events
-from knuth_runtime.hooks import HookAction, HookContext, HookManager, HookRegistration, HookResult
 from knuth_runtime.policy import PolicyEngine
 from knuth_toold import ToolBroker, create_default_registry
 
 
-class ScriptedClient:
-    def __init__(self) -> None:
-        self.calls = 0
-
-    async def complete(
-        self,
-        messages: list[InferenceMessage],
-        config: InferenceConfig,
-        tools=(),
-        runtime=None,
-    ) -> InferenceResult:
-        self.calls += 1
-        if self.calls == 1:
-            return InferenceResult(
-                message=InferenceMessage(
-                    role=InferenceRole.ASSISTANT,
-                    content="Reading file",
-                    tool_calls=[
-                        CoreToolCall(
-                            name="read_file",
-                            arguments={"path": "fact.txt"},
-                        )
-                    ],
-                ),
-            )
-        tool_message = messages[-1]
-        return InferenceResult(
-            message=InferenceMessage(
-                role=InferenceRole.ASSISTANT,
-                content=f"Final answer: {tool_message.content}",
-            )
-        )
-
-
-class AgentLoopTests(unittest.TestCase):
-    def test_agent_loop_executes_tool_calls_then_returns_final_answer(self) -> None:
-        with tempfile.TemporaryDirectory() as workspace:
-            Path(workspace, "fact.txt").write_text("Knuth works", encoding="utf-8")
-            loop = AgentLoop(
-                inference_client=ScriptedClient(),
-                inference_config=InferenceConfig(model="scripted-model"),
-                tool_executor=create_default_registry(Path(workspace)),
-            )
-
-            turn = anyio.run(loop.run_turn, "read fact.txt")
-
-            self.assertEqual(turn.answer, "Final answer: Knuth works")
-            self.assertEqual([call.name for call in turn.tool_calls], ["read_file"])
-
+class RuntimeFactoryTests(unittest.TestCase):
     def test_build_default_runtime_does_not_pass_workspace_to_toold(self) -> None:
         with (
             patch("knuth_runtime.agent.load_llm_config") as load_config,
@@ -93,7 +41,7 @@ class AgentLoopTests(unittest.TestCase):
                     "timeout": 60.0,
                 },
             )()
-            client_class.return_value = ScriptedClient()
+            client_class.return_value = object()
             create_registry.return_value = create_default_registry(Path.cwd())
 
             runtime = anyio.run(build_default_runtime)
@@ -106,9 +54,6 @@ class ScriptedInferenceClient:
     def __init__(self, messages: list[InferenceMessage]) -> None:
         self.messages = messages
         self.calls = 0
-
-    async def complete(self, messages, config, runtime=None):
-        raise NotImplementedError
 
     async def stream(self, messages, tools, config, runtime=None):
         message = self.messages[min(self.calls, len(self.messages) - 1)]
@@ -198,6 +143,33 @@ class EventDrivenRuntimeTests(unittest.TestCase):
             self.assertEqual(turn.status, RunStatus.WAITING_USER)
             self.assertEqual(turn.answer, "Which file?")
 
+    def test_resume_does_not_replay_waiting_user_request(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            runtime = self.build_runtime(
+                workspace,
+                [
+                    InferenceMessage(
+                        role=InferenceRole.ASSISTANT,
+                        tool_calls=[
+                            CoreToolCall(
+                                id="call-ask",
+                                name="knuth.ask_user",
+                                arguments={"question": "Which file?"},
+                            )
+                        ],
+                    )
+                ],
+            )
+
+            first = anyio.run(runtime.run_once, "read something")
+            before = anyio.run(runtime.events, first.run_id)
+            resumed = anyio.run(runtime.resume, first.run_id)
+            after = anyio.run(runtime.events, first.run_id)
+
+            self.assertEqual(resumed.status, RunStatus.WAITING_USER)
+            self.assertEqual(resumed.answer, "Which file?")
+            self.assertEqual(len(after), len(before))
+
     def test_approval_resume_executes_pending_tool_call(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             runtime = self.build_runtime(
@@ -228,45 +200,6 @@ class EventDrivenRuntimeTests(unittest.TestCase):
             self.assertEqual(first.status, RunStatus.WAITING_APPROVAL)
             self.assertEqual(resumed.status, RunStatus.SUCCEEDED)
             self.assertEqual(Path(workspace, "x.txt").read_text(encoding="utf-8"), "hello")
-
-    def test_hook_manager_can_pause_blocking_flow(self) -> None:
-        hooks = HookManager()
-
-        async def pause(ctx: HookContext) -> HookResult:
-            return HookResult(action=HookAction.PAUSE, reason="test")
-
-        hooks.register(
-            HookRegistration(
-                namespace="run",
-                name="before_step",
-                handler_id="pause",
-                blocking=True,
-            ),
-            pause,
-        )
-
-        result = anyio.run(
-            hooks.dispatch_blocking,
-            HookContext(run_id="run-1", namespace="run", name="before_step"),
-        )
-
-        self.assertEqual(result.action, HookAction.PAUSE)
-
-    def test_memory_artifact_store_round_trips_text(self) -> None:
-        store = MemoryArtifactStore()
-
-        artifact = anyio.run(
-            store.put_text,
-            "run-1",
-            "note",
-            "summary",
-            "hello artifact",
-        )
-        content = anyio.run(store.get_text, artifact.id)
-
-        self.assertEqual(artifact.kind, "note")
-        self.assertEqual(content, "hello artifact")
-
 
 if __name__ == "__main__":
     unittest.main()

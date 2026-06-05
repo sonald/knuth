@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 from knuth.core.messages import InferenceMessage, InferenceRole
-from knuth.core.events import RuntimeEvent
 from knuth.core.types import RunStatus
 from knuth_llmd import InferenceConfig, InferenceEventType, InferenceRuntimeOptions
 from knuth_runtime.context import RunContext
-from knuth_runtime.hooks import HookAction, HookContext
 from knuth_runtime.services import RuntimeServices
 from knuth_toold import ToolIntent, ToolProposalStatus
 
@@ -50,21 +48,6 @@ async def run_agent_loop(
             return RunStatus.FAILED
 
         turns += 1
-        hook_result = await services.hooks.dispatch_blocking(
-            HookContext(
-                run_id=run_id,
-                namespace="run",
-                name="before_step",
-                payload={"turn": turns},
-            )
-        )
-        if hook_result.action == HookAction.PAUSE:
-            await services.run_store.set_status(run_id, RunStatus.PAUSED)
-            return RunStatus.PAUSED
-        if hook_result.action == HookAction.TERMINATE:
-            await services.run_store.set_status(run_id, RunStatus.CANCELLED)
-            return RunStatus.CANCELLED
-
         ctx = RunContext(
             run_id=run_id,
             user_id=run.user_id,
@@ -91,7 +74,6 @@ async def run_agent_loop(
             config=inference_config.model_copy(update={"run_id": run_id}),
             runtime=runtime_options,
         ):
-            await services.realtime_bus.publish(run_id, event)
             if event.type == InferenceEventType.ERROR:
                 stream_error = event.payload
                 break
@@ -142,8 +124,7 @@ async def run_agent_loop(
                 return status
             continue
 
-        verified = await services.verifier.verify_final_answer(run_id, assistant_message)
-        if verified.ok:
+        if assistant_message.content and assistant_message.content.strip():
             await services.event_store.append(
                 run_id,
                 namespace="run",
@@ -157,7 +138,7 @@ async def run_agent_loop(
             run_id,
             namespace="verification",
             name="failed",
-            payload=verified.model_dump(),
+            payload={"ok": False, "reason": "empty_final_answer"},
         )
 
 

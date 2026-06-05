@@ -5,10 +5,9 @@ from dataclasses import dataclass
 from unittest.mock import patch
 
 from knuth.core.events import RuntimeEvent
-from knuth.core.messages import InferenceMessage, InferenceRole
 from knuth.core.types import RunStatus
 from knuth_cli.cli import main
-from knuth_runtime import AgentTurn
+from knuth_runtime import RunResult
 
 
 class CliTests(unittest.TestCase):
@@ -16,13 +15,9 @@ class CliTests(unittest.TestCase):
         output = io.StringIO()
 
         class FakeRuntime:
-            async def run_once(self, prompt: str) -> AgentTurn:
-                return AgentTurn(
+            async def run_once(self, prompt: str) -> RunResult:
+                return RunResult(
                     answer=f"real-ish: {prompt}",
-                    messages=(
-                        InferenceMessage(role=InferenceRole.ASSISTANT, content="ok"),
-                    ),
-                    tool_calls=(),
                 )
 
         async def runtime_factory() -> FakeRuntime:
@@ -42,11 +37,9 @@ class CliTests(unittest.TestCase):
         input_stream = io.StringIO("hello\n/exit\n")
 
         class FakeRuntime:
-            async def run_once(self, prompt: str) -> AgentTurn:
-                return AgentTurn(
+            async def run_once(self, prompt: str) -> RunResult:
+                return RunResult(
                     answer=f"repl: {prompt}",
-                    messages=(),
-                    tool_calls=(),
                 )
 
         async def runtime_factory() -> FakeRuntime:
@@ -112,11 +105,9 @@ class CliTests(unittest.TestCase):
             async def deny(self, approval_id: str):
                 return FakeApproval(approval_id, RunStatus.CANCELLED)
 
-            async def resume(self, run_id: str) -> AgentTurn:
-                return AgentTurn(
+            async def resume(self, run_id: str) -> RunResult:
+                return RunResult(
                     answer="resumed",
-                    messages=(),
-                    tool_calls=(),
                     run_id=run_id,
                     status=RunStatus.SUCCEEDED,
                 )
@@ -128,7 +119,6 @@ class CliTests(unittest.TestCase):
             (["status", "run-1"], "succeeded"),
             (["events", "run-1"], "run.succeeded"),
             (["tools", "list"], "read_file"),
-            (["tools", "refresh"], "read_file"),
             (["approve", "appr-1"], "appr-1"),
             (["deny", "appr-1"], "appr-1"),
             (["resume", "run-1"], "resumed"),

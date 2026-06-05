@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from abc import ABC, abstractmethod
 from collections.abc import Callable
 from enum import StrEnum
 from typing import Any, AsyncIterator, Mapping, Protocol, Sequence
@@ -11,7 +10,6 @@ from pydantic import Field
 
 from knuth.core.messages import InferenceMessage, InferenceRole, ToolCall as CoreToolCall
 from knuth.core.types import ErrorInfo, KnuthModel
-from knuth_llmd.types import ToolSpec
 
 
 class InferenceEventType(StrEnum):
@@ -24,13 +22,6 @@ class InferenceEventType(StrEnum):
     TOOL_CALL = "tool_call"
     ERROR = "error"
     ABORTED = "aborted"
-
-
-class UsageInfo(KnuthModel):
-    input_tokens: int | None = None
-    output_tokens: int | None = None
-    total_tokens: int | None = None
-    cost_usd: float | None = None
 
 
 class InferenceConfig(KnuthModel):
@@ -63,15 +54,7 @@ class InferenceEvent(KnuthModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
-class InferenceResult(KnuthModel):
-    message: InferenceMessage
-    finish_reason: str | None = None
-    usage: UsageInfo | None = None
-    raw: dict[str, Any] = Field(default_factory=dict)
-
-
-class InferenceClient(ABC):
-    @abstractmethod
+class InferenceClient(Protocol):
     async def stream(
         self,
         messages: Sequence[InferenceMessage],
@@ -79,16 +62,6 @@ class InferenceClient(ABC):
         config: InferenceConfig,
         runtime: InferenceRuntimeOptions | None = None,
     ) -> AsyncIterator[InferenceEvent]:
-        ...
-
-    @abstractmethod
-    async def complete(
-        self,
-        messages: Sequence[InferenceMessage],
-        config: InferenceConfig,
-        tools: Sequence[dict[str, Any]] = (),
-        runtime: InferenceRuntimeOptions | None = None,
-    ) -> InferenceResult:
         ...
 
 
@@ -200,7 +173,7 @@ class StreamAccumulator:
         )
 
 
-class LiteLLMInferenceClient(InferenceClient):
+class LiteLLMInferenceClient:
     def __init__(
         self,
         *,
@@ -277,29 +250,6 @@ class LiteLLMInferenceClient(InferenceClient):
                 ).model_dump(),
             )
 
-    async def complete(
-        self,
-        messages: Sequence[InferenceMessage],
-        config: InferenceConfig,
-        tools: Sequence[dict[str, Any]] = (),
-        runtime: InferenceRuntimeOptions | None = None,
-    ) -> InferenceResult:
-        if runtime and runtime.abort_signal:
-            await runtime.abort_signal.checkpoint()
-        response = await self._completion_fn(
-            **self._completion_kwargs(
-                config=config,
-                messages=messages,
-                stream=False,
-                tools=tools,
-            )
-        )
-        return InferenceResult(
-            message=_parse_inference_message(response),
-            finish_reason=_parse_finish_reason(response),
-            raw=_to_plain(response),
-        )
-
     def _base_kwargs(self, config: InferenceConfig) -> dict[str, object]:
         model = _litellm_model_name(config.model or self._model)
         kwargs: dict[str, object] = {
@@ -349,74 +299,6 @@ async def _default_completion_fn(**kwargs: object) -> object:
     from litellm import acompletion
 
     return await acompletion(**kwargs)
-
-
-def tool_spec_to_payload(tool: ToolSpec) -> dict[str, object]:
-    return {
-        "type": "function",
-        "function": {
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": dict(tool.input_schema),
-        },
-    }
-
-
-def _parse_inference_message(response: object) -> InferenceMessage:
-    choices = _get(response, "choices")
-    if not isinstance(choices, Sequence) or isinstance(choices, str) or not choices:
-        raise RuntimeError("LLM response did not include choices")
-
-    first_choice = choices[0]
-    raw_message = _get(first_choice, "message")
-    if raw_message is None:
-        raise RuntimeError("LLM response choice did not include a message")
-
-    content = _get(raw_message, "content") or ""
-    raw_tool_calls = _get(raw_message, "tool_calls") or ()
-    return InferenceMessage(
-        role=InferenceRole.ASSISTANT,
-        content=str(content),
-        tool_calls=[
-            _parse_tool_call(item, index)
-            for index, item in enumerate(raw_tool_calls)
-        ],
-    )
-
-
-def _parse_finish_reason(response: object) -> str | None:
-    choice = _first_choice(response)
-    if choice is None:
-        return None
-    return _string_or_none(_get(choice, "finish_reason"))
-
-
-def _parse_tool_call(raw_call: object, fallback_index: int) -> CoreToolCall:
-    raw_function = _get(raw_call, "function")
-    if raw_function is None:
-        raise RuntimeError("LLM tool call did not include a function")
-
-    name = _get(raw_function, "name")
-    if not isinstance(name, str) or not name:
-        raise RuntimeError("LLM tool call did not include a function name")
-
-    arguments = _get(raw_function, "arguments") or "{}"
-    if not isinstance(arguments, str):
-        raise RuntimeError("LLM tool call arguments were not a JSON string")
-    parsed_arguments = json.loads(arguments)
-    if not isinstance(parsed_arguments, Mapping):
-        raise RuntimeError("LLM tool call arguments were not an object")
-
-    call_id = _get(raw_call, "id")
-    index = _get(raw_call, "index")
-    return CoreToolCall(
-        id=call_id if isinstance(call_id, str) else None,
-        name=name,
-        arguments=dict(parsed_arguments),
-        arguments_json=arguments,
-        index=index if isinstance(index, int) else fallback_index,
-        raw=_to_plain(raw_call),
-    )
 
 
 def _get(value: object, key: str) -> object:

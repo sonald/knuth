@@ -6,11 +6,11 @@ and behind service clients later.
 
 ## Packages
 
-- `knuth-llmd` / `knuth_llmd`: LLM message types and client protocol.
+- `knuth-core` / `knuth.core`: shared message, event, run, and status models.
+- `knuth-llmd` / `knuth_llmd`: LLM client protocol and LiteLLM adapter.
 - `knuth-toold` / `knuth_toold`: tool contracts, registry, and execution.
-- `knuth-agentfsd` / `knuth_agentfsd`: agent-facing filesystem protocol.
-- `knuth-runtime` / `knuth_runtime`: orchestration layer that composes LLM,
-  tools, and filesystem access.
+- `knuth-runtime` / `knuth_runtime`: orchestration layer that composes LLM and
+  tools.
 - `knuth-cli` / `knuth_cli`: reference command-line interface.
 
 `knuth-runtime` depends on the component packages and assembles them. The lower

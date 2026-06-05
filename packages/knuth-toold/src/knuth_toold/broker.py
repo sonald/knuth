@@ -180,13 +180,16 @@ class ToolBroker:
                 ),
             )
         provider = self.registry.get_provider_for_tool(proposal.intent.name)
-        result = await provider.call_tool(
-            proposal.intent.name,
-            proposal.normalized_args,
-            ToolContext(
-                run_id=run_id,
-                tool_call_id=proposal.intent.id,
-                workspace_uri=self.workspace_uri,
-            ),
-        )
+        try:
+            result = await provider.call_tool(
+                proposal.intent.name,
+                proposal.normalized_args,
+                ToolContext(
+                    run_id=run_id,
+                    tool_call_id=proposal.intent.id,
+                    workspace_uri=self.workspace_uri,
+                ),
+            )
+        except Exception as exc:
+            result = ToolResult.from_error(exc.__class__.__name__, str(exc))
         return ToolExecutionRecord(intent=proposal.intent, result=result)

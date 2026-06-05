@@ -5,8 +5,8 @@ description = "Command-line interface for the Knuth agent framework"
 requires-python = ">=3.12"
 dependencies = [
     "anyio>=4.12.0",
+    "knuth-core",
     "knuth-runtime",
-    "rich>=15.0.0",
 ]
 
 [project.scripts]

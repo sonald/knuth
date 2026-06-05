@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 from enum import StrEnum
-from pathlib import Path
 from typing import Any
 
 import anyio
@@ -162,71 +160,3 @@ class SQLiteApprovalService(MemoryApprovalService):
                 "select status from approvals where id = ?", (approval_id,)
             ).fetchone()
         return row is not None and row[0] == ApprovalStatus.APPROVED.value
-
-
-class JsonApprovalService(MemoryApprovalService):
-    def __init__(self, state_dir: Path | str) -> None:
-        self.state_dir = Path(state_dir).expanduser()
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.path = self.state_dir / "approvals.json"
-        if not self.path.exists():
-            self._write({})
-
-    def _read(self) -> dict[str, Any]:
-        return json.loads(self.path.read_text(encoding="utf-8"))
-
-    def _write(self, data: dict[str, Any]) -> None:
-        temp = self.path.with_suffix(".tmp")
-        temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        temp.replace(self.path)
-
-    async def request(self, request: ApprovalRequest) -> Approval:
-        return await anyio.to_thread.run_sync(self._request, request)
-
-    def _request(self, request: ApprovalRequest) -> Approval:
-        data = self._read()
-        if request.id in data:
-            return Approval.model_validate(data[request.id])
-        approval = Approval(
-            id=request.id,
-            run_id=request.run_id,
-            status=ApprovalStatus.PENDING,
-            title=request.title,
-            reason=request.reason,
-            risk=request.risk,
-            payload=request.payload,
-            created_at=utc_now(),
-        )
-        data[approval.id] = approval.model_dump()
-        self._write(data)
-        return approval
-
-    async def resolve(self, approval_id: str, status: ApprovalStatus) -> Approval:
-        return await anyio.to_thread.run_sync(self._resolve, approval_id, status)
-
-    def _resolve(self, approval_id: str, status: ApprovalStatus) -> Approval:
-        data = self._read()
-        approval = Approval.model_validate(data[approval_id]).model_copy(
-            update={"status": status, "resolved_at": utc_now()}
-        )
-        data[approval.id] = approval.model_dump()
-        self._write(data)
-        return approval
-
-    async def list_pending(self, run_id: str | None = None) -> list[Approval]:
-        return await anyio.to_thread.run_sync(self._list_pending, run_id)
-
-    def _list_pending(self, run_id: str | None = None) -> list[Approval]:
-        return [
-            Approval.model_validate(item)
-            for item in self._read().values()
-            if item["status"] == ApprovalStatus.PENDING.value
-            and (run_id is None or item["run_id"] == run_id)
-        ]
-
-    async def is_approved(self, approval_id: str) -> bool:
-        return await anyio.to_thread.run_sync(self._is_approved, approval_id)
-
-    def _is_approved(self, approval_id: str) -> bool:
-        item = self._read().get(approval_id)
-        return item is not None and item["status"] == ApprovalStatus.APPROVED.value
