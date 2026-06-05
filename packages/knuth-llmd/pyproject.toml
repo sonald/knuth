@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "LLM client layer for the Knuth agent framework"
 requires-python = ">=3.12"
 dependencies = [
+    "anyio>=4.12.0",
+    "knuth-core",
     "litellm>=1.87.0",
 ]
 

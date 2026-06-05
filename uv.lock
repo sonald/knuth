@@ -7,6 +7,7 @@ members = [
     "knuth",
     "knuth-agentfsd",
     "knuth-cli",
+    "knuth-core",
     "knuth-llmd",
     "knuth-runtime",
     "knuth-toold",
@@ -661,7 +662,9 @@ name = "knuth"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "knuth-agentfsd" },
+    { name = "knuth-core" },
     { name = "knuth-llmd" },
     { name = "knuth-runtime" },
     { name = "knuth-toold" },
@@ -670,7 +673,9 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.12.0" },
     { name = "knuth-agentfsd", editable = "packages/knuth-agentfsd" },
+    { name = "knuth-core", editable = "packages/knuth-core" },
     { name = "knuth-llmd", editable = "packages/knuth-llmd" },
     { name = "knuth-runtime", editable = "packages/knuth-runtime" },
     { name = "knuth-toold", editable = "packages/knuth-toold" },
@@ -687,40 +692,63 @@ name = "knuth-cli"
 version = "0.1.0"
 source = { editable = "packages/knuth-cli" }
 dependencies = [
+    { name = "anyio" },
     { name = "knuth-runtime" },
     { name = "rich" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.12.0" },
     { name = "knuth-runtime", editable = "packages/knuth-runtime" },
     { name = "rich", specifier = ">=15.0.0" },
 ]
+
+[[package]]
+name = "knuth-core"
+version = "0.1.0"
+source = { editable = "packages/knuth-core" }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pydantic", specifier = ">=2.13.0" }]
 
 [[package]]
 name = "knuth-llmd"
 version = "0.1.0"
 source = { editable = "packages/knuth-llmd" }
 dependencies = [
+    { name = "anyio" },
+    { name = "knuth-core" },
     { name = "litellm" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "litellm", specifier = ">=1.87.0" }]
+requires-dist = [
+    { name = "anyio", specifier = ">=4.12.0" },
+    { name = "knuth-core", editable = "packages/knuth-core" },
+    { name = "litellm", specifier = ">=1.87.0" },
+]
 
 [[package]]
 name = "knuth-runtime"
 version = "0.1.0"
 source = { editable = "packages/knuth-runtime" }
 dependencies = [
+    { name = "anyio" },
     { name = "knuth-agentfsd" },
+    { name = "knuth-core" },
     { name = "knuth-llmd" },
     { name = "knuth-toold" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.12.0" },
     { name = "knuth-agentfsd", editable = "packages/knuth-agentfsd" },
+    { name = "knuth-core", editable = "packages/knuth-core" },
     { name = "knuth-llmd", editable = "packages/knuth-llmd" },
     { name = "knuth-toold", editable = "packages/knuth-toold" },
 ]
@@ -729,6 +757,20 @@ requires-dist = [
 name = "knuth-toold"
 version = "0.1.0"
 source = { editable = "packages/knuth-toold" }
+dependencies = [
+    { name = "anyio" },
+    { name = "jsonschema" },
+    { name = "knuth-core" },
+    { name = "knuth-llmd" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "anyio", specifier = ">=4.12.0" },
+    { name = "jsonschema", specifier = ">=4.0.0" },
+    { name = "knuth-core", editable = "packages/knuth-core" },
+    { name = "knuth-llmd", editable = "packages/knuth-llmd" },
+]
 
 [[package]]
 name = "litellm"
