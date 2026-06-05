@@ -2,9 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO
-
-import anyio
 
 from knuth.core.events import RuntimeEvent
 from knuth.core.messages import InferenceMessage, InferenceRole, ToolCall
@@ -181,26 +178,6 @@ class AgentRuntime:
             raise RuntimeError("runtime is not configured")
         return await self._services.approvals.list_pending(run_id)
 
-    async def run(self, input_stream: TextIO, output_stream: TextIO) -> int:
-        await _write(output_stream, "Knuth agent ready. Type /exit to quit.\n")
-        while True:
-            await _write(output_stream, "knuth> ")
-            await _flush(output_stream)
-            line = await anyio.to_thread.run_sync(input_stream.readline)
-            if line == "":
-                await _write(output_stream, "\n")
-                return 0
-            prompt = line.strip()
-            if prompt in {"/exit", "/quit"}:
-                return 0
-            if not prompt:
-                continue
-            turn = await self.run_once(prompt)
-            await _write(output_stream, f"{turn.answer}\n")
-            if turn.status in {RunStatus.WAITING_APPROVAL, RunStatus.WAITING_USER}:
-                await _write(output_stream, f"[{turn.status.value}] run_id={turn.run_id}\n")
-            await _flush(output_stream)
-
 
 async def build_default_runtime(db_path: Path | str | None = None) -> AgentRuntime:
     config = await load_llm_config()
@@ -268,11 +245,3 @@ def _answer_from_events(events: list[RuntimeEvent]) -> str:
         if event.namespace == "user_input" and event.name == "requested":
             return str(event.payload.get("question") or "Waiting for user input")
     return ""
-
-
-async def _write(stream: TextIO, value: str) -> None:
-    await anyio.to_thread.run_sync(stream.write, value)
-
-
-async def _flush(stream: TextIO) -> None:
-    await anyio.to_thread.run_sync(stream.flush)

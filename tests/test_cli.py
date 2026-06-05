@@ -2,6 +2,7 @@ import contextlib
 import io
 import unittest
 from dataclasses import dataclass
+from unittest.mock import patch
 
 from knuth.core.events import RuntimeEvent
 from knuth.core.messages import InferenceMessage, InferenceRole
@@ -35,6 +36,31 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertIn("real-ish: hello", output.getvalue())
+
+    def test_interactive_run_loop_stays_in_cli_layer(self) -> None:
+        output = io.StringIO()
+        input_stream = io.StringIO("hello\n/exit\n")
+
+        class FakeRuntime:
+            async def run_once(self, prompt: str) -> AgentTurn:
+                return AgentTurn(
+                    answer=f"repl: {prompt}",
+                    messages=(),
+                    tool_calls=(),
+                )
+
+        async def runtime_factory() -> FakeRuntime:
+            return FakeRuntime()
+
+        with (
+            patch("sys.stdin", input_stream),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["run"], runtime_factory=runtime_factory)
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Knuth agent ready", output.getvalue())
+        self.assertIn("repl: hello", output.getvalue())
 
     def test_run_help_does_not_expose_workspace_option(self) -> None:
         output = io.StringIO()
