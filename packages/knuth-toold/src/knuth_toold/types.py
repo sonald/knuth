@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 
-from knuth_llmd.types import ToolCall, ToolSpec
+from knuth.core.messages import ToolCall
+from knuth_llmd.types import ToolSpec
 from knuth_toold.base import ToolResult
 
 

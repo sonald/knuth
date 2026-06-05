@@ -6,16 +6,13 @@ from knuth_llmd.client import (
     InferenceResult,
     InferenceRuntimeOptions,
     LiteLLMInferenceClient,
-    LiteLlmClient,
-    LlmClient,
     StreamAccumulator,
+    tool_spec_to_payload,
 )
 from knuth_llmd.config import LlmConfig, load_llm_config
-from knuth_llmd.types import ChatMessage, ChatResponse, ToolCall, ToolSpec
+from knuth_llmd.types import ToolSpec
 
 __all__ = [
-    "ChatMessage",
-    "ChatResponse",
     "InferenceClient",
     "InferenceConfig",
     "InferenceEvent",
@@ -23,11 +20,9 @@ __all__ = [
     "InferenceResult",
     "InferenceRuntimeOptions",
     "LiteLLMInferenceClient",
-    "LiteLlmClient",
     "LlmConfig",
-    "LlmClient",
     "StreamAccumulator",
-    "ToolCall",
     "ToolSpec",
     "load_llm_config",
+    "tool_spec_to_payload",
 ]

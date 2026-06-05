@@ -4,7 +4,8 @@ from collections.abc import Iterable
 from importlib.metadata import entry_points
 from typing import Any
 
-from knuth_llmd.types import ToolCall, ToolSpec
+from knuth.core.messages import ToolCall
+from knuth_llmd.types import ToolSpec
 from knuth_toold.base import ToolBase, ToolContext, ToolManifest, ToolResult
 from knuth_toold.providers import ToolProvider
 from knuth_toold.types import Tool

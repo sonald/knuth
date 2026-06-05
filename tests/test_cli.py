@@ -4,9 +4,9 @@ import unittest
 from dataclasses import dataclass
 
 from knuth.core.events import RuntimeEvent
+from knuth.core.messages import InferenceMessage, InferenceRole
 from knuth.core.types import RunStatus
 from knuth_cli.cli import main
-from knuth_llmd.types import ChatMessage
 from knuth_runtime import AgentTurn
 
 
@@ -18,7 +18,9 @@ class CliTests(unittest.TestCase):
             async def run_once(self, prompt: str) -> AgentTurn:
                 return AgentTurn(
                     answer=f"real-ish: {prompt}",
-                    messages=(ChatMessage(role="assistant", content="ok"),),
+                    messages=(
+                        InferenceMessage(role=InferenceRole.ASSISTANT, content="ok"),
+                    ),
                     tool_calls=(),
                 )
 

@@ -6,14 +6,12 @@ import anyio
 
 from knuth.core.messages import InferenceMessage, InferenceRole
 from knuth_llmd import (
-    ChatMessage,
     InferenceConfig,
     InferenceEventType,
     LiteLLMInferenceClient,
-    LiteLlmClient,
-    ToolCall,
     ToolSpec,
     load_llm_config,
+    tool_spec_to_payload,
 )
 
 
@@ -90,10 +88,10 @@ class LlmConfigTests(unittest.TestCase):
             anyio.run(load_llm_config, Path("does-not-exist.env"), {})
 
 
-class LiteLlmClientTests(unittest.TestCase):
+class LiteLLMInferenceClientCompleteTests(unittest.TestCase):
     def test_complete_calls_litellm_completion_and_parses_response(self) -> None:
         completion = CapturingCompletion()
-        client = LiteLlmClient(
+        client = LiteLLMInferenceClient(
             model="test-model",
             base_url="https://example.test/v1",
             api_key="test-key",
@@ -102,7 +100,9 @@ class LiteLlmClientTests(unittest.TestCase):
         )
 
         response = anyio.run(
-            client.complete, [ChatMessage(role="user", content="hello")], []
+            client.complete,
+            [InferenceMessage(role=InferenceRole.USER, content="hello")],
+            InferenceConfig(model="test-model", timeout_s=12.5),
         )
 
         self.assertEqual(response.message.content, "real response")
@@ -118,21 +118,25 @@ class LiteLlmClientTests(unittest.TestCase):
 
     def test_complete_does_not_double_prefix_provider_model(self) -> None:
         completion = CapturingCompletion()
-        client = LiteLlmClient(
+        client = LiteLLMInferenceClient(
             model="openai/test-model",
             base_url="https://example.test/v1",
             api_key="test-key",
             completion_fn=completion,
         )
 
-        anyio.run(client.complete, [ChatMessage(role="user", content="hello")], [])
+        anyio.run(
+            client.complete,
+            [InferenceMessage(role=InferenceRole.USER, content="hello")],
+            InferenceConfig(model="openai/test-model"),
+        )
 
         kwargs = completion.kwargs or {}
         self.assertEqual(kwargs["model"], "openai/test-model")
 
     def test_complete_includes_tool_specs_when_available(self) -> None:
         completion = CapturingCompletion()
-        client = LiteLlmClient(
+        client = LiteLLMInferenceClient(
             model="test-model",
             base_url="https://example.test/v1",
             api_key="test-key",
@@ -141,15 +145,18 @@ class LiteLlmClientTests(unittest.TestCase):
 
         anyio.run(
             client.complete,
-            [ChatMessage(role="user", content="read file")],
+            [InferenceMessage(role=InferenceRole.USER, content="read file")],
+            InferenceConfig(model="test-model"),
             [
-                ToolSpec(
-                    name="read_file",
-                    description="Read a file",
-                    input_schema={
-                        "type": "object",
-                        "properties": {"path": {"type": "string"}},
-                    },
+                tool_spec_to_payload(
+                    ToolSpec(
+                        name="read_file",
+                        description="Read a file",
+                        input_schema={
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                        },
+                    )
                 )
             ],
         )
@@ -196,7 +203,7 @@ class LiteLlmClientTests(unittest.TestCase):
                 ]
             }
         )
-        client = LiteLlmClient(
+        client = LiteLLMInferenceClient(
             model="test-model",
             base_url="https://example.test/v1",
             api_key="test-key",
@@ -205,14 +212,15 @@ class LiteLlmClientTests(unittest.TestCase):
 
         response = anyio.run(
             client.complete,
-            [ChatMessage(role="user", content="read README")],
-            [],
+            [InferenceMessage(role=InferenceRole.USER, content="read README")],
+            InferenceConfig(model="test-model"),
         )
 
         self.assertEqual(response.message.content, "")
+        self.assertEqual(response.message.role, InferenceRole.ASSISTANT)
         self.assertEqual(
-            response.tool_calls,
-            (ToolCall(id="call-1", name="read_file", arguments={"path": "README.md"}),),
+            [(call.id, call.name, call.arguments) for call in response.message.tool_calls],
+            [("call-1", "read_file", {"path": "README.md"})],
         )
 
 

@@ -7,17 +7,14 @@ from typing import TextIO
 import anyio
 
 from knuth.core.events import RuntimeEvent
-from knuth.core.messages import InferenceMessage
+from knuth.core.messages import InferenceMessage, InferenceRole, ToolCall
 from knuth.core.types import RunStatus
 from knuth_llmd import (
-    ChatMessage,
-    ChatResponse,
     InferenceConfig,
+    InferenceClient,
     LiteLLMInferenceClient,
-    LiteLlmClient,
-    LlmClient,
-    ToolCall,
     load_llm_config,
+    tool_spec_to_payload,
 )
 from knuth_runtime.approval import (
     Approval,
@@ -40,7 +37,7 @@ from knuth_toold import ToolBroker, ToolExecutor, create_default_registry
 @dataclass(frozen=True)
 class AgentTurn:
     answer: str
-    messages: tuple[ChatMessage | InferenceMessage, ...]
+    messages: tuple[InferenceMessage, ...]
     tool_calls: tuple[ToolCall, ...]
     run_id: str | None = None
     status: RunStatus | None = None
@@ -49,40 +46,45 @@ class AgentTurn:
 class AgentLoop:
     def __init__(
         self,
-        llm_client: LlmClient,
+        inference_client: InferenceClient,
+        inference_config: InferenceConfig,
         tool_executor: ToolExecutor,
         max_tool_rounds: int = 4,
     ) -> None:
-        self._llm_client = llm_client
+        self._inference_client = inference_client
+        self._inference_config = inference_config
         self._tool_executor = tool_executor
         self._max_tool_rounds = max_tool_rounds
 
     async def run_turn(
-        self, user_input: str, history: tuple[ChatMessage, ...] = ()
+        self, user_input: str, history: tuple[InferenceMessage, ...] = ()
     ) -> AgentTurn:
         messages = list(history)
-        messages.append(ChatMessage(role="user", content=user_input))
+        messages.append(InferenceMessage(role=InferenceRole.USER, content=user_input))
         tool_calls: list[ToolCall] = []
+        tool_specs = [tool_spec_to_payload(tool) for tool in self._tool_executor.specs()]
 
         for _ in range(self._max_tool_rounds + 1):
-            response = await self._llm_client.complete(
-                messages, self._tool_executor.specs()
+            response = await self._inference_client.complete(
+                messages,
+                self._inference_config,
+                tools=tool_specs,
             )
             messages.append(response.message)
-            if not response.tool_calls:
+            if not response.message.tool_calls:
                 return AgentTurn(
-                    answer=response.message.content,
+                    answer=response.message.content or "",
                     messages=tuple(messages),
                     tool_calls=tuple(tool_calls),
                 )
-            for call in response.tool_calls:
+            for call in response.message.tool_calls:
                 tool_calls.append(call)
                 result = await self._tool_executor.execute(call)
                 content = result.content if result.ok else f"ERROR: {result.error}"
                 messages.append(
-                    ChatMessage(
-                        role="tool",
-                        name=call.name,
+                    InferenceMessage(
+                        role=InferenceRole.TOOL_RESULT,
+                        tool_name=call.name,
                         content=content or "",
                         tool_call_id=call.id,
                     )

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import anyio
 
-from knuth_llmd.types import ToolCall
+from knuth.core.messages import ToolCall
 from knuth_runtime.approval import MemoryApprovalService
 from knuth_runtime.policy import PolicyEngine
 from knuth_toold import ToolBroker, ToolIntent, ToolProposalStatus, create_default_registry

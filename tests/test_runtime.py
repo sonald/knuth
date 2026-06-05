@@ -7,8 +7,12 @@ import anyio
 
 from knuth.core.messages import InferenceMessage, InferenceRole, ToolCall as CoreToolCall
 from knuth.core.types import RunStatus
-from knuth_llmd import InferenceConfig, InferenceEvent, InferenceEventType
-from knuth_llmd.types import ChatMessage, ChatResponse, ToolCall, ToolSpec
+from knuth_llmd import (
+    InferenceConfig,
+    InferenceEvent,
+    InferenceEventType,
+    InferenceResult,
+)
 from knuth_runtime import (
     AgentLoop,
     MemoryEventStore,
@@ -29,18 +33,31 @@ class ScriptedClient:
         self.calls = 0
 
     async def complete(
-        self, messages: list[ChatMessage], tools: list[ToolSpec]
-    ) -> ChatResponse:
+        self,
+        messages: list[InferenceMessage],
+        config: InferenceConfig,
+        tools=(),
+        runtime=None,
+    ) -> InferenceResult:
         self.calls += 1
         if self.calls == 1:
-            return ChatResponse(
-                message=ChatMessage(role="assistant", content="Reading file"),
-                tool_calls=(ToolCall(name="read_file", arguments={"path": "fact.txt"}),),
+            return InferenceResult(
+                message=InferenceMessage(
+                    role=InferenceRole.ASSISTANT,
+                    content="Reading file",
+                    tool_calls=[
+                        CoreToolCall(
+                            name="read_file",
+                            arguments={"path": "fact.txt"},
+                        )
+                    ],
+                ),
             )
         tool_message = messages[-1]
-        return ChatResponse(
-            message=ChatMessage(
-                role="assistant", content=f"Final answer: {tool_message.content}"
+        return InferenceResult(
+            message=InferenceMessage(
+                role=InferenceRole.ASSISTANT,
+                content=f"Final answer: {tool_message.content}",
             )
         )
 
@@ -50,7 +67,8 @@ class AgentLoopTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as workspace:
             Path(workspace, "fact.txt").write_text("Knuth works", encoding="utf-8")
             loop = AgentLoop(
-                llm_client=ScriptedClient(),
+                inference_client=ScriptedClient(),
+                inference_config=InferenceConfig(model="scripted-model"),
                 tool_executor=create_default_registry(Path(workspace)),
             )
 
@@ -62,7 +80,7 @@ class AgentLoopTests(unittest.TestCase):
     def test_build_default_runtime_does_not_pass_workspace_to_toold(self) -> None:
         with (
             patch("knuth_runtime.agent.load_llm_config") as load_config,
-            patch("knuth_runtime.agent.LiteLlmClient") as client_class,
+            patch("knuth_runtime.agent.LiteLLMInferenceClient") as client_class,
             patch("knuth_runtime.agent.create_default_registry") as create_registry,
         ):
             load_config.return_value = type(

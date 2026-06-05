@@ -11,14 +11,7 @@ from pydantic import Field
 
 from knuth.core.messages import InferenceMessage, InferenceRole, ToolCall as CoreToolCall
 from knuth.core.types import ErrorInfo, KnuthModel
-from knuth_llmd.types import (
-    ChatMessage,
-    ChatResponse,
-    ToolCall,
-    ToolSpec,
-    chat_to_inference_message,
-    inference_to_chat_message,
-)
+from knuth_llmd.types import ToolSpec
 
 
 class InferenceEventType(StrEnum):
@@ -93,15 +86,9 @@ class InferenceClient(ABC):
         self,
         messages: Sequence[InferenceMessage],
         config: InferenceConfig,
+        tools: Sequence[dict[str, Any]] = (),
         runtime: InferenceRuntimeOptions | None = None,
     ) -> InferenceResult:
-        ...
-
-
-class LlmClient(Protocol):
-    async def complete(
-        self, messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]
-    ) -> ChatResponse:
         ...
 
 
@@ -258,14 +245,13 @@ class LiteLLMInferenceClient(InferenceClient):
 
         accumulator = StreamAccumulator()
         try:
-            response = await self._completion_fn(
-                **self._base_kwargs(config),
-                messages=[message.to_litellm_message() for message in messages],
-                tools=list(tools) or None,
-                tool_choice="auto" if tools else None,
+            kwargs = self._completion_kwargs(
+                config=config,
+                messages=messages,
                 stream=True,
-                parallel_tool_calls=False,
+                tools=tools,
             )
+            response = await self._completion_fn(**kwargs)
             async for chunk in response:  # type: ignore[attr-defined]
                 if runtime and runtime.abort_signal and runtime.abort_signal.is_aborted():
                     yield event(InferenceEventType.ABORTED, {"reason": "abort_signal"})
@@ -295,19 +281,22 @@ class LiteLLMInferenceClient(InferenceClient):
         self,
         messages: Sequence[InferenceMessage],
         config: InferenceConfig,
+        tools: Sequence[dict[str, Any]] = (),
         runtime: InferenceRuntimeOptions | None = None,
     ) -> InferenceResult:
         if runtime and runtime.abort_signal:
             await runtime.abort_signal.checkpoint()
         response = await self._completion_fn(
-            **self._base_kwargs(config),
-            messages=[message.to_litellm_message() for message in messages],
-            stream=False,
-            parallel_tool_calls=False,
+            **self._completion_kwargs(
+                config=config,
+                messages=messages,
+                stream=False,
+                tools=tools,
+            )
         )
-        chat_response = _parse_chat_response(response)
         return InferenceResult(
-            message=chat_to_inference_message(chat_response.message),
+            message=_parse_inference_message(response),
+            finish_reason=_parse_finish_reason(response),
             raw=_to_plain(response),
         )
 
@@ -328,25 +317,26 @@ class LiteLLMInferenceClient(InferenceClient):
         kwargs.update(config.provider_options)
         return kwargs
 
-
-class LiteLlmClient(LiteLLMInferenceClient):
-    async def complete(
-        self, messages: Sequence[ChatMessage], tools: Sequence[ToolSpec]
-    ) -> ChatResponse:
-        kwargs: dict[str, object] = {
-            "model": self._model,
-            "base_url": self._base_url,
-            "api_key": self._api_key,
-            "messages": [_message_to_payload(message) for message in messages],
-            "timeout": self._timeout,
-            "parallel_tool_calls": False,
-        }
+    def _completion_kwargs(
+        self,
+        *,
+        config: InferenceConfig,
+        messages: Sequence[InferenceMessage],
+        stream: bool,
+        tools: Sequence[dict[str, Any]],
+    ) -> dict[str, object]:
+        kwargs = self._base_kwargs(config)
+        kwargs.update(
+            {
+                "messages": [message.to_litellm_message() for message in messages],
+                "stream": stream,
+                "parallel_tool_calls": False,
+            }
+        )
         if tools:
-            kwargs["tools"] = [_tool_to_payload(tool) for tool in tools]
+            kwargs["tools"] = list(tools)
             kwargs["tool_choice"] = "auto"
-
-        response = await self._completion_fn(**kwargs)
-        return _parse_chat_response(response)
+        return kwargs
 
 
 def _litellm_model_name(model: str) -> str:
@@ -361,21 +351,7 @@ async def _default_completion_fn(**kwargs: object) -> object:
     return await acompletion(**kwargs)
 
 
-def _message_to_payload(message: ChatMessage) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "role": message.role,
-        "content": message.content,
-    }
-    if message.name is not None:
-        payload["name"] = message.name
-    if message.tool_call_id is not None:
-        payload["tool_call_id"] = message.tool_call_id
-    if message.tool_calls:
-        payload["tool_calls"] = [_tool_call_to_payload(call) for call in message.tool_calls]
-    return payload
-
-
-def _tool_to_payload(tool: ToolSpec) -> dict[str, object]:
+def tool_spec_to_payload(tool: ToolSpec) -> dict[str, object]:
     return {
         "type": "function",
         "function": {
@@ -386,20 +362,7 @@ def _tool_to_payload(tool: ToolSpec) -> dict[str, object]:
     }
 
 
-def _tool_call_to_payload(call: ToolCall) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "type": "function",
-        "function": {
-            "name": call.name,
-            "arguments": json.dumps(dict(call.arguments)),
-        },
-    }
-    if call.id is not None:
-        payload["id"] = call.id
-    return payload
-
-
-def _parse_chat_response(response: object) -> ChatResponse:
+def _parse_inference_message(response: object) -> InferenceMessage:
     choices = _get(response, "choices")
     if not isinstance(choices, Sequence) or isinstance(choices, str) or not choices:
         raise RuntimeError("LLM response did not include choices")
@@ -411,16 +374,24 @@ def _parse_chat_response(response: object) -> ChatResponse:
 
     content = _get(raw_message, "content") or ""
     raw_tool_calls = _get(raw_message, "tool_calls") or ()
-    tool_calls = tuple(_parse_tool_call(item) for item in raw_tool_calls)
-    message = ChatMessage(
-        role="assistant",
+    return InferenceMessage(
+        role=InferenceRole.ASSISTANT,
         content=str(content),
-        tool_calls=tool_calls,
+        tool_calls=[
+            _parse_tool_call(item, index)
+            for index, item in enumerate(raw_tool_calls)
+        ],
     )
-    return ChatResponse(message=message, tool_calls=tool_calls)
 
 
-def _parse_tool_call(raw_call: object) -> ToolCall:
+def _parse_finish_reason(response: object) -> str | None:
+    choice = _first_choice(response)
+    if choice is None:
+        return None
+    return _string_or_none(_get(choice, "finish_reason"))
+
+
+def _parse_tool_call(raw_call: object, fallback_index: int) -> CoreToolCall:
     raw_function = _get(raw_call, "function")
     if raw_function is None:
         raise RuntimeError("LLM tool call did not include a function")
@@ -437,10 +408,14 @@ def _parse_tool_call(raw_call: object) -> ToolCall:
         raise RuntimeError("LLM tool call arguments were not an object")
 
     call_id = _get(raw_call, "id")
-    return ToolCall(
+    index = _get(raw_call, "index")
+    return CoreToolCall(
         id=call_id if isinstance(call_id, str) else None,
         name=name,
         arguments=dict(parsed_arguments),
+        arguments_json=arguments,
+        index=index if isinstance(index, int) else fallback_index,
+        raw=_to_plain(raw_call),
     )
 
 
