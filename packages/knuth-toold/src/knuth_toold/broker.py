@@ -1,30 +1,21 @@
 from __future__ import annotations
 
-from enum import StrEnum
 from typing import Any, Protocol
 
-from pydantic import Field
 from jsonschema import ValidationError, validate
 
-from knuth.core.messages import InferenceMessage, InferenceRole, ToolCall
+from knuth.core.messages import InferenceMessage, InferenceRole
+from knuth.core.tools import (
+    ApprovalRequest,
+    ToolIntent,
+    ToolProposal,
+    ToolProposalStatus,
+    ToolResult,
+    ToolResultStatus,
+)
 from knuth.core.types import ErrorInfo, KnuthModel
-from knuth_toold.base import ToolContext, ToolResult, ToolResultStatus
+from knuth_toold.base import ToolContext
 from knuth_toold.registry import ToolRegistry
-
-
-class ToolProposalStatus(StrEnum):
-    ALLOWED = "allowed"
-    REQUIRES_APPROVAL = "requires_approval"
-    DENIED = "denied"
-
-
-class ApprovalRequest(KnuthModel):
-    id: str
-    run_id: str
-    title: str
-    reason: str
-    risk: str
-    payload: dict[str, Any]
 
 
 class PolicyDecision(KnuthModel):
@@ -53,32 +44,6 @@ class AllowAllPolicy:
         args: dict[str, Any],
     ) -> PolicyDecision:
         return PolicyDecision(kind=ToolProposalStatus.ALLOWED)
-
-
-class ToolIntent(KnuthModel):
-    id: str
-    name: str
-    arguments: dict[str, Any] = Field(default_factory=dict)
-    index: int = 0
-    raw: dict[str, Any] = Field(default_factory=dict)
-
-    @classmethod
-    def from_tool_call(cls, call: ToolCall) -> "ToolIntent":
-        return cls(
-            id=call.id or f"call_{call.index}",
-            name=call.name,
-            arguments=call.arguments,
-            index=call.index,
-            raw=call.raw,
-        )
-
-
-class ToolProposal(KnuthModel):
-    status: ToolProposalStatus
-    intent: ToolIntent
-    normalized_args: dict[str, Any] = Field(default_factory=dict)
-    approval: ApprovalRequest | None = None
-    error: ErrorInfo | None = None
 
 
 class ToolExecutionRecord(KnuthModel):

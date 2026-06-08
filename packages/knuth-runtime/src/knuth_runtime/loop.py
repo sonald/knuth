@@ -1,24 +1,55 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
+from uuid import uuid4
 
-from knuth.core.events import RuntimeEvent
-from knuth.core.messages import InferenceMessage, InferenceRole
-from knuth.core.types import RunStatus
-from knuth_llmd import (
-    InferenceConfig,
-    InferenceEvent,
-    InferenceEventType,
-    InferenceRuntimeOptions,
+from knuth.core.events import (
+    ApprovalRequestedDraft,
+    DurableRuntimeEventDraft,
+    InferenceAborted,
+    InferenceContentDelta,
+    InferenceFailed,
+    InferenceGenerationCompleted,
+    InferenceReasoningCompleted,
+    InferenceReasoningDelta,
+    InferenceToolCallCompleted,
+    InferenceToolCallDelta,
+    InferenceToolCallStarted,
+    ModelAbortedDraft,
+    ModelCompletedDraft,
+    ModelContentDeltaDraft,
+    ModelFailedDraft,
+    ModelReasoningCompletedDraft,
+    ModelReasoningDeltaDraft,
+    ModelStartedDraft,
+    ModelToolCallCompletedDraft,
+    ModelToolCallDeltaDraft,
+    ModelToolCallStartedDraft,
+    RunFailedDraft,
+    RunSucceededDraft,
+    RuntimeEvent,
+    ToolCompletedDraft,
+    ToolIntentDraft,
+    ToolProposedDraft,
+    ToolStartedDraft,
+    TransientRuntimeEventDraft,
+    UserInputRequestedDraft,
+    VerificationFailedDraft,
+    emit_transient_runtime_event,
 )
+from knuth.core.messages import InferenceMessage, InferenceRole
+from knuth.core.tools import ToolIntent, ToolProposalStatus
+from knuth.core.types import ErrorInfo, RunStatus
+from knuth_llmd import InferenceConfig, InferenceRuntimeOptions
 from knuth_runtime.context import RunContext
 from knuth_runtime.services import RuntimeServices
-from knuth_toold import ToolIntent, ToolProposalStatus
 
-# Optional async sink for live observation of a run. Receives streamed
-# InferenceEvents and the durable RuntimeEvents emitted for tool/approval
-# lifecycle. Defaults to None, in which case the loop behaves exactly as before.
-EventSink = Callable[[InferenceEvent | RuntimeEvent], Awaitable[None]]
+EventSink = Callable[[RuntimeEvent], Awaitable[None]]
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat()
 
 
 async def run_agent_loop(
@@ -29,6 +60,24 @@ async def run_agent_loop(
     on_event: EventSink | None = None,
 ) -> RunStatus:
     turns = 0
+
+    async def emit_durable(event: DurableRuntimeEventDraft) -> RuntimeEvent:
+        stored_event = await services.event_store.append(run_id, event)
+        if on_event is not None:
+            await on_event(stored_event)
+        return stored_event
+
+    async def emit_transient(event: TransientRuntimeEventDraft) -> RuntimeEvent:
+        runtime_event = emit_transient_runtime_event(
+            run_id,
+            event,
+            event_id=f"evt_{uuid4().hex}",
+            created_at=_utc_now(),
+        )
+        if on_event is not None:
+            await on_event(runtime_event)
+        return runtime_event
+
     while True:
         run = await services.run_store.get(run_id)
         if run.status in {
@@ -54,11 +103,11 @@ async def run_agent_loop(
             continue
 
         if turns >= run.max_turns:
-            await services.event_store.append(
-                run_id,
-                namespace="run",
-                name="failed",
-                payload={"reason": "max_turns_exceeded", "max_turns": run.max_turns},
+            await emit_durable(
+                RunFailedDraft(
+                    reason="max_turns_exceeded",
+                    max_turns=run.max_turns,
+                )
             )
             await services.run_store.set_status(run_id, RunStatus.FAILED)
             return RunStatus.FAILED
@@ -70,70 +119,85 @@ async def run_agent_loop(
             workspace_uri=run.metadata.get("workspace_uri"),
         )
         view = await services.context_builder.build(ctx)
-        await services.event_store.append(
-            run_id,
-            namespace="model",
-            name="started",
-            payload={
-                "turn": turns,
-                "model": services.inference_client.model,
-                "message_count": len(view.messages),
-                "tool_count": len(view.tools),
-            },
+        await emit_durable(
+            ModelStartedDraft(
+                turn=turns,
+                model=services.inference_client.model,
+                message_count=len(view.messages),
+                tool_count=len(view.tools),
+            )
         )
 
         assistant_message: InferenceMessage | None = None
-        stream_error: dict | None = None
+        finish_reason: str | None = None
+        usage = None
+        stream_error: ErrorInfo | None = None
         async for event in services.inference_client.stream(
             messages=view.messages,
             tools=view.tools,
             config=inference_config.model_copy(update={"run_id": run_id}),
             runtime=runtime_options,
         ):
-            if on_event is not None:
-                await on_event(event)
-            if event.type == InferenceEventType.ERROR:
-                stream_error = event.payload
-                break
-            if event.type == InferenceEventType.ABORTED:
-                await services.event_store.append(
-                    run_id,
-                    namespace="model",
-                    name="aborted",
-                    payload=event.payload,
+            if isinstance(event, InferenceReasoningDelta):
+                await emit_transient(ModelReasoningDeltaDraft(delta=event.delta))
+            elif isinstance(event, InferenceReasoningCompleted):
+                await emit_transient(ModelReasoningCompletedDraft())
+            elif isinstance(event, InferenceContentDelta):
+                await emit_transient(ModelContentDeltaDraft(delta=event.delta))
+            elif isinstance(event, InferenceToolCallStarted):
+                await emit_transient(
+                    ModelToolCallStartedDraft(index=event.index, id=event.id)
                 )
+            elif isinstance(event, InferenceToolCallDelta):
+                await emit_transient(
+                    ModelToolCallDeltaDraft(
+                        index=event.index,
+                        id=event.id,
+                        name_delta=event.name_delta,
+                        arguments_json_delta=event.arguments_json_delta,
+                        raw=event.raw,
+                    )
+                )
+            elif isinstance(event, InferenceToolCallCompleted):
+                await emit_transient(
+                    ModelToolCallCompletedDraft(tool_call=event.tool_call)
+                )
+            elif isinstance(event, InferenceFailed):
+                stream_error = event.error
+                break
+            elif isinstance(event, InferenceAborted):
+                await emit_durable(ModelAbortedDraft(reason=event.reason))
                 await services.run_store.set_status(run_id, RunStatus.PAUSED)
                 return RunStatus.PAUSED
-            if event.type == InferenceEventType.GENERATION_END:
-                assistant_message = InferenceMessage.model_validate(
-                    event.payload["message"]
-                )
+            elif isinstance(event, InferenceGenerationCompleted):
+                assistant_message = event.message
+                finish_reason = event.finish_reason
+                usage = event.usage
 
         if stream_error is not None:
-            await services.event_store.append(
-                run_id,
-                namespace="model",
-                name="failed",
-                payload=stream_error,
-            )
+            await emit_durable(ModelFailedDraft(error=stream_error))
             await services.run_store.set_status(run_id, RunStatus.FAILED)
             return RunStatus.FAILED
 
         if assistant_message is None:
-            await services.event_store.append(
-                run_id,
-                namespace="model",
-                name="failed",
-                payload={"reason": "missing_generation_end"},
+            await emit_durable(
+                ModelFailedDraft(
+                    error=ErrorInfo(
+                        code="missing_generation_end",
+                        message="missing_generation_end",
+                    )
+                )
             )
             await services.run_store.set_status(run_id, RunStatus.FAILED)
             return RunStatus.FAILED
 
-        await services.event_store.append(
-            run_id,
-            namespace="model",
-            name="completed",
-            payload={"turn": turns, "assistant_message": assistant_message.model_dump()},
+        await emit_durable(
+            ModelCompletedDraft(
+                turn=turns,
+                message=assistant_message,
+                finish_reason=finish_reason,
+                usage=usage,
+            )
         )
 
         if assistant_message.tool_calls:
@@ -145,20 +209,14 @@ async def run_agent_loop(
             continue
 
         if assistant_message.content and assistant_message.content.strip():
-            await services.event_store.append(
-                run_id,
-                namespace="run",
-                name="succeeded",
-                payload={"answer": assistant_message.content or "", "turns": turns},
+            await emit_durable(
+                RunSucceededDraft(answer=assistant_message.content or "", turns=turns)
             )
             await services.run_store.set_status(run_id, RunStatus.SUCCEEDED)
             return RunStatus.SUCCEEDED
 
-        await services.event_store.append(
-            run_id,
-            namespace="verification",
-            name="failed",
-            payload={"ok": False, "reason": "empty_final_answer"},
+        await emit_durable(
+            VerificationFailedDraft(reason="empty_final_answer")
         )
 
 
@@ -168,10 +226,8 @@ async def handle_tool_calls(
     services: RuntimeServices,
     on_event: EventSink | None = None,
 ) -> RunStatus | None:
-    async def emit(namespace: str, name: str, payload: dict) -> RuntimeEvent:
-        event = await services.event_store.append(
-            run_id, namespace=namespace, name=name, payload=payload
-        )
+    async def emit(event: DurableRuntimeEventDraft) -> RuntimeEvent:
+        event = await services.event_store.append(run_id, event)
         if on_event is not None:
             await on_event(event)
         return event
@@ -180,21 +236,19 @@ async def handle_tool_calls(
     for intent in intents:
         if intent.name == "knuth.ask_user":
             await emit(
-                "user_input",
-                "requested",
-                {
-                    "question": intent.arguments.get("question", ""),
-                    "tool_call_id": intent.id,
-                },
+                UserInputRequestedDraft(
+                    question=str(intent.arguments.get("question", "")),
+                    tool_call_id=intent.id,
+                )
             )
             await services.run_store.set_status(run_id, RunStatus.WAITING_USER)
             return RunStatus.WAITING_USER
 
     proposals = []
     for intent in intents:
-        await emit("tool", "intent", intent.model_dump())
+        await emit(ToolIntentDraft(intent=intent))
         proposal = await services.tool_broker.propose(run_id, intent)
-        await emit("tool", "proposed", proposal.model_dump())
+        await emit(ToolProposedDraft(proposal=proposal))
         if proposal.status == ToolProposalStatus.DENIED:
             error_message = InferenceMessage(
                 role=InferenceRole.TOOL_RESULT,
@@ -203,13 +257,11 @@ async def handle_tool_calls(
                 content=f"Tool call denied: {proposal.error.message if proposal.error else 'unknown'}",
             )
             await emit(
-                "tool",
-                "completed",
-                {
-                    "intent": intent.model_dump(),
-                    "message": error_message.model_dump(),
-                    "denied": True,
-                },
+                ToolCompletedDraft(
+                    intent=intent,
+                    message=error_message,
+                    outcome="denied",
+                )
             )
             continue
         if proposal.status == ToolProposalStatus.REQUIRES_APPROVAL:
@@ -217,22 +269,29 @@ async def handle_tool_calls(
                 await services.run_store.set_status(run_id, RunStatus.FAILED)
                 return RunStatus.FAILED
             approval = await services.approvals.request(proposal.approval)
-            await emit("approval", "requested", approval.model_dump())
+            await emit(
+                ApprovalRequestedDraft(
+                    approval_id=approval.id,
+                    tool_call_id=proposal.intent.id,
+                    title=approval.title,
+                    reason=approval.reason,
+                    risk=approval.risk,
+                )
+            )
             await services.run_store.set_status(run_id, RunStatus.WAITING_APPROVAL)
             return RunStatus.WAITING_APPROVAL
         proposals.append(proposal)
 
     for proposal in proposals:
-        await emit("tool", "started", {"intent": proposal.intent.model_dump()})
+        await emit(ToolStartedDraft(intent=proposal.intent))
         record = await services.tool_broker.execute(run_id, proposal)
         await emit(
-            "tool",
-            "completed",
-            {
-                "intent": proposal.intent.model_dump(),
-                "result": record.result.model_dump(),
-                "message": record.to_tool_result_message().model_dump(),
-            },
+            ToolCompletedDraft(
+                intent=proposal.intent,
+                result=record.result,
+                message=record.to_tool_result_message(),
+                outcome="succeeded" if record.result.ok else "failed",
+            )
         )
     return None
 
@@ -244,24 +303,13 @@ async def _pending_assistant_tool_message(
     latest_model: tuple[int, InferenceMessage] | None = None
     completed_ids: set[str] = set()
     for event in events:
-        if event.namespace == "model" and event.name == "completed":
-            raw = event.payload.get("assistant_message")
-            if isinstance(raw, dict):
-                message = InferenceMessage.model_validate(raw)
-                if message.tool_calls:
-                    latest_model = (event.seq, message)
-                    completed_ids.clear()
-        elif (
-            latest_model is not None
-            and event.seq > latest_model[0]
-            and event.namespace == "tool"
-            and event.name == "completed"
-        ):
-            raw = event.payload.get("message")
-            if isinstance(raw, dict):
-                tool_message = InferenceMessage.model_validate(raw)
-                if tool_message.tool_call_id is not None:
-                    completed_ids.add(tool_message.tool_call_id)
+        if event.type == "model.completed":
+            if event.message.tool_calls:
+                latest_model = (event.seq, event.message)
+                completed_ids.clear()
+        elif latest_model is not None and event.seq > latest_model[0] and event.type == "tool.completed":
+            if event.message.tool_call_id is not None:
+                completed_ids.add(event.message.tool_call_id)
     if latest_model is None:
         return None
     expected_ids = {call.id or f"call_{call.index}" for call in latest_model[1].tool_calls}

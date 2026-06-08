@@ -1,8 +1,6 @@
 from knuth_llmd.client import (
     InferenceClient,
     InferenceConfig,
-    InferenceEvent,
-    InferenceEventType,
     InferenceRuntimeOptions,
     LiteLLMInferenceClient,
     StreamAccumulator,
@@ -13,8 +11,6 @@ __all__ = [
     "Config",
     "InferenceClient",
     "InferenceConfig",
-    "InferenceEvent",
-    "InferenceEventType",
     "InferenceRuntimeOptions",
     "LiteLLMInferenceClient",
     "StreamAccumulator",

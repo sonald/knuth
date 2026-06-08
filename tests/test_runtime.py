@@ -5,16 +5,18 @@ from unittest.mock import patch
 
 import anyio
 
+from knuth.core.events import (
+    InferenceContentDelta,
+    InferenceGenerationCompleted,
+    RunCreatedDraft,
+)
 from knuth.core.messages import InferenceMessage, InferenceRole, ToolCall as CoreToolCall
 from knuth.core.types import RunStatus
-from knuth_llmd import (
-    InferenceConfig,
-    InferenceEvent,
-    InferenceEventType,
-)
+from knuth_llmd import InferenceConfig
 from knuth_runtime import (
     MemoryEventStore,
     MemoryRunStore,
+    SQLiteStore,
     build_default_runtime,
     build_memory_runtime,
 )
@@ -22,6 +24,70 @@ from knuth_runtime.approval import MemoryApprovalService
 from knuth_runtime.context import reconstruct_messages_from_events
 from knuth_runtime.policy import PolicyEngine
 from knuth_toold import ToolBroker, create_default_registry
+
+
+class EventStoreTests(unittest.TestCase):
+    def test_append_stores_strongly_typed_runtime_event(self) -> None:
+        store = MemoryEventStore()
+
+        event = anyio.run(
+            store.append,
+            "run-1",
+            RunCreatedDraft(query="hello", metadata={"workspace_uri": "file:///tmp"}),
+        )
+
+        self.assertEqual(event.type, "run.created")
+        self.assertEqual(event.run_id, "run-1")
+        self.assertEqual(event.seq, 1)
+        self.assertEqual(event.query, "hello")
+        self.assertEqual(event.metadata["workspace_uri"], "file:///tmp")
+        self.assertFalse(hasattr(event, "namespace"))
+        self.assertFalse(hasattr(event, "name"))
+        self.assertFalse(hasattr(event, "payload"))
+
+    def test_sqlite_store_round_trips_typed_runtime_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteStore(Path(temp_dir, "knuth.db"))
+
+            appended = anyio.run(
+                store.append,
+                "run-1",
+                RunCreatedDraft(query="hello", metadata={"workspace_uri": "file:///tmp"}),
+            )
+            listed = anyio.run(store.list_events, "run-1")
+
+        self.assertEqual(appended.type, "run.created")
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0].query, "hello")
+        self.assertEqual(listed[0].metadata["workspace_uri"], "file:///tmp")
+        self.assertFalse(hasattr(listed[0], "namespace"))
+        self.assertFalse(hasattr(listed[0], "name"))
+        self.assertFalse(hasattr(listed[0], "payload"))
+
+    def test_sqlite_store_rejects_legacy_event_schema(self) -> None:
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir, "knuth.db")
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    create table events (
+                      id text primary key,
+                      run_id text not null,
+                      seq integer not null,
+                      namespace text not null,
+                      name text not null,
+                      type text not null,
+                      payload_json text not null,
+                      durability text not null,
+                      created_at text not null
+                    )
+                    """
+                )
+
+            with self.assertRaisesRegex(RuntimeError, "breaking event schema"):
+                SQLiteStore(db_path)
 
 
 class RuntimeFactoryTests(unittest.TestCase):
@@ -44,7 +110,10 @@ class RuntimeFactoryTests(unittest.TestCase):
             client_class.return_value = object()
             create_registry.return_value = create_default_registry(Path.cwd())
 
-            runtime = anyio.run(build_default_runtime)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                runtime = anyio.run(
+                    build_default_runtime, Path(temp_dir, "knuth.db")
+                )
 
             self.assertIsNotNone(runtime)
             create_registry.assert_called_once_with()
@@ -60,12 +129,11 @@ class ScriptedInferenceClient:
     async def stream(self, messages, tools, config, runtime=None):
         message = self.messages[min(self.calls, len(self.messages) - 1)]
         self.calls += 1
-        yield InferenceEvent(
-            type=InferenceEventType.GENERATION_END,
+        yield InferenceGenerationCompleted(
             generation_id=f"gen-{self.calls}",
             seq=1,
             run_id=config.run_id,
-            payload={"message": message.model_dump()},
+            message=message,
         )
 
 
@@ -114,14 +182,14 @@ class EventDrivenRuntimeTests(unittest.TestCase):
 
             self.assertEqual(turn.status, RunStatus.SUCCEEDED)
             self.assertEqual(turn.answer, "Final answer: Knuth works")
-            self.assertIn(("tool", "completed"), [(e.namespace, e.name) for e in events])
-            self.assertIn(("run", "succeeded"), [(e.namespace, e.name) for e in events])
+            self.assertIn("tool.completed", [e.type for e in events])
+            self.assertIn("run.succeeded", [e.type for e in events])
             started = [
-                e for e in events if e.namespace == "model" and e.name == "started"
+                e for e in events if e.type == "model.started"
             ]
-            self.assertEqual(started[0].payload["model"], "scripted-model")
+            self.assertEqual(started[0].model, "scripted-model")
             self.assertNotIn(
-                ("model", "content_delta"), [(e.namespace, e.name) for e in events]
+                "model.content.delta", [e.type for e in events]
             )
             reconstructed = reconstruct_messages_from_events(events)
             self.assertEqual(reconstructed[-1].content, "Final answer: Knuth works")
@@ -221,20 +289,18 @@ class StreamingTextClient:
         text = self.answers[min(self.calls, len(self.answers) - 1)]
         self.calls += 1
         gen = f"gen-{self.calls}"
-        yield InferenceEvent(
-            type=InferenceEventType.CONTENT_DELTA,
+        yield InferenceContentDelta(
             generation_id=gen,
             seq=1,
             run_id=config.run_id,
-            payload={"delta": text},
+            delta=text,
         )
         message = InferenceMessage(role=InferenceRole.ASSISTANT, content=text)
-        yield InferenceEvent(
-            type=InferenceEventType.GENERATION_END,
+        yield InferenceGenerationCompleted(
             generation_id=gen,
             seq=2,
             run_id=config.run_id,
-            payload={"message": message.model_dump()},
+            message=message,
         )
 
 
@@ -260,7 +326,7 @@ class StreamingRuntimeTests(unittest.TestCase):
             tool_broker=broker,
         )
 
-    def test_run_streaming_forwards_inference_events(self) -> None:
+    def test_run_streaming_forwards_runtime_event_projection(self) -> None:
         async def scenario():
             collector = _Collector()
             with tempfile.TemporaryDirectory() as workspace:
@@ -270,14 +336,12 @@ class StreamingRuntimeTests(unittest.TestCase):
 
         result, collected = anyio.run(scenario)
         self.assertEqual(result.status, RunStatus.SUCCEEDED)
-        types = [getattr(e, "type", None) for e in collected]
-        self.assertIn(InferenceEventType.CONTENT_DELTA, types)
-        self.assertIn(InferenceEventType.GENERATION_END, types)
-        deltas = [
-            e.payload.get("delta")
-            for e in collected
-            if getattr(e, "type", None) == InferenceEventType.CONTENT_DELTA
-        ]
+        types = [event.type for event in collected]
+        self.assertIn("model.content.delta", types)
+        self.assertIn("model.completed", types)
+        self.assertNotIn("inference.content.delta", types)
+        self.assertTrue(all(not event.type.startswith("inference.") for event in collected))
+        deltas = [event.delta for event in collected if event.type == "model.content.delta"]
         self.assertEqual(deltas, ["Hello there"])
 
     def test_run_streaming_forwards_tool_lifecycle(self) -> None:
@@ -309,13 +373,9 @@ class StreamingRuntimeTests(unittest.TestCase):
 
         result, collected = anyio.run(scenario)
         self.assertEqual(result.status, RunStatus.SUCCEEDED)
-        runtime_events = [
-            (e.namespace, e.name)
-            for e in collected
-            if getattr(e, "namespace", None) is not None
-        ]
-        self.assertIn(("tool", "started"), runtime_events)
-        self.assertIn(("tool", "completed"), runtime_events)
+        types = [event.type for event in collected]
+        self.assertIn("tool.started", types)
+        self.assertIn("tool.completed", types)
 
     def test_run_streaming_keeps_multi_turn_memory(self) -> None:
         async def scenario():

@@ -1,15 +1,8 @@
 """Rich rendering of a streaming agent run.
 
-``EventRenderer`` consumes the events forwarded by ``run_agent_loop`` via the
-``on_event`` callback and turns them into a Claude Code style terminal view:
+``EventRenderer`` consumes the runtime events forwarded by ``run_agent_loop`` via
+the ``on_event`` callback and turns them into a Claude Code style terminal view:
 a thinking spinner, streamed assistant text, and live tool-call lines.
-
-Two event shapes flow through ``handle``:
-
-- ``InferenceEvent`` (token-level): ``generation_start`` / ``content_delta`` /
-  ``reasoning_delta`` / ``tool_call`` / ``generation_end`` / ``error`` / ...
-- ``RuntimeEvent`` (durable lifecycle): ``tool/started`` / ``tool/completed`` /
-  ``approval/requested`` / ``user_input/requested`` / ...
 """
 
 from __future__ import annotations
@@ -18,6 +11,21 @@ import json
 import time
 from typing import Any
 
+from knuth.core.events import (
+    ApprovalRequested,
+    ModelAborted,
+    ModelCompleted,
+    ModelContentDelta,
+    ModelFailed,
+    ModelReasoningCompleted,
+    ModelReasoningDelta,
+    ModelToolCallCompleted,
+    RuntimeEvent,
+    ToolCompleted,
+    ToolStarted,
+    UserInputRequested,
+)
+from knuth.core.messages import ToolCall
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
@@ -39,72 +47,59 @@ class EventRenderer:
         self._content_live: Live | None = None
         self._content_parts: list[str] = []
 
-    async def handle(self, event: Any) -> None:
-        # RuntimeEvent has namespace/name; InferenceEvent has a `.type`.
-        if getattr(event, "namespace", None) is not None:
-            self._handle_runtime_event(event)
-        else:
-            self._handle_inference_event(event)
+    async def handle(self, event: RuntimeEvent) -> None:
+        self._handle_runtime_event(event)
 
     def finish(self) -> None:
         """Tear down any live region left open (end of a turn)."""
         self._stop_thinking()
         self._stop_content()
 
-    # -- inference (token-level) ------------------------------------------
-
-    def _handle_inference_event(self, event: Any) -> None:
-        etype = str(getattr(event, "type", ""))
-        payload = getattr(event, "payload", {}) or {}
-        if etype == "reasoning_delta":
+    def _handle_runtime_event(self, event: RuntimeEvent) -> None:
+        if isinstance(event, ModelReasoningDelta):
             self._stop_content()
             self._start_thinking()
-            self._append_reasoning(str(payload.get("delta", "")))
-        elif etype == "content_delta":
+            self._append_reasoning(event.delta)
+        elif isinstance(event, ModelReasoningCompleted):
             self._stop_thinking()
-            self._append_content(str(payload.get("delta", "")))
-        elif etype == "tool_call":
+        elif isinstance(event, ModelContentDelta):
             self._stop_thinking()
-            self._stop_content()
-            self._print_tool_call(payload.get("tool_call") or {})
-        elif etype == "generation_end":
+            self._append_content(event.delta)
+        elif isinstance(event, ModelToolCallCompleted):
             self._stop_thinking()
             self._stop_content()
-        elif etype == "error":
+            self._print_tool_call(event.tool_call)
+        elif isinstance(event, ModelCompleted):
             self._stop_thinking()
             self._stop_content()
-            message = payload.get("message") or payload.get("code") or "unknown error"
-            self._console.print(Text(f"✗ error: {message}", style="bold red"))
-        elif etype == "aborted":
+        elif isinstance(event, ModelFailed):
+            self._stop_thinking()
+            self._stop_content()
+            self._console.print(Text(f"✗ error: {event.error.message}", style="bold red"))
+        elif isinstance(event, ModelAborted):
             self._stop_thinking()
             self._stop_content()
             self._console.print(Text("⊘ aborted", style="yellow"))
-
-    # -- runtime (lifecycle) ----------------------------------------------
-
-    def _handle_runtime_event(self, event: Any) -> None:
-        key = (event.namespace, event.name)
-        payload = event.payload or {}
-        if key == ("tool", "started"):
+        elif isinstance(event, ToolStarted):
             self._stop_thinking()
             self._stop_content()
-            name = (payload.get("intent") or {}).get("name", "tool")
+            name = event.intent.name
             self._console.print(Text(f"  ⏳ {name}…", style="dim"))
-        elif key == ("tool", "completed"):
-            self._print_tool_completed(payload)
-        elif key == ("approval", "requested"):
+        elif isinstance(event, ToolCompleted):
+            self._print_tool_completed(event)
+        elif isinstance(event, ApprovalRequested):
             self._stop_thinking()
             self._stop_content()
-            title = payload.get("title") or payload.get("reason") or "tool call"
-            risk = payload.get("risk")
+            title = event.title or event.reason or "tool call"
+            risk = event.risk
             suffix = f" [risk: {risk}]" if risk else ""
             self._console.print(
                 Text(f"  ⚠ approval required: {title}{suffix}", style="yellow")
             )
-        elif key == ("user_input", "requested"):
+        elif isinstance(event, UserInputRequested):
             self._stop_thinking()
             self._stop_content()
-            question = payload.get("question") or "(no question)"
+            question = event.question or "(no question)"
             self._console.print(Text(f"  ? {question}", style="cyan"))
 
     # -- thinking spinner -------------------------------------------------
@@ -183,21 +178,21 @@ class EventRenderer:
 
     # -- tool rendering ---------------------------------------------------
 
-    def _print_tool_call(self, tool_call: dict[str, Any]) -> None:
-        name = tool_call.get("name", "tool")
-        args = tool_call.get("arguments") or {}
+    def _print_tool_call(self, tool_call: ToolCall) -> None:
+        name = tool_call.name or "tool"
+        args = tool_call.arguments
         self._console.print(Text(f"● {name}({_format_args(args)})", style="bold blue"))
 
-    def _print_tool_completed(self, payload: dict[str, Any]) -> None:
+    def _print_tool_completed(self, event: ToolCompleted) -> None:
         self._stop_thinking()
         self._stop_content()
-        name = (payload.get("intent") or {}).get("name", "tool")
-        if payload.get("denied"):
+        name = event.intent.name
+        if event.outcome == "denied":
             self._console.print(Text(f"  ✘ {name} denied", style="red"))
             return
-        result = payload.get("result") or {}
-        ok = result.get("ok", True)
-        body = result.get("content") or result.get("error") or ""
+        result = event.result
+        ok = True if result is None else result.ok
+        body = "" if result is None else result.content or (result.error.message if result.error else "")
         mark = "✔" if ok else "✘"
         style = "green" if ok else "red"
         summary = _truncate(str(body).strip().replace("\n", " "), _MAX_RESULT_LEN)

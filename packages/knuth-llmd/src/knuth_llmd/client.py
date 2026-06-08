@@ -2,26 +2,26 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from enum import StrEnum
 from typing import Any, AsyncIterator, Mapping, Protocol, Sequence
 from uuid import uuid4
 
 from pydantic import Field
 
+from knuth.core.events import (
+    InferenceAborted,
+    InferenceContentDelta,
+    InferenceEvent,
+    InferenceFailed,
+    InferenceGenerationCompleted,
+    InferenceGenerationStarted,
+    InferenceReasoningCompleted,
+    InferenceReasoningDelta,
+    InferenceToolCallCompleted,
+    InferenceToolCallDelta,
+    InferenceToolCallStarted,
+)
 from knuth.core.messages import InferenceMessage, InferenceRole, ToolCall as CoreToolCall
 from knuth.core.types import ErrorInfo, KnuthModel
-
-
-class InferenceEventType(StrEnum):
-    GENERATION_START = "generation_start"
-    GENERATION_END = "generation_end"
-    CONTENT_DELTA = "content_delta"
-    CONTENT = "content"
-    REASONING_DELTA = "reasoning_delta"
-    REASONING = "reasoning"
-    TOOL_CALL = "tool_call"
-    ERROR = "error"
-    ABORTED = "aborted"
 
 
 class InferenceConfig(KnuthModel):
@@ -43,14 +43,6 @@ class AbortSignal(Protocol):
 
 class InferenceRuntimeOptions(KnuthModel):
     abort_signal: Any | None = Field(default=None, exclude=True)
-
-
-class InferenceEvent(KnuthModel):
-    type: InferenceEventType
-    generation_id: str
-    seq: int
-    run_id: str | None = None
-    payload: dict[str, Any] = Field(default_factory=dict)
 
 
 class InferenceClient(Protocol):
@@ -118,13 +110,18 @@ class _ThinkTagSplitter:
                     out.append(("reasoning", self._buf[:idx]))
                 self._buf = self._buf[idx + len(_THINK_CLOSE) :]
                 self._in_think = False
+                out.append(("reasoning_completed", ""))
                 continue
             hold = _suffix_overlap(self._buf, _THINK_CLOSE)
             if len(self._buf) > hold:
                 out.append(("reasoning", self._buf[: len(self._buf) - hold]))
                 self._buf = self._buf[len(self._buf) - hold :]
             break
-        return [(channel, chunk) for channel, chunk in out if chunk]
+        return [
+            (channel, chunk)
+            for channel, chunk in out
+            if chunk or channel == "reasoning_completed"
+        ]
 
     def flush(self) -> list[tuple[str, str]]:
         if not self._buf:
@@ -142,8 +139,8 @@ class StreamAccumulator:
         self.finish_reason: str | None = None
         self._think = _ThinkTagSplitter()
 
-    def feed_chunk(self, chunk: object) -> list[tuple[InferenceEventType, dict[str, Any]]]:
-        events: list[tuple[InferenceEventType, dict[str, Any]]] = []
+    def feed_chunk(self, chunk: object) -> list[tuple[type, dict[str, Any]]]:
+        events: list[tuple[type, dict[str, Any]]] = []
         choice = _first_choice(chunk)
         if choice is None:
             return events
@@ -160,24 +157,23 @@ class StreamAccumulator:
             for channel, text in self._think.feed(content):
                 if channel == "reasoning":
                     self.reasoning_parts.append(text)
-                    events.append(
-                        (InferenceEventType.REASONING_DELTA, {"delta": text})
-                    )
+                    events.append((InferenceReasoningDelta, {"delta": text}))
+                elif channel == "reasoning_completed":
+                    events.append((InferenceReasoningCompleted, {}))
                 else:
                     self.content_parts.append(text)
-                    events.append(
-                        (InferenceEventType.CONTENT_DELTA, {"delta": text})
-                    )
+                    events.append((InferenceContentDelta, {"delta": text}))
 
         reasoning = _get(delta, "reasoning_content") or _get(delta, "reasoning")
         if isinstance(reasoning, str) and reasoning:
             self.reasoning_parts.append(reasoning)
-            events.append((InferenceEventType.REASONING_DELTA, {"delta": reasoning}))
+            events.append((InferenceReasoningDelta, {"delta": reasoning}))
 
         for raw_call in _get(delta, "tool_calls") or ():
             index = _get(raw_call, "index")
             if not isinstance(index, int):
                 index = len(self.tool_calls)
+            is_new_call = index not in self.tool_calls
             current = self.tool_calls.setdefault(
                 index,
                 {"id": None, "name": "", "arguments_json": "", "raw": {}},
@@ -185,6 +181,13 @@ class StreamAccumulator:
             call_id = _get(raw_call, "id")
             if isinstance(call_id, str):
                 current["id"] = call_id
+            if is_new_call:
+                events.append(
+                    (
+                        InferenceToolCallStarted,
+                        {"index": index, "id": current["id"]},
+                    )
+                )
             raw_function = _get(raw_call, "function") or {}
             name = _get(raw_function, "name")
             if isinstance(name, str):
@@ -193,24 +196,33 @@ class StreamAccumulator:
             if isinstance(arguments, str):
                 current["arguments_json"] += arguments
             current["raw"] = _to_plain(raw_call)
+            if isinstance(name, str) or isinstance(arguments, str):
+                events.append(
+                    (
+                        InferenceToolCallDelta,
+                        {
+                            "index": index,
+                            "id": current["id"],
+                            "name_delta": name if isinstance(name, str) else None,
+                            "arguments_json_delta": arguments
+                            if isinstance(arguments, str)
+                            else None,
+                            "raw": current["raw"],
+                        },
+                    )
+                )
 
         return events
 
-    def finish(self) -> list[tuple[InferenceEventType, dict[str, Any]]]:
-        events: list[tuple[InferenceEventType, dict[str, Any]]] = []
+    def finish(self) -> list[tuple[type, dict[str, Any]]]:
+        events: list[tuple[type, dict[str, Any]]] = []
         for channel, text in self._think.flush():
             if channel == "reasoning":
                 self.reasoning_parts.append(text)
-                events.append((InferenceEventType.REASONING_DELTA, {"delta": text}))
+                events.append((InferenceReasoningDelta, {"delta": text}))
             else:
                 self.content_parts.append(text)
-                events.append((InferenceEventType.CONTENT_DELTA, {"delta": text}))
-        content = "".join(self.content_parts)
-        reasoning = "".join(self.reasoning_parts)
-        if content:
-            events.append((InferenceEventType.CONTENT, {"content": content}))
-        if reasoning:
-            events.append((InferenceEventType.REASONING, {"reasoning": reasoning}))
+                events.append((InferenceContentDelta, {"delta": text}))
         for index in sorted(self.tool_calls):
             current = self.tool_calls[index]
             arguments_json = current["arguments_json"] or "{}"
@@ -228,7 +240,7 @@ class StreamAccumulator:
                 index=index,
                 raw=current["raw"],
             )
-            events.append((InferenceEventType.TOOL_CALL, {"tool_call": call.model_dump()}))
+            events.append((InferenceToolCallCompleted, {"tool_call": call}))
         return events
 
     def to_message(self) -> InferenceMessage:
@@ -289,20 +301,17 @@ class LiteLLMInferenceClient:
         generation_id = f"gen_{uuid4().hex}"
         seq = 0
 
-        def event(
-            event_type: InferenceEventType, payload: dict[str, Any] | None = None
-        ) -> InferenceEvent:
+        def event(event_class: type, fields: dict[str, Any] | None = None) -> InferenceEvent:
             nonlocal seq
             seq += 1
-            return InferenceEvent(
-                type=event_type,
+            return event_class(
                 generation_id=generation_id,
                 seq=seq,
                 run_id=config.run_id,
-                payload=payload or {},
+                **(fields or {}),
             )
 
-        yield event(InferenceEventType.GENERATION_START, {"model": self.model})
+        yield event(InferenceGenerationStarted, {"model": self.model})
         if runtime and runtime.abort_signal:
             await runtime.abort_signal.checkpoint()
 
@@ -317,27 +326,29 @@ class LiteLLMInferenceClient:
             response = await self._completion_fn(**kwargs)
             async for chunk in response:  # type: ignore[attr-defined]
                 if runtime and runtime.abort_signal and runtime.abort_signal.is_aborted():
-                    yield event(InferenceEventType.ABORTED, {"reason": "abort_signal"})
+                    yield event(InferenceAborted, {"reason": "abort_signal"})
                     return
-                for event_type, payload in accumulator.feed_chunk(chunk):
-                    yield event(event_type, payload)
-            for event_type, payload in accumulator.finish():
-                yield event(event_type, payload)
+                for event_class, fields in accumulator.feed_chunk(chunk):
+                    yield event(event_class, fields)
+            for event_class, fields in accumulator.finish():
+                yield event(event_class, fields)
             yield event(
-                InferenceEventType.GENERATION_END,
+                InferenceGenerationCompleted,
                 {
                     "finish_reason": accumulator.finish_reason,
-                    "message": accumulator.to_message().model_dump(),
+                    "message": accumulator.to_message(),
                 },
             )
         except Exception as exc:
             yield event(
-                InferenceEventType.ERROR,
-                ErrorInfo(
-                    code=exc.__class__.__name__,
-                    message=str(exc),
-                    retryable=False,
-                ).model_dump(),
+                InferenceFailed,
+                {
+                    "error": ErrorInfo(
+                        code=exc.__class__.__name__,
+                        message=str(exc),
+                        retryable=False,
+                    )
+                },
             )
 
     def _base_kwargs(self, config: InferenceConfig) -> dict[str, object]:

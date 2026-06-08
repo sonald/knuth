@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -8,9 +7,14 @@ from uuid import uuid4
 
 import anyio
 
-from knuth.core.events import RuntimeEvent
+from knuth.core.events import (
+    DurableRuntimeEventDraft,
+    StoredRuntimeEvent,
+    parse_stored_runtime_event_json,
+    store_runtime_event,
+)
 from knuth.core.runs import AgentRun
-from knuth.core.types import EventDurability, RunStatus
+from knuth.core.types import RunStatus
 
 
 def utc_now() -> str:
@@ -32,16 +36,13 @@ class EventStore(Protocol):
     async def append(
         self,
         run_id: str,
-        namespace: str,
-        name: str,
-        payload: dict[str, Any] | None = None,
-        durability: EventDurability = EventDurability.DURABLE,
-    ) -> RuntimeEvent:
+        event: DurableRuntimeEventDraft,
+    ) -> StoredRuntimeEvent:
         ...
 
     async def list_events(
         self, run_id: str, after_seq: int | None = None
-    ) -> list[RuntimeEvent]:
+    ) -> list[StoredRuntimeEvent]:
         ...
 
 
@@ -75,34 +76,27 @@ class MemoryRunStore:
 
 class MemoryEventStore:
     def __init__(self) -> None:
-        self._events: dict[str, list[RuntimeEvent]] = {}
+        self._events: dict[str, list[StoredRuntimeEvent]] = {}
 
     async def append(
         self,
         run_id: str,
-        namespace: str,
-        name: str,
-        payload: dict[str, Any] | None = None,
-        durability: EventDurability = EventDurability.DURABLE,
-    ) -> RuntimeEvent:
+        event: DurableRuntimeEventDraft,
+    ) -> StoredRuntimeEvent:
         events = self._events.setdefault(run_id, [])
-        event = RuntimeEvent(
-            id=f"evt_{uuid4().hex}",
-            run_id=run_id,
-            seq=len(events) + 1,
-            namespace=namespace,
-            name=name,
-            type=f"{namespace}.{name}",
-            payload=payload or {},
-            durability=durability,
+        stored_event = store_runtime_event(
+            run_id,
+            len(events) + 1,
+            event,
+            event_id=f"evt_{uuid4().hex}",
             created_at=utc_now(),
         )
-        events.append(event)
-        return event
+        events.append(stored_event)
+        return stored_event
 
     async def list_events(
         self, run_id: str, after_seq: int | None = None
-    ) -> list[RuntimeEvent]:
+    ) -> list[StoredRuntimeEvent]:
         events = self._events.get(run_id, [])
         if after_seq is None:
             return list(events)
@@ -136,11 +130,8 @@ class SQLiteStore:
                   id text primary key,
                   run_id text not null,
                   seq integer not null,
-                  namespace text not null,
-                  name text not null,
                   type text not null,
-                  payload_json text not null,
-                  durability text not null,
+                  event_json text not null,
                   created_at text not null,
                   unique(run_id, seq)
                 );
@@ -154,6 +145,16 @@ class SQLiteStore:
                 );
                 """
             )
+            columns = {
+                row[1]
+                for row in conn.execute("pragma table_info(events)").fetchall()
+            }
+            legacy_columns = {"namespace", "name", "payload_json", "durability"}
+            required_columns = {"id", "run_id", "seq", "type", "event_json", "created_at"}
+            if columns & legacy_columns or not required_columns.issubset(columns):
+                raise RuntimeError(
+                    "breaking event schema: remove the legacy events table or use a new database"
+                )
 
     async def create(self, query: str, metadata: dict[str, Any] | None = None) -> AgentRun:
         now = utc_now()
@@ -209,68 +210,52 @@ class SQLiteStore:
     async def append(
         self,
         run_id: str,
-        namespace: str,
-        name: str,
-        payload: dict[str, Any] | None = None,
-        durability: EventDurability = EventDurability.DURABLE,
-    ) -> RuntimeEvent:
+        event: DurableRuntimeEventDraft,
+    ) -> StoredRuntimeEvent:
         return await anyio.to_thread.run_sync(
             self._append_event,
             run_id,
-            namespace,
-            name,
-            payload or {},
-            durability,
+            event,
         )
 
     def _append_event(
         self,
         run_id: str,
-        namespace: str,
-        name: str,
-        payload: dict[str, Any],
-        durability: EventDurability,
-    ) -> RuntimeEvent:
+        event: DurableRuntimeEventDraft,
+    ) -> StoredRuntimeEvent:
         with self._connect() as conn:
             row = conn.execute(
                 "select coalesce(max(seq), 0) + 1 from events where run_id = ?",
                 (run_id,),
             ).fetchone()
             seq = int(row[0])
-            event = RuntimeEvent(
-                id=f"evt_{uuid4().hex}",
-                run_id=run_id,
-                seq=seq,
-                namespace=namespace,
-                name=name,
-                type=f"{namespace}.{name}",
-                payload=payload,
-                durability=durability,
+            stored_event = store_runtime_event(
+                run_id,
+                seq,
+                event,
+                event_id=f"evt_{uuid4().hex}",
                 created_at=utc_now(),
             )
             conn.execute(
-                "insert into events (id, run_id, seq, namespace, name, type, payload_json, durability, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "insert into events (id, run_id, seq, type, event_json, created_at) values (?, ?, ?, ?, ?, ?)",
                 (
-                    event.id,
-                    event.run_id,
-                    event.seq,
-                    event.namespace,
-                    event.name,
-                    event.type,
-                    json.dumps(event.payload),
-                    event.durability.value,
-                    event.created_at,
+                    stored_event.id,
+                    stored_event.run_id,
+                    stored_event.seq,
+                    stored_event.type,
+                    stored_event.model_dump_json(),
+                    stored_event.created_at,
                 ),
             )
-        return event
+        return stored_event
 
     async def list_events(
         self, run_id: str, after_seq: int | None = None
-    ) -> list[RuntimeEvent]:
+    ) -> list[StoredRuntimeEvent]:
         return await anyio.to_thread.run_sync(self._list_events, run_id, after_seq)
 
-    def _list_events(self, run_id: str, after_seq: int | None = None) -> list[RuntimeEvent]:
-        sql = "select id, run_id, seq, namespace, name, type, payload_json, durability, created_at from events where run_id = ?"
+    def _list_events(self, run_id: str, after_seq: int | None = None) -> list[StoredRuntimeEvent]:
+        sql = "select event_json from events where run_id = ?"
         params: tuple[Any, ...] = (run_id,)
         if after_seq is not None:
             sql += " and seq > ?"
@@ -278,17 +263,4 @@ class SQLiteStore:
         sql += " order by seq"
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
-        return [
-            RuntimeEvent(
-                id=row[0],
-                run_id=row[1],
-                seq=row[2],
-                namespace=row[3],
-                name=row[4],
-                type=row[5],
-                payload=json.loads(row[6]),
-                durability=EventDurability(row[7]),
-                created_at=row[8],
-            )
-            for row in rows
-        ]
+        return [parse_stored_runtime_event_json(row[0]) for row in rows]

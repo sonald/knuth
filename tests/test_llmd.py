@@ -4,11 +4,20 @@ from pathlib import Path
 
 import anyio
 
+from knuth.core.events import (
+    InferenceContentDelta,
+    InferenceGenerationCompleted,
+    InferenceGenerationStarted,
+    InferenceReasoningCompleted,
+    InferenceReasoningDelta,
+    InferenceToolCallCompleted,
+    InferenceToolCallDelta,
+    InferenceToolCallStarted,
+)
 from knuth.core.messages import InferenceMessage, InferenceRole
 from knuth_llmd import (
     Config,
     InferenceConfig,
-    InferenceEventType,
     LiteLLMInferenceClient,
     load_config,
 )
@@ -118,8 +127,48 @@ class CapturingStreamCompletion:
 
 
 class LiteLLMInferenceClientTests(unittest.TestCase):
-    def test_stream_normalizes_litellm_chunks_into_inference_events(self) -> None:
-        completion = CapturingStreamCompletion()
+    def test_stream_normalizes_litellm_chunks_into_typed_inference_events(self) -> None:
+        completion = CapturingStreamCompletion(
+            [
+                {"choices": [{"delta": {"content": "hello "}}]},
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call-1",
+                                        "function": {
+                                            "name": "read_",
+                                            "arguments": "{\"path\":",
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "function": {
+                                            "name": "file",
+                                            "arguments": "\"README.md\"}",
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+                {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+            ]
+        )
         client = LiteLLMInferenceClient(
             model="test-model",
             base_url="https://example.test/v1",
@@ -148,12 +197,24 @@ class LiteLLMInferenceClientTests(unittest.TestCase):
 
         events = anyio.run(collect)
 
-        self.assertEqual(events[0].type, InferenceEventType.GENERATION_START)
-        self.assertEqual(events[0].payload["model"], "test-model")
-        self.assertIn(InferenceEventType.CONTENT_DELTA, [event.type for event in events])
-        tool_events = [event for event in events if event.type == InferenceEventType.TOOL_CALL]
-        self.assertEqual(tool_events[0].payload["tool_call"]["name"], "read_file")
-        self.assertEqual(events[-1].type, InferenceEventType.GENERATION_END)
+        self.assertIsInstance(events[0], InferenceGenerationStarted)
+        self.assertEqual(events[0].type, "inference.generation.started")
+        self.assertEqual(events[0].model, "test-model")
+        self.assertTrue(any(isinstance(event, InferenceContentDelta) for event in events))
+        started = [event for event in events if isinstance(event, InferenceToolCallStarted)]
+        deltas = [event for event in events if isinstance(event, InferenceToolCallDelta)]
+        completed = [event for event in events if isinstance(event, InferenceToolCallCompleted)]
+        self.assertEqual(started[0].index, 0)
+        self.assertEqual(started[0].id, "call-1")
+        self.assertEqual([event.name_delta for event in deltas], ["read_", "file"])
+        self.assertEqual(
+            [event.arguments_json_delta for event in deltas],
+            ["{\"path\":", "\"README.md\"}"],
+        )
+        self.assertEqual(completed[0].tool_call.name, "read_file")
+        self.assertEqual(completed[0].tool_call.arguments, {"path": "README.md"})
+        self.assertIsInstance(events[-1], InferenceGenerationCompleted)
+        self.assertEqual(events[-1].message.tool_calls[0].name, "read_file")
         self.assertIsNotNone(completion.kwargs)
         kwargs = completion.kwargs or {}
         self.assertEqual(kwargs["stream"], True)
@@ -190,21 +251,31 @@ class LiteLLMInferenceClientTests(unittest.TestCase):
         events = anyio.run(collect)
 
         reasoning = "".join(
-            e.payload["delta"]
+            e.delta
             for e in events
-            if e.type == InferenceEventType.REASONING_DELTA
+            if isinstance(e, InferenceReasoningDelta)
         )
         content = "".join(
-            e.payload["delta"]
+            e.delta
             for e in events
-            if e.type == InferenceEventType.CONTENT_DELTA
+            if isinstance(e, InferenceContentDelta)
         )
         self.assertEqual(reasoning, "17*23=391")
         self.assertEqual(content, "The answer is 391.")
-        # The materialized assistant message must not leak think tags.
-        self.assertEqual(
-            events[-1].payload["message"]["content"], "The answer is 391."
+        self.assertTrue(any(isinstance(e, InferenceReasoningCompleted) for e in events))
+        reasoning_done_index = next(
+            index
+            for index, event in enumerate(events)
+            if isinstance(event, InferenceReasoningCompleted)
         )
+        content_index = next(
+            index
+            for index, event in enumerate(events)
+            if isinstance(event, InferenceContentDelta)
+        )
+        self.assertLess(reasoning_done_index, content_index)
+        # The materialized assistant message must not leak think tags.
+        self.assertEqual(events[-1].message.content, "The answer is 391.")
 
     def test_stream_uses_inference_messages_without_tools(self) -> None:
         completion = CapturingStreamCompletion(
@@ -229,7 +300,8 @@ class LiteLLMInferenceClientTests(unittest.TestCase):
 
         events = anyio.run(collect)
 
-        self.assertEqual(events[-1].payload["message"]["content"], "real response")
+        self.assertIsInstance(events[-1], InferenceGenerationCompleted)
+        self.assertEqual(events[-1].message.content, "real response")
         kwargs = completion.kwargs or {}
         self.assertNotIn("tools", kwargs)
         self.assertEqual(kwargs["parallel_tool_calls"], False)

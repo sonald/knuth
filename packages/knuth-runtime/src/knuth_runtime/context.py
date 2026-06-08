@@ -60,19 +60,15 @@ class ContextBuilder:
 def reconstruct_messages_from_events(events: list[RuntimeEvent]) -> list[InferenceMessage]:
     messages: list[InferenceMessage] = []
     for event in events:
-        if event.namespace == "user" and event.name == "message":
+        if event.type == "user.message":
             messages.append(
                 InferenceMessage(
                     role=InferenceRole.USER,
-                    content=str(event.payload.get("content") or ""),
+                    content=event.content,
                 )
             )
-        elif event.namespace == "model" and event.name == "completed":
-            raw = event.payload.get("assistant_message") or event.payload.get("message")
-            if isinstance(raw, dict):
-                messages.append(InferenceMessage.model_validate(raw))
-        elif event.namespace == "tool" and event.name == "completed":
-            raw = event.payload.get("message")
-            if isinstance(raw, dict):
-                messages.append(InferenceMessage.model_validate(raw))
+        elif event.type == "model.completed":
+            messages.append(event.message)
+        elif event.type == "tool.completed":
+            messages.append(event.message)
     return messages

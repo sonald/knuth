@@ -4,12 +4,17 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from knuth.core.events import RuntimeEvent
+from knuth.core.events import (
+    RunCreatedDraft,
+    RuntimeEvent,
+    ToolCompletedDraft,
+    UserMessageDraft,
+)
 from knuth.core.messages import InferenceMessage, InferenceRole
+from knuth.core.tools import ToolIntent
 from knuth.core.types import RunStatus
 from knuth_llmd import (
     InferenceConfig,
-    InferenceEvent,
     LiteLLMInferenceClient,
     load_config,
 )
@@ -49,15 +54,11 @@ class AgentRuntime:
         run = await self._services.run_store.create(prompt)
         await self._services.event_store.append(
             run.id,
-            namespace="run",
-            name="created",
-            payload=run.model_dump(),
+            RunCreatedDraft(query=run.query, metadata=run.metadata),
         )
         await self._services.event_store.append(
             run.id,
-            namespace="user",
-            name="message",
-            payload={"content": prompt},
+            UserMessageDraft(content=prompt),
         )
         status = await run_agent_loop(run.id, self._services, self._inference_config)
         events = await self._services.event_store.list_events(run.id)
@@ -85,7 +86,7 @@ class AgentRuntime:
     async def run_streaming(
         self,
         prompt: str | None,
-        on_event: Callable[[InferenceEvent | RuntimeEvent], Awaitable[None]],
+        on_event: Callable[[RuntimeEvent], Awaitable[None]],
         *,
         run_id: str | None = None,
     ) -> RunResult:
@@ -106,15 +107,11 @@ class AgentRuntime:
             run = await self._services.run_store.create(prompt)
             await self._services.event_store.append(
                 run.id,
-                namespace="run",
-                name="created",
-                payload=run.model_dump(),
+                RunCreatedDraft(query=run.query, metadata=run.metadata),
             )
             await self._services.event_store.append(
                 run.id,
-                namespace="user",
-                name="message",
-                payload={"content": prompt},
+                UserMessageDraft(content=prompt),
             )
             run_id = run.id
         elif prompt is not None:
@@ -124,9 +121,7 @@ class AgentRuntime:
             else:
                 await self._services.event_store.append(
                     run_id,
-                    namespace="user",
-                    name="message",
-                    payload={"content": prompt},
+                    UserMessageDraft(content=prompt),
                 )
             await self._services.run_store.set_status(run_id, RunStatus.RUNNING)
         else:
@@ -151,8 +146,8 @@ class AgentRuntime:
         events = await self._services.event_store.list_events(run_id)
         tool_call_id: str | None = None
         for event in reversed(events):
-            if event.namespace == "user_input" and event.name == "requested":
-                tool_call_id = event.payload.get("tool_call_id")
+            if event.type == "user_input.requested":
+                tool_call_id = event.tool_call_id
                 break
         message = InferenceMessage(
             role=InferenceRole.TOOL_RESULT,
@@ -162,12 +157,14 @@ class AgentRuntime:
         )
         await self._services.event_store.append(
             run_id,
-            namespace="tool",
-            name="completed",
-            payload={
-                "intent": {"name": "knuth.ask_user", "id": tool_call_id},
-                "message": message.model_dump(),
-            },
+            ToolCompletedDraft(
+                intent=ToolIntent(
+                    id=tool_call_id or "call_ask_user",
+                    name="knuth.ask_user",
+                ),
+                message=message,
+                outcome="answered",
+            ),
         )
 
     async def approve(self, approval_id: str) -> Approval:
@@ -252,11 +249,10 @@ def build_memory_runtime(
 
 def _answer_from_events(events: list[RuntimeEvent]) -> str:
     for event in reversed(events):
-        if event.namespace == "run" and event.name == "succeeded":
-            return str(event.payload.get("answer") or "")
-        if event.namespace == "approval" and event.name == "requested":
-            approval_id = event.payload.get("id")
-            return f"Waiting for approval: {approval_id}"
-        if event.namespace == "user_input" and event.name == "requested":
-            return str(event.payload.get("question") or "Waiting for user input")
+        if event.type == "run.succeeded":
+            return event.answer
+        if event.type == "approval.requested":
+            return f"Waiting for approval: {event.approval_id}"
+        if event.type == "user_input.requested":
+            return event.question or "Waiting for user input"
     return ""

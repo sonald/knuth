@@ -4,10 +4,13 @@ import unittest
 from dataclasses import dataclass
 from unittest.mock import patch
 
-from knuth.core.events import RuntimeEvent
+from knuth.core.events import (
+    ModelContentDeltaDraft,
+    RunSucceeded,
+    emit_transient_runtime_event,
+)
 from knuth.core.types import RunStatus
 from knuth_cli.cli import main
-from knuth_llmd import InferenceEvent, InferenceEventType
 from knuth_runtime import RunResult
 
 
@@ -17,19 +20,11 @@ class _StreamingFakeRuntime:
     async def run_streaming(self, prompt, on_event, *, run_id=None) -> RunResult:
         answer = f"real-ish: {prompt}"
         await on_event(
-            InferenceEvent(
-                type=InferenceEventType.CONTENT_DELTA,
-                generation_id="gen-1",
-                seq=1,
-                payload={"delta": answer},
-            )
-        )
-        await on_event(
-            InferenceEvent(
-                type=InferenceEventType.GENERATION_END,
-                generation_id="gen-1",
-                seq=2,
-                payload={"finish_reason": "stop"},
+            emit_transient_runtime_event(
+                run_id or "run-1",
+                ModelContentDeltaDraft(delta=answer),
+                event_id="evt-1",
+                created_at="2026-06-05T00:00:00Z",
             )
         )
         return RunResult(answer=answer, run_id=run_id or "run-1", status=RunStatus.SUCCEEDED)
@@ -92,14 +87,13 @@ class CliTests(unittest.TestCase):
 
             async def events(self, run_id: str):
                 return [
-                    RuntimeEvent(
+                    RunSucceeded(
                         id="evt-1",
                         run_id=run_id,
                         seq=1,
-                        namespace="run",
-                        name="succeeded",
                         type="run.succeeded",
-                        payload={"answer": "ok"},
+                        answer="ok",
+                        turns=1,
                         created_at="2026-06-05T00:00:00Z",
                     )
                 ]

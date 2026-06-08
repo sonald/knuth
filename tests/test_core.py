@@ -1,6 +1,6 @@
 import unittest
 
-from knuth.core.events import RuntimeEvent
+from knuth.core.events import RunCreated
 from knuth.core.messages import InferenceMessage, InferenceRole, ToolCall
 
 
@@ -42,14 +42,13 @@ class CoreModelTests(unittest.TestCase):
         self.assertEqual(payload["tool_calls"][0]["id"], "call-1")
         self.assertIn('"README.md"', payload["tool_calls"][0]["function"]["arguments"])
 
-    def test_runtime_event_allows_forward_compatible_extra_fields(self) -> None:
-        event = RuntimeEvent(
+    def test_typed_runtime_event_allows_forward_compatible_extra_fields(self) -> None:
+        event = RunCreated(
             id="evt-1",
             run_id="run-1",
             seq=1,
-            namespace="model",
-            name="completed",
-            type="model.completed",
+            type="run.created",
+            query="hello",
             created_at="2026-06-05T00:00:00Z",
             future_field="kept",
         )
