@@ -11,7 +11,7 @@ from knuth_llmd import (
     InferenceConfig,
     InferenceEvent,
     LiteLLMInferenceClient,
-    load_llm_config,
+    load_config,
 )
 from knuth_runtime.approval import (
     Approval,
@@ -204,7 +204,7 @@ class AgentRuntime:
 
 
 async def build_default_runtime(db_path: Path | str | None = None) -> AgentRuntime:
-    config = await load_llm_config()
+    config = await load_config()
     store = SQLiteStore(db_path or Path("~/.knuth/knuth.db"))
     approvals = SQLiteApprovalService(store)
     registry = create_default_registry()
@@ -226,7 +226,6 @@ async def build_default_runtime(db_path: Path | str | None = None) -> AgentRunti
     return AgentRuntime(
         services=services,
         inference_config=InferenceConfig(
-            model=config.model,
             timeout_s=config.timeout,
         ),
     )

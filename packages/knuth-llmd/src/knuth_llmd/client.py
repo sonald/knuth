@@ -25,7 +25,6 @@ class InferenceEventType(StrEnum):
 
 
 class InferenceConfig(KnuthModel):
-    model: str
     temperature: float | None = None
     max_output_tokens: int | None = None
     timeout_s: float | None = None
@@ -55,6 +54,10 @@ class InferenceEvent(KnuthModel):
 
 
 class InferenceClient(Protocol):
+    @property
+    def model(self) -> str:
+        ...
+
     async def stream(
         self,
         messages: Sequence[InferenceMessage],
@@ -266,11 +269,15 @@ class LiteLLMInferenceClient:
         completion_fn: Callable[..., object] | None = None,
         timeout: float = 60.0,
     ) -> None:
-        self._model = _litellm_model_name(model)
+        self._model = model
         self._base_url = base_url
         self._api_key = api_key
         self._completion_fn = completion_fn or _default_completion_fn
         self._timeout = timeout
+
+    @property
+    def model(self) -> str:
+        return self._model
 
     async def stream(
         self,
@@ -295,7 +302,7 @@ class LiteLLMInferenceClient:
                 payload=payload or {},
             )
 
-        yield event(InferenceEventType.GENERATION_START, {"model": config.model})
+        yield event(InferenceEventType.GENERATION_START, {"model": self.model})
         if runtime and runtime.abort_signal:
             await runtime.abort_signal.checkpoint()
 
@@ -334,7 +341,7 @@ class LiteLLMInferenceClient:
             )
 
     def _base_kwargs(self, config: InferenceConfig) -> dict[str, object]:
-        model = _litellm_model_name(config.model or self._model)
+        model = _litellm_model_name(self._model)
         kwargs: dict[str, object] = {
             "model": model,
             "timeout": config.timeout_s or self._timeout,

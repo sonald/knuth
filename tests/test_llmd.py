@@ -6,65 +6,72 @@ import anyio
 
 from knuth.core.messages import InferenceMessage, InferenceRole
 from knuth_llmd import (
+    Config,
     InferenceConfig,
     InferenceEventType,
     LiteLLMInferenceClient,
-    load_llm_config,
+    load_config,
 )
 
 
-class LlmConfigTests(unittest.TestCase):
-    def test_load_llm_config_reads_knuth_env_file(self) -> None:
+class ConfigTests(unittest.TestCase):
+    def test_load_config_reads_local_config_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            env_path = Path(temp_dir, ".env")
-            env_path.write_text(
+            config_path = Path(temp_dir, "config.toml")
+            config_path.write_text(
                 "\n".join(
                     [
-                        "KNUTH_API_KEY=test-key",
-                        "KNUTH_BASE_URL=https://example.test/v1",
-                        "KNUTH_MODEL=test-model",
+                        'api_key = "test-key"',
+                        'base_url = "https://example.test/v1"',
+                        'model = "test-model"',
+                        "timeout = 45.5",
                     ]
                 ),
                 encoding="utf-8",
             )
 
-            config = anyio.run(load_llm_config, env_path, {})
+            config = anyio.run(load_config, config_path, {})
 
+            self.assertIsInstance(config, Config)
             self.assertEqual(config.api_key, "test-key")
             self.assertEqual(config.base_url, "https://example.test/v1")
             self.assertEqual(config.model, "test-model")
+            self.assertEqual(config.timeout, 45.5)
 
-    def test_environment_values_override_env_file(self) -> None:
+    def test_environment_values_override_config_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            env_path = Path(temp_dir, ".env")
-            env_path.write_text(
+            config_path = Path(temp_dir, "config.toml")
+            config_path.write_text(
                 "\n".join(
                     [
-                        "KNUTH_API_KEY=file-key",
-                        "KNUTH_BASE_URL=https://file.test/v1",
-                        "KNUTH_MODEL=file-model",
+                        'api_key = "file-key"',
+                        'base_url = "https://file.test/v1"',
+                        'model = "file-model"',
+                        "timeout = 30",
                     ]
                 ),
                 encoding="utf-8",
             )
 
             config = anyio.run(
-                load_llm_config,
-                env_path,
+                load_config,
+                config_path,
                 {
                     "KNUTH_API_KEY": "env-key",
                     "KNUTH_BASE_URL": "https://env.test/v1",
                     "KNUTH_MODEL": "env-model",
+                    "KNUTH_TIMEOUT": "90.5",
                 },
             )
 
             self.assertEqual(config.api_key, "env-key")
             self.assertEqual(config.base_url, "https://env.test/v1")
             self.assertEqual(config.model, "env-model")
+            self.assertEqual(config.timeout, 90.5)
 
-    def test_load_llm_config_fails_when_required_values_are_missing(self) -> None:
+    def test_load_config_fails_when_required_values_are_missing(self) -> None:
         with self.assertRaisesRegex(ValueError, "KNUTH_API_KEY"):
-            anyio.run(load_llm_config, Path("does-not-exist.env"), {})
+            anyio.run(load_config, Path("does-not-exist.toml"), {})
 
 
 class AsyncChunks:
@@ -135,13 +142,14 @@ class LiteLLMInferenceClientTests(unittest.TestCase):
                             },
                         }
                     ],
-                    config=InferenceConfig(model="test-model", run_id="run-1"),
+                    config=InferenceConfig(run_id="run-1"),
                 )
             ]
 
         events = anyio.run(collect)
 
         self.assertEqual(events[0].type, InferenceEventType.GENERATION_START)
+        self.assertEqual(events[0].payload["model"], "test-model")
         self.assertIn(InferenceEventType.CONTENT_DELTA, [event.type for event in events])
         tool_events = [event for event in events if event.type == InferenceEventType.TOOL_CALL]
         self.assertEqual(tool_events[0].payload["tool_call"]["name"], "read_file")
@@ -175,7 +183,7 @@ class LiteLLMInferenceClientTests(unittest.TestCase):
                 async for event in client.stream(
                     messages=[InferenceMessage(role=InferenceRole.USER, content="hi")],
                     tools=[],
-                    config=InferenceConfig(model="test-model"),
+                    config=InferenceConfig(),
                 )
             ]
 
@@ -215,7 +223,7 @@ class LiteLLMInferenceClientTests(unittest.TestCase):
                 async for event in client.stream(
                     messages=[InferenceMessage(role=InferenceRole.USER, content="hello")],
                     tools=[],
-                    config=InferenceConfig(model="openai/test-model"),
+                    config=InferenceConfig(),
                 )
             ]
 

@@ -7,16 +7,16 @@ from knuth_llmd.client import (
     LiteLLMInferenceClient,
     StreamAccumulator,
 )
-from knuth_llmd.config import LlmConfig, load_llm_config
+from knuth_llmd.config import Config, load_config
 
 __all__ = [
+    "Config",
     "InferenceClient",
     "InferenceConfig",
     "InferenceEvent",
     "InferenceEventType",
     "InferenceRuntimeOptions",
     "LiteLLMInferenceClient",
-    "LlmConfig",
     "StreamAccumulator",
-    "load_llm_config",
+    "load_config",
 ]

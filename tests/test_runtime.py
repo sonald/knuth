@@ -27,7 +27,7 @@ from knuth_toold import ToolBroker, create_default_registry
 class RuntimeFactoryTests(unittest.TestCase):
     def test_build_default_runtime_does_not_pass_workspace_to_toold(self) -> None:
         with (
-            patch("knuth_runtime.agent.load_llm_config") as load_config,
+            patch("knuth_runtime.agent.load_config") as load_config,
             patch("knuth_runtime.agent.LiteLLMInferenceClient") as client_class,
             patch("knuth_runtime.agent.create_default_registry") as create_registry,
         ):
@@ -51,6 +51,8 @@ class RuntimeFactoryTests(unittest.TestCase):
 
 
 class ScriptedInferenceClient:
+    model = "scripted-model"
+
     def __init__(self, messages: list[InferenceMessage]) -> None:
         self.messages = messages
         self.calls = 0
@@ -76,7 +78,7 @@ class EventDrivenRuntimeTests(unittest.TestCase):
         broker = ToolBroker(registry, PolicyEngine(approvals))
         return build_memory_runtime(
             inference_client=ScriptedInferenceClient(messages),
-            inference_config=InferenceConfig(model="scripted-model"),
+            inference_config=InferenceConfig(),
             run_store=run_store,
             event_store=event_store,
             approvals=approvals,
@@ -114,6 +116,10 @@ class EventDrivenRuntimeTests(unittest.TestCase):
             self.assertEqual(turn.answer, "Final answer: Knuth works")
             self.assertIn(("tool", "completed"), [(e.namespace, e.name) for e in events])
             self.assertIn(("run", "succeeded"), [(e.namespace, e.name) for e in events])
+            started = [
+                e for e in events if e.namespace == "model" and e.name == "started"
+            ]
+            self.assertEqual(started[0].payload["model"], "scripted-model")
             self.assertNotIn(
                 ("model", "content_delta"), [(e.namespace, e.name) for e in events]
             )
@@ -205,6 +211,8 @@ class EventDrivenRuntimeTests(unittest.TestCase):
 class StreamingTextClient:
     """Yields a content delta then a generation_end per scripted answer."""
 
+    model = "streaming-model"
+
     def __init__(self, answers: list[str]) -> None:
         self.answers = answers
         self.calls = 0
@@ -245,7 +253,7 @@ class StreamingRuntimeTests(unittest.TestCase):
         broker = ToolBroker(registry, PolicyEngine(approvals))
         return build_memory_runtime(
             inference_client=client,
-            inference_config=InferenceConfig(model="scripted-model"),
+            inference_config=InferenceConfig(),
             run_store=MemoryRunStore(),
             event_store=MemoryEventStore(),
             approvals=approvals,

@@ -76,7 +76,7 @@ async def run_agent_loop(
             name="started",
             payload={
                 "turn": turns,
-                "model": inference_config.model,
+                "model": services.inference_client.model,
                 "message_count": len(view.messages),
                 "tool_count": len(view.tools),
             },
