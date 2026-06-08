@@ -9,22 +9,10 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from typing import Any
 
-from knuth.core.events import (
-    ApprovalRequested,
-    ModelAborted,
-    ModelCompleted,
-    ModelContentDelta,
-    ModelFailed,
-    ModelReasoningCompleted,
-    ModelReasoningDelta,
-    ModelToolCallCompleted,
-    RuntimeEvent,
-    ToolCompleted,
-    ToolStarted,
-    UserInputRequested,
-)
+from knuth.core.events import RuntimeEvent
 from knuth.core.messages import ToolCall
 from rich.console import Console
 from rich.live import Live
@@ -47,60 +35,85 @@ class EventRenderer:
         self._content_live: Live | None = None
         self._content_parts: list[str] = []
 
+        self._dispatch: dict[str, Callable[[Any], None]] = {
+            "model.reasoning.delta": self._on_reasoning_delta,
+            "model.reasoning.completed": self._on_reasoning_completed,
+            "model.content.delta": self._on_content_delta,
+            "model.tool_call.completed": self._on_tool_call_completed,
+            "model.completed": self._on_model_completed,
+            "model.failed": self._on_model_failed,
+            "model.aborted": self._on_model_aborted,
+            "tool.started": self._on_tool_started,
+            "tool.completed": self._on_tool_completed,
+            "approval.requested": self._on_approval_requested,
+            "user_input.requested": self._on_user_input_requested,
+        }
+
     async def handle(self, event: RuntimeEvent) -> None:
-        self._handle_runtime_event(event)
+        handler = self._dispatch.get(event.type)
+        if handler is not None:
+            handler(event)
 
     def finish(self) -> None:
         """Tear down any live region left open (end of a turn)."""
         self._stop_thinking()
         self._stop_content()
 
-    def _handle_runtime_event(self, event: RuntimeEvent) -> None:
-        if isinstance(event, ModelReasoningDelta):
-            self._stop_content()
-            self._start_thinking()
-            self._append_reasoning(event.delta)
-        elif isinstance(event, ModelReasoningCompleted):
-            self._stop_thinking()
-        elif isinstance(event, ModelContentDelta):
-            self._stop_thinking()
-            self._append_content(event.delta)
-        elif isinstance(event, ModelToolCallCompleted):
-            self._stop_thinking()
-            self._stop_content()
-            self._print_tool_call(event.tool_call)
-        elif isinstance(event, ModelCompleted):
-            self._stop_thinking()
-            self._stop_content()
-        elif isinstance(event, ModelFailed):
-            self._stop_thinking()
-            self._stop_content()
-            self._console.print(Text(f"✗ error: {event.error.message}", style="bold red"))
-        elif isinstance(event, ModelAborted):
-            self._stop_thinking()
-            self._stop_content()
-            self._console.print(Text("⊘ aborted", style="yellow"))
-        elif isinstance(event, ToolStarted):
-            self._stop_thinking()
-            self._stop_content()
-            name = event.intent.name
-            self._console.print(Text(f"  ⏳ {name}…", style="dim"))
-        elif isinstance(event, ToolCompleted):
-            self._print_tool_completed(event)
-        elif isinstance(event, ApprovalRequested):
-            self._stop_thinking()
-            self._stop_content()
-            title = event.title or event.reason or "tool call"
-            risk = event.risk
-            suffix = f" [risk: {risk}]" if risk else ""
-            self._console.print(
-                Text(f"  ⚠ approval required: {title}{suffix}", style="yellow")
-            )
-        elif isinstance(event, UserInputRequested):
-            self._stop_thinking()
-            self._stop_content()
-            question = event.question or "(no question)"
-            self._console.print(Text(f"  ? {question}", style="cyan"))
+    # -- event handlers ----------------------------------------------------
+
+    def _on_reasoning_delta(self, event: Any) -> None:
+        self._stop_content()
+        self._start_thinking()
+        self._append_reasoning(event.delta)
+
+    def _on_reasoning_completed(self, _event: Any) -> None:
+        self._stop_thinking()
+
+    def _on_content_delta(self, event: Any) -> None:
+        self._stop_thinking()
+        self._append_content(event.delta)
+
+    def _on_tool_call_completed(self, event: Any) -> None:
+        self._stop_thinking()
+        self._stop_content()
+        self._print_tool_call(event.tool_call)
+
+    def _on_model_completed(self, _event: Any) -> None:
+        self._stop_thinking()
+        self._stop_content()
+
+    def _on_model_failed(self, event: Any) -> None:
+        self._stop_thinking()
+        self._stop_content()
+        self._console.print(Text(f"✗ error: {event.error.message}", style="bold red"))
+
+    def _on_model_aborted(self, _event: Any) -> None:
+        self._stop_thinking()
+        self._stop_content()
+        self._console.print(Text("⊘ aborted", style="yellow"))
+
+    def _on_tool_started(self, event: Any) -> None:
+        self._stop_thinking()
+        self._stop_content()
+        self._console.print(Text(f"  ⏳ {event.intent.name}…", style="dim"))
+
+    def _on_tool_completed(self, event: Any) -> None:
+        self._print_tool_completed(event)
+
+    def _on_approval_requested(self, event: Any) -> None:
+        self._stop_thinking()
+        self._stop_content()
+        title = event.title or event.reason or "tool call"
+        suffix = f" [risk: {event.risk}]" if event.risk else ""
+        self._console.print(
+            Text(f"  ⚠ approval required: {title}{suffix}", style="yellow")
+        )
+
+    def _on_user_input_requested(self, event: Any) -> None:
+        self._stop_thinking()
+        self._stop_content()
+        question = event.question or "(no question)"
+        self._console.print(Text(f"  ? {question}", style="cyan"))
 
     # -- thinking spinner -------------------------------------------------
 
@@ -183,7 +196,7 @@ class EventRenderer:
         args = tool_call.arguments
         self._console.print(Text(f"● {name}({_format_args(args)})", style="bold blue"))
 
-    def _print_tool_completed(self, event: ToolCompleted) -> None:
+    def _print_tool_completed(self, event: Any) -> None:
         self._stop_thinking()
         self._stop_content()
         name = event.intent.name
