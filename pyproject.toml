@@ -10,6 +10,7 @@ dependencies = [
     "knuth-llmd",
     "knuth-runtime",
     "knuth-toold",
+    "textual>=8.2.7",
 ]
 
 [dependency-groups]
