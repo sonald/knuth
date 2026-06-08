@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import os
-import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 import anyio
+import platformdirs
+import yaml
 
 
 @dataclass(frozen=True)
@@ -17,11 +18,16 @@ class Config:
     timeout: float = 60.0
 
 
+def default_config_path() -> Path:
+    return Path(platformdirs.user_data_dir("knuth")) / "llmd" / "knuth.yaml"
+
+
 async def load_config(
-    config_path: Path | str = "knuth.toml",
+    config_path: Path | str | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> Config:
-    values = await _read_config_file(Path(config_path))
+    path = Path(config_path) if config_path is not None else default_config_path()
+    values = await _read_config_file(path)
     source = os.environ if environ is None else environ
     for env_key, config_key in _ENV_TO_CONFIG_KEY.items():
         if env_key in source:
@@ -59,4 +65,11 @@ async def _read_config_file(config_path: Path) -> dict[str, Any]:
 
     async with await anyio.open_file(config_path, "rb") as file:
         content = await file.read()
-    return dict(tomllib.loads(content.decode("utf-8")))
+    loaded = yaml.safe_load(content.decode("utf-8"))
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, Mapping):
+        raise ValueError(
+            f"Config file must contain a mapping, got {type(loaded).__name__}"
+        )
+    return dict(loaded)
