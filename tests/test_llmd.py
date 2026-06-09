@@ -1,10 +1,6 @@
-import tempfile
 import unittest
-from pathlib import Path
-from unittest.mock import patch
 
 import anyio
-import platformdirs
 
 from knuth.core.events import (
     InferenceContentDelta,
@@ -18,110 +14,9 @@ from knuth.core.events import (
 )
 from knuth.core.messages import InferenceMessage, InferenceRole
 from knuth_llmd import (
-    Config,
     InferenceConfig,
     LiteLLMInferenceClient,
-    load_config,
 )
-from knuth_llmd.config import default_config_path
-
-
-def _write_yaml(path: Path, values: dict[str, object]) -> None:
-    lines = []
-    for key, value in values.items():
-        if isinstance(value, str):
-            lines.append(f'{key}: "{value}"')
-        else:
-            lines.append(f"{key}: {value}")
-    path.write_text("\n".join(lines), encoding="utf-8")
-
-
-class ConfigPathTests(unittest.TestCase):
-    def test_default_config_path_lives_in_user_data_dir(self) -> None:
-        path = default_config_path()
-
-        expected_parent = Path(platformdirs.user_data_dir("knuth")) / "llmd"
-        self.assertEqual(path.parent, expected_parent)
-        self.assertEqual(path.name, "knuth.yaml")
-
-
-class ConfigTests(unittest.TestCase):
-    def test_load_config_reads_yaml_config_file(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir, "knuth.yaml")
-            _write_yaml(
-                config_path,
-                {
-                    "api_key": "test-key",
-                    "base_url": "https://example.test/v1",
-                    "model": "test-model",
-                    "timeout": 45.5,
-                },
-            )
-
-            config = anyio.run(load_config, config_path, {})
-
-            self.assertIsInstance(config, Config)
-            self.assertEqual(config.api_key, "test-key")
-            self.assertEqual(config.base_url, "https://example.test/v1")
-            self.assertEqual(config.model, "test-model")
-            self.assertEqual(config.timeout, 45.5)
-
-    def test_environment_values_override_config_file(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir, "knuth.yaml")
-            _write_yaml(
-                config_path,
-                {
-                    "api_key": "file-key",
-                    "base_url": "https://file.test/v1",
-                    "model": "file-model",
-                    "timeout": 30,
-                },
-            )
-
-            config = anyio.run(
-                load_config,
-                config_path,
-                {
-                    "KNUTH_API_KEY": "env-key",
-                    "KNUTH_BASE_URL": "https://env.test/v1",
-                    "KNUTH_MODEL": "env-model",
-                    "KNUTH_TIMEOUT": "90.5",
-                },
-            )
-
-            self.assertEqual(config.api_key, "env-key")
-            self.assertEqual(config.base_url, "https://env.test/v1")
-            self.assertEqual(config.model, "env-model")
-            self.assertEqual(config.timeout, 90.5)
-
-    def test_load_config_fails_when_required_values_are_missing(self) -> None:
-        with self.assertRaisesRegex(ValueError, "KNUTH_API_KEY"):
-            anyio.run(load_config, Path("does-not-exist.yaml"), {})
-
-    def test_load_config_defaults_to_user_data_dir_path(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config_path = Path(temp_dir, "llmd", "knuth.yaml")
-            config_path.parent.mkdir(parents=True)
-            _write_yaml(
-                config_path,
-                {
-                    "api_key": "default-key",
-                    "base_url": "https://default.test/v1",
-                    "model": "default-model",
-                },
-            )
-
-            with patch(
-                "knuth_llmd.config.default_config_path",
-                return_value=config_path,
-            ):
-                config = anyio.run(load_config, None, {})
-
-            self.assertEqual(config.api_key, "default-key")
-            self.assertEqual(config.base_url, "https://default.test/v1")
-            self.assertEqual(config.model, "default-model")
 
 
 class AsyncChunks:

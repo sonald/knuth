@@ -8,14 +8,15 @@ from rich.console import Console
 
 from knuth_cli import __version__
 from knuth_cli.repl import run_interactive, run_single
-from knuth_runtime import AgentRuntime, build_default_runtime
+from knuth_cli.runtime import build_runtime
+from knuth_runtime import AgentRuntime
 
 CommandHandler = Callable[[AgentRuntime, argparse.Namespace], Awaitable[int]]
 
 
 def main(
     argv: list[str] | None = None,
-    runtime_factory: Callable[[], Awaitable[AgentRuntime]] = build_default_runtime,
+    runtime_factory: Callable[[], Awaitable[AgentRuntime]] = build_runtime,
 ) -> int:
     return anyio.run(async_main, argv, runtime_factory)
 
@@ -84,7 +85,7 @@ _COMMAND_HANDLERS: dict[str, CommandHandler] = {
 
 async def async_main(
     argv: list[str] | None = None,
-    runtime_factory: Callable[[], Awaitable[AgentRuntime]] = build_default_runtime,
+    runtime_factory: Callable[[], Awaitable[AgentRuntime]] = build_runtime,
 ) -> int:
     parser = argparse.ArgumentParser(prog="knuth", description="Knuth agent framework")
     parser.add_argument(

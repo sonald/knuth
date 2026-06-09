@@ -16,6 +16,20 @@ class InferenceRole(StrEnum):
     TOOL_RESULT = "tool_result"
 
 
+class SystemSectionSource(StrEnum):
+    """Closed, strongly-typed set of contributors to the system preamble."""
+
+    BASE = "base"
+    USER = "user"
+
+
+class SystemSection(KnuthModel):
+    """An extensible fragment composed into the ``SystemPreamble``."""
+
+    source: SystemSectionSource
+    text: str
+
+
 class ToolCall(KnuthModel):
     id: str | None = None
     name: str

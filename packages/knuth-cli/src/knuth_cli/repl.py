@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 import anyio
+from knuth_runtime import AgentRuntime, RunResult
 from rich.console import Console
 from rich.text import Text
 
@@ -21,7 +20,7 @@ _HELP = """Commands:
   /exit, /quit     Leave the session"""
 
 
-async def run_interactive(runtime: Any, console: Console) -> int:
+async def run_interactive(runtime: AgentRuntime, console: Console) -> int:
     console.print(Text(_BANNER, style="bold"))
     session_run_id: str | None = None
     while True:
@@ -42,14 +41,14 @@ async def run_interactive(runtime: Any, console: Console) -> int:
         session_run_id = await _run_turn(runtime, console, prompt, session_run_id)
 
 
-async def run_single(runtime: Any, console: Console, prompt: str) -> int:
+async def run_single(runtime: AgentRuntime, console: Console, prompt: str) -> int:
     """Render a single streaming turn (used for ``knuth run <prompt>``)."""
     await _run_turn(runtime, console, prompt, None)
     return 0
 
 
 async def _run_turn(
-    runtime: Any, console: Console, prompt: str, session_run_id: str | None
+    runtime: AgentRuntime, console: Console, prompt: str, session_run_id: str | None
 ) -> str | None:
     renderer = EventRenderer(console)
     result = await runtime.run_streaming(
@@ -64,8 +63,8 @@ async def _run_turn(
 
 
 async def _resolve_approvals(
-    runtime: Any, console: Console, result: Any, run_id: str | None
-) -> Any:
+    runtime: AgentRuntime, console: Console, result: RunResult, run_id: str | None
+) -> RunResult:
     while result.status == RunStatus.WAITING_APPROVAL and run_id is not None:
         pending = await runtime.pending_approvals(run_id)
         if not pending:
@@ -88,7 +87,7 @@ async def _resolve_approvals(
 
 
 async def _handle_slash(
-    runtime: Any, console: Console, command: str, session_run_id: str | None
+    runtime: AgentRuntime, console: Console, command: str, session_run_id: str | None
 ) -> str | None:
     name = command.split()[0]
     if name == "/help":

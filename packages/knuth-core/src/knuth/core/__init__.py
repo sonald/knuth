@@ -7,7 +7,13 @@ from knuth.core.events import (
     TransientRuntimeEvent,
     TransientRuntimeEventDraft,
 )
-from knuth.core.messages import InferenceMessage, InferenceRole, ToolCall
+from knuth.core.messages import (
+    InferenceMessage,
+    InferenceRole,
+    SystemSection,
+    SystemSectionSource,
+    ToolCall,
+)
 from knuth.core.runs import AgentRun
 from knuth.core.tools import (
     ApprovalRequest,
@@ -33,6 +39,8 @@ __all__ = [
     "RuntimeEvent",
     "RuntimeEventDraft",
     "StoredRuntimeEvent",
+    "SystemSection",
+    "SystemSectionSource",
     "ToolIntent",
     "ToolProposal",
     "ToolProposalStatus",

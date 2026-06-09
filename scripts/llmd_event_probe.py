@@ -14,7 +14,8 @@ from rich.table import Table
 
 from knuth.core.events import InferenceEvent
 from knuth.core.messages import InferenceMessage, InferenceRole
-from knuth_llmd import Config, InferenceConfig, LiteLLMInferenceClient, load_config
+from knuth_cli.config import AgentConfig, load_config
+from knuth_llmd import InferenceConfig, LiteLLMInferenceClient
 
 
 DEBUG_TOOL_SCHEMA: dict[str, Any] = {
@@ -64,7 +65,7 @@ def parse_args(
         "--config",
         type=Path,
         default=None,
-        help="Path to llmd YAML config. Defaults to the knuth llmd user config.",
+        help="Path to agent YAML config. Defaults to the knuth-cli user config.",
     )
     parser.add_argument("--api-key", default=None, help="Override KNUTH_API_KEY.")
     parser.add_argument("--base-url", default=None, help="Override KNUTH_BASE_URL.")
@@ -137,7 +138,7 @@ def _messages(prompt: str, system: str | None) -> list[InferenceMessage]:
     return messages
 
 
-async def _load_config(args: argparse.Namespace) -> Config:
+async def _load_config(args: argparse.Namespace) -> AgentConfig:
     environ = dict(os.environ)
     if args.api_key is not None:
         environ["KNUTH_API_KEY"] = args.api_key

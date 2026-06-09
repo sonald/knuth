@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from knuth.core.events import (
+    InferenceGenerationCompleted,
     RunCreatedDraft,
     RuntimeEvent,
     ToolCompletedDraft,
@@ -13,18 +14,17 @@ from knuth.core.events import (
 from knuth.core.messages import InferenceMessage, InferenceRole
 from knuth.core.tools import ToolIntent
 from knuth.core.types import RunStatus
-from knuth_llmd import (
-    InferenceConfig,
-    LiteLLMInferenceClient,
-    load_config,
-)
+from knuth_llmd import InferenceConfig
 from knuth_runtime.approval import (
     Approval,
     ApprovalStatus,
     MemoryApprovalService,
     SQLiteApprovalService,
 )
-from knuth_runtime.context import ContextBuilder
+from knuth_runtime.context import (
+    ContextBuilder,
+    SystemSectionProvider,
+)
 from knuth_runtime.loop import run_agent_loop
 from knuth_runtime.policy import PolicyEngine
 from knuth_runtime.services import RuntimeServices
@@ -200,31 +200,54 @@ class AgentRuntime:
         return await self._services.approvals.list_pending(run_id)
 
 
-async def build_default_runtime(db_path: Path | str | None = None) -> AgentRuntime:
-    config = await load_config()
+class _DemoInferenceClient:
+    model = "knuth-demo"
+
+    async def stream(self, messages, tools, config, runtime=None):
+        yield InferenceGenerationCompleted(
+            generation_id="demo-generation",
+            seq=1,
+            run_id=config.run_id,
+            message=InferenceMessage(
+                role=InferenceRole.ASSISTANT,
+                content="Knuth demo runtime is configured.",
+            ),
+        )
+
+
+def build_sqlite_runtime(
+    *,
+    inference_client,
+    inference_config: InferenceConfig,
+    db_path: Path | str | None = None,
+    section_providers: list[SystemSectionProvider] | None = None,
+) -> AgentRuntime:
     store = SQLiteStore(db_path or Path("~/.knuth/knuth.db"))
     approvals = SQLiteApprovalService(store)
     registry = create_default_registry()
     policy = PolicyEngine(approvals)
     broker = ToolBroker(registry, policy_engine=policy)
     services = RuntimeServices(
-        inference_client=LiteLLMInferenceClient(
-            model=config.model,
-            base_url=config.base_url,
-            api_key=config.api_key,
-            timeout=config.timeout,
-        ),
+        inference_client=inference_client,
         tool_broker=broker,
         run_store=store,
         event_store=store,
         approvals=approvals,
-        context_builder=ContextBuilder(store, broker),
-    )
-    return AgentRuntime(
-        services=services,
-        inference_config=InferenceConfig(
-            timeout_s=config.timeout,
+        context_builder=ContextBuilder(
+            store,
+            broker,
+            section_providers=section_providers,
         ),
+    )
+    return AgentRuntime(services=services, inference_config=inference_config)
+
+
+async def build_default_runtime(db_path: Path | str | None = None) -> AgentRuntime:
+    """Build a demo/test runtime without agent-specific configuration policy."""
+    return build_sqlite_runtime(
+        inference_client=_DemoInferenceClient(),
+        inference_config=InferenceConfig(),
+        db_path=db_path,
     )
 
 
@@ -235,6 +258,7 @@ def build_memory_runtime(
     event_store: EventStore,
     approvals: MemoryApprovalService,
     tool_broker: ToolBroker,
+    section_providers: list[SystemSectionProvider] | None = None,
 ) -> AgentRuntime:
     services = RuntimeServices(
         inference_client=inference_client,
@@ -242,7 +266,11 @@ def build_memory_runtime(
         run_store=run_store,
         event_store=event_store,
         approvals=approvals,
-        context_builder=ContextBuilder(event_store, tool_broker),
+        context_builder=ContextBuilder(
+            event_store,
+            tool_broker,
+            section_providers=section_providers,
+        ),
     )
     return AgentRuntime(services=services, inference_config=inference_config)
 

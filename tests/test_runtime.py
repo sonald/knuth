@@ -10,18 +10,28 @@ from knuth.core.events import (
     InferenceGenerationCompleted,
     RunCreatedDraft,
 )
-from knuth.core.messages import InferenceMessage, InferenceRole, ToolCall as CoreToolCall
+from knuth.core.messages import (
+    InferenceMessage,
+    InferenceRole,
+    SystemSection,
+    SystemSectionSource,
+    ToolCall as CoreToolCall,
+)
 from knuth.core.types import RunStatus
 from knuth_llmd import InferenceConfig
 from knuth_runtime import (
     MemoryEventStore,
     MemoryRunStore,
     SQLiteStore,
-    build_default_runtime,
+    build_sqlite_runtime,
     build_memory_runtime,
 )
 from knuth_runtime.approval import MemoryApprovalService
-from knuth_runtime.context import reconstruct_messages_from_events
+from knuth_runtime.context import (
+    StaticSectionProvider,
+    assemble_preamble,
+    reconstruct_messages_from_events,
+)
 from knuth_runtime.policy import PolicyEngine
 from knuth_toold import ToolBroker, create_default_registry
 
@@ -91,28 +101,17 @@ class EventStoreTests(unittest.TestCase):
 
 
 class RuntimeFactoryTests(unittest.TestCase):
-    def test_build_default_runtime_does_not_pass_workspace_to_toold(self) -> None:
+    def test_build_sqlite_runtime_does_not_pass_workspace_to_toold(self) -> None:
         with (
-            patch("knuth_runtime.agent.load_config") as load_config,
-            patch("knuth_runtime.agent.LiteLLMInferenceClient") as client_class,
             patch("knuth_runtime.agent.create_default_registry") as create_registry,
         ):
-            load_config.return_value = type(
-                "Config",
-                (),
-                {
-                    "model": "test-model",
-                    "base_url": "https://example.test/v1",
-                    "api_key": "test-key",
-                    "timeout": 60.0,
-                },
-            )()
-            client_class.return_value = object()
             create_registry.return_value = create_default_registry(Path.cwd())
 
             with tempfile.TemporaryDirectory() as temp_dir:
-                runtime = anyio.run(
-                    build_default_runtime, Path(temp_dir, "knuth.db")
+                runtime = build_sqlite_runtime(
+                    inference_client=object(),
+                    inference_config=InferenceConfig(timeout_s=60.0),
+                    db_path=Path(temp_dir, "knuth.db"),
                 )
 
             self.assertIsNotNone(runtime)
@@ -302,6 +301,158 @@ class StreamingTextClient:
             run_id=config.run_id,
             message=message,
         )
+
+
+class CapturingInferenceClient:
+    """Records the messages handed to each ``stream`` call."""
+
+    model = "capturing-model"
+
+    def __init__(self, answers: list[str]) -> None:
+        self.answers = answers
+        self.calls = 0
+        self.captured_messages: list[list[InferenceMessage]] = []
+
+    async def stream(self, messages, tools, config, runtime=None):
+        self.captured_messages.append(list(messages))
+        text = self.answers[min(self.calls, len(self.answers) - 1)]
+        self.calls += 1
+        yield InferenceGenerationCompleted(
+            generation_id=f"gen-{self.calls}",
+            seq=1,
+            run_id=config.run_id,
+            message=InferenceMessage(role=InferenceRole.ASSISTANT, content=text),
+        )
+
+
+class CapturingScriptedClient(ScriptedInferenceClient):
+    """Scripts full assistant messages while recording inbound message lists."""
+
+    def __init__(self, messages: list[InferenceMessage]) -> None:
+        super().__init__(messages)
+        self.captured_messages: list[list[InferenceMessage]] = []
+
+    async def stream(self, messages, tools, config, runtime=None):
+        self.captured_messages.append(list(messages))
+        async for event in super().stream(messages, tools, config, runtime):
+            yield event
+
+
+class SystemPreambleTests(unittest.TestCase):
+    def _runtime(self, workspace: str, client, section_providers):
+        approvals = MemoryApprovalService()
+        registry = create_default_registry(Path(workspace))
+        broker = ToolBroker(registry, PolicyEngine(approvals))
+        return build_memory_runtime(
+            inference_client=client,
+            inference_config=InferenceConfig(),
+            run_store=MemoryRunStore(),
+            event_store=MemoryEventStore(),
+            approvals=approvals,
+            tool_broker=broker,
+            section_providers=section_providers,
+        )
+
+    def test_base_identity_delivered_as_leading_system_message(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            client = CapturingInferenceClient(["Hello"])
+            runtime = self._runtime(
+                workspace,
+                client,
+                [StaticSectionProvider(SystemSectionSource.BASE, "BASE")],
+            )
+            anyio.run(runtime.run_once, "hi")
+
+        first_turn_messages = client.captured_messages[0]
+        self.assertEqual(first_turn_messages[0].role, InferenceRole.SYSTEM)
+        self.assertEqual(first_turn_messages[0].content, "BASE")
+
+    def test_sections_composed_in_provider_injection_order(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            client = CapturingInferenceClient(["Hello"])
+            runtime = self._runtime(
+                workspace,
+                client,
+                [
+                    StaticSectionProvider(SystemSectionSource.BASE, "BASE"),
+                    StaticSectionProvider(SystemSectionSource.USER, "USER"),
+                ],
+            )
+            anyio.run(runtime.run_once, "hi")
+
+        first_turn_messages = client.captured_messages[0]
+        self.assertEqual(first_turn_messages[0].role, InferenceRole.SYSTEM)
+        self.assertEqual(first_turn_messages[0].content, "BASE\n\nUSER")
+        # The preamble is a single leading system message, not one per section.
+        system_messages = [
+            m for m in first_turn_messages if m.role == InferenceRole.SYSTEM
+        ]
+        self.assertEqual(len(system_messages), 1)
+
+    def test_no_system_message_when_all_sections_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            client = CapturingInferenceClient(["Hello"])
+            runtime = self._runtime(
+                workspace,
+                client,
+                [StaticSectionProvider(SystemSectionSource.USER, None)],
+            )
+            anyio.run(runtime.run_once, "hi")
+
+        first_turn_messages = client.captured_messages[0]
+        self.assertTrue(
+            all(m.role != InferenceRole.SYSTEM for m in first_turn_messages)
+        )
+
+    def test_preamble_present_on_every_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            Path(workspace, "fact.txt").write_text("ok", encoding="utf-8")
+            client = CapturingScriptedClient(
+                [
+                    InferenceMessage(
+                        role=InferenceRole.ASSISTANT,
+                        content="",
+                        tool_calls=[
+                            CoreToolCall(
+                                id="call-1",
+                                name="read_file",
+                                arguments={"path": "fact.txt"},
+                            )
+                        ],
+                    ),
+                    InferenceMessage(role=InferenceRole.ASSISTANT, content="done"),
+                ]
+            )
+            runtime = self._runtime(
+                workspace,
+                client,
+                [StaticSectionProvider(SystemSectionSource.BASE, "BASE")],
+            )
+            anyio.run(runtime.run_once, "read it")
+
+        self.assertEqual(len(client.captured_messages), 2)
+        for turn_messages in client.captured_messages:
+            self.assertEqual(turn_messages[0].role, InferenceRole.SYSTEM)
+            self.assertEqual(turn_messages[0].content, "BASE")
+
+
+class AssemblePreambleTests(unittest.TestCase):
+    def test_joins_sections_in_given_order(self) -> None:
+        sections = [
+            SystemSection(source=SystemSectionSource.USER, text="USER"),
+            SystemSection(source=SystemSectionSource.BASE, text="BASE"),
+        ]
+        self.assertEqual(assemble_preamble(sections), "USER\n\nBASE")
+
+    def test_skips_empty_section_text(self) -> None:
+        sections = [
+            SystemSection(source=SystemSectionSource.BASE, text="BASE"),
+            SystemSection(source=SystemSectionSource.USER, text=""),
+        ]
+        self.assertEqual(assemble_preamble(sections), "BASE")
+
+    def test_returns_none_when_no_sections(self) -> None:
+        self.assertIsNone(assemble_preamble([]))
 
 
 class _Collector:
