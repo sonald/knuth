@@ -18,9 +18,7 @@ class DefaultToolRegistryTests(unittest.TestCase):
             tools = anyio.run(broker.list_visible_tools, "run-1")
             names = {tool["function"]["name"] for tool in tools}
 
-            self.assertEqual(
-                names, {"read_file", "write_file", "shell", "python", "knuth.ask_user"}
-            )
+            self.assertEqual(names, {"read_file", "write_file", "shell", "python"})
 
     def test_file_tools_write_and_read_workspace_file(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:

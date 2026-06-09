@@ -92,7 +92,6 @@ usage: UsageInfo | None
 - `tool.started`
 - `tool.completed`
 - `approval.requested`
-- `user_input.requested`
 - `run.succeeded`
 - `run.failed`
 - `verification.failed`
@@ -183,7 +182,7 @@ usage: UsageInfo | None
 intent: ToolIntent
 result: ToolResult | None
 message: InferenceMessage
-outcome: Literal["succeeded", "failed", "denied", "answered"]
+outcome: Literal["succeeded", "failed", "denied"]
 ```
 
 `message` 是 context reconstruction 使用的 canonical tool_result message。`result` 只在真实工具执行路径存在。

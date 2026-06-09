@@ -57,8 +57,6 @@ async def _run_turn(
     renderer.finish()
     run_id = result.run_id
     result = await _resolve_approvals(runtime, console, result, run_id)
-    if result.status == RunStatus.WAITING_USER:
-        console.print(Text("  (answer the question above to continue)", style="dim"))
     return run_id
 
 

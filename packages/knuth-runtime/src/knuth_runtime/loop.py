@@ -36,7 +36,6 @@ from knuth.core.events import (
     ToolProposedDraft,
     ToolStartedDraft,
     TransientRuntimeEventDraft,
-    UserInputRequestedDraft,
     VerificationFailedDraft,
     emit_transient_runtime_event,
 )
@@ -95,7 +94,6 @@ async def run_agent_loop(
         if run.status in {
             RunStatus.PAUSED,
             RunStatus.WAITING_APPROVAL,
-            RunStatus.WAITING_USER,
             RunStatus.SUCCEEDED,
             RunStatus.FAILED,
             RunStatus.CANCELLED,
@@ -242,17 +240,6 @@ async def handle_tool_calls(
         return await _emit_runtime_event(run_id, services, event, on_event)
 
     intents = [ToolIntent.from_tool_call(call) for call in assistant_message.tool_calls]
-    for intent in intents:
-        if intent.name == "knuth.ask_user":
-            await emit(
-                UserInputRequestedDraft(
-                    question=str(intent.arguments.get("question", "")),
-                    tool_call_id=intent.id,
-                )
-            )
-            await services.run_store.set_status(run_id, RunStatus.WAITING_USER)
-            return RunStatus.WAITING_USER
-
     proposals = []
     for intent in intents:
         await emit(ToolIntentDraft(intent=intent))

@@ -11,7 +11,7 @@ from knuth_cli.config import load_config
 
 
 KNUTH_CLI_BASE_IDENTITY = (
-    "You are Knuth, a general purpose agent. "
+    "You are Knuth, a general purpose local agent runtime. "
 )
 
 

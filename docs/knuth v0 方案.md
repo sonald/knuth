@@ -31,7 +31,6 @@ knuth/
     broker.py
     providers.py
     builtin/
-      ask_user.py
       read_file.py
       write_file.py
       shell.py
@@ -148,7 +147,6 @@ class RunStatus(StrEnum):
     CREATED = "created"
     RUNNING = "running"
     WAITING_APPROVAL = "waiting_approval"
-    WAITING_USER = "waiting_user"
     PAUSED = "paused"
     FAILED = "failed"
     SUCCEEDED = "succeeded"
@@ -1368,9 +1366,6 @@ model.completed
 tool.completed
   -> tool_result message
 
-user_input.received
-  -> user message
-
 system.note
   -> system 或 assistant metadata，视具体用途
 ```
@@ -1518,17 +1513,11 @@ flowchart TD
 
 核心原则：agent loop 不直接执行工具。它只处理模型输出，形成 `ToolIntent`，交给 `ToolBroker`。
 
-还有一个建议：`need_clarification` 不要靠解析模型文本。v0 做一个内置控制工具 `knuth.ask_user`。模型需要问用户时，就调用这个工具。runtime 识别到它后，把 run 状态设为 `waiting_user`。
+clarification / ask-user 类能力先不进入 v0。不要在 agent loop 里按工具名特判，也不要为 `ask_user` 预留 `waiting_user` 状态；这类工具以后单独设计。
 
 内置工具：
 
 ```text
-knuth.ask_user
-  effect: pure
-  risk: low
-  参数: question: string
-  runtime 特殊处理：不真正执行外部动作，而是生成 user_input.requested event
-
 knuth.finish
   可选
   如果你想强制 final answer 结构化，可以做成 finish tool
@@ -1540,7 +1529,7 @@ Agent loop 主流程：
 ```mermaid
 stateDiagram-v2
     [*] --> LoadRun
-    LoadRun --> Stop: paused / waiting_approval / waiting_user
+    LoadRun --> Stop: paused / waiting_approval
     LoadRun --> BuildContext
     BuildContext --> StreamModel
     StreamModel --> PersistAssistant
@@ -1602,7 +1591,6 @@ async def run_agent_loop(
         if run.status in {
             RunStatus.PAUSED,
             RunStatus.WAITING_APPROVAL,
-            RunStatus.WAITING_USER,
             RunStatus.SUCCEEDED,
             RunStatus.FAILED,
             RunStatus.CANCELLED,
@@ -1771,19 +1759,6 @@ async def handle_tool_calls(
         )
         for tc in assistant_message.tool_calls
     ]
-
-    # Special control tool: ask user.
-    for intent in intents:
-        if intent.name == "knuth.ask_user":
-            question = intent.arguments.get("question", "")
-            await services.event_store.append(
-                run_id,
-                namespace="user_input",
-                name="requested",
-                payload={"question": question, "tool_call_id": intent.id},
-            )
-            await services.run_store.set_status(run_id, RunStatus.WAITING_USER)
-            return RunStatus.WAITING_USER
 
     proposals = []
     for intent in intents:
@@ -2121,32 +2096,8 @@ class ReadFileTool(ToolBase):
         )
 ```
 
-`ask_user` 控制工具：
+clarification / ask-user 工具不属于 v0 内置工具集合，后续单独设计。
 
-```python
-class AskUserTool(ToolBase):
-    name: str = "knuth.ask_user"
-    description: str = "Ask the human user for clarification or confirmation."
-    parameters: dict = {
-        "type": "object",
-        "properties": {
-            "question": {"type": "string"},
-        },
-        "required": ["question"],
-        "additionalProperties": False,
-    }
-    parallelable: bool = False
-    cacheable: bool = False
-    risk: ToolRisk = ToolRisk.LOW
-    effect: ToolEffect = ToolEffect.PURE
-
-    async def __call__(self, ctx: ToolContext, **kwargs) -> ToolResult:
-        # Runtime should intercept this before normal execution.
-        return ToolResult(
-            status=ToolResultStatus.SUCCESS,
-            content=kwargs["question"],
-        )
-```
 
 ------
 
@@ -2199,7 +2150,7 @@ flowchart TD
 
 第五，`parallelable/cacheable` 可以保留，但 v0 不做真正缓存和复杂并行。最多先实现“全部 parallelable 才可 batch 并行”，默认串行。
 
-第六，`need_clarification` 不要靠模型自由文本判断。用 `knuth.ask_user` 控制工具。
+第六，clarification / ask-user 类能力延期设计，v0 不放内置控制工具。
 
 第七，事件系统不要和模型流式事件混成一套。`InferenceEvent` 是模型输出流；`RuntimeEvent` 是持久化事实。
 
@@ -2230,7 +2181,7 @@ flowchart TD
    - BuiltinToolProvider
    - ToolRegistry
    - ToolBroker
-   - read_file / ask_user 两个内置工具
+   - read_file 等基础内置工具
 
 4. knuth-runtime
    - MemoryRunStore

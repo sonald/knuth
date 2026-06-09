@@ -9,7 +9,6 @@ from knuth_runtime.agent import (
 )
 from knuth_runtime.approval import Approval, ApprovalStatus
 from knuth_runtime.context import StaticSectionProvider, SystemSectionProvider
-from knuth_runtime.loop import run_agent_loop
 from knuth_runtime.stores import MemoryEventStore, MemoryRunStore, SQLiteStore
 
 __all__ = [
@@ -25,5 +24,4 @@ __all__ = [
     "build_default_runtime",
     "build_memory_runtime",
     "build_sqlite_runtime",
-    "run_agent_loop",
 ]

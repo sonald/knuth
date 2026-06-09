@@ -156,25 +156,6 @@ class PythonTool(ExecutionContextTool):
         )
 
 
-class AskUserTool(ToolBase):
-    name: str = "knuth.ask_user"
-    description: str = "Ask the human user for clarification or confirmation."
-    parameters: dict[str, Any] = {
-        "type": "object",
-        "properties": {"question": {"type": "string"}},
-        "required": ["question"],
-        "additionalProperties": False,
-    }
-    risk: ToolRisk = ToolRisk.LOW
-    effect: ToolEffect = ToolEffect.PURE
-
-    async def __call__(self, ctx: ToolContext, **kwargs: Any) -> ToolResult:
-        question = kwargs.get("question")
-        if not isinstance(question, str) or not question:
-            raise ValueError("question must be a non-empty string")
-        return ToolResult.success(content=question)
-
-
 def create_default_registry(cwd: Path | str | None = None) -> ToolRegistry:
     return ToolRegistry(
         [
@@ -182,6 +163,5 @@ def create_default_registry(cwd: Path | str | None = None) -> ToolRegistry:
             WriteFileTool(cwd),
             ShellTool(cwd),
             PythonTool(cwd),
-            AskUserTool(),
         ]
     )

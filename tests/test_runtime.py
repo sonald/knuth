@@ -193,56 +193,6 @@ class EventDrivenRuntimeTests(unittest.TestCase):
             reconstructed = reconstruct_messages_from_events(events)
             self.assertEqual(reconstructed[-1].content, "Final answer: Knuth works")
 
-    def test_ask_user_tool_sets_waiting_user(self) -> None:
-        with tempfile.TemporaryDirectory() as workspace:
-            runtime = self.build_runtime(
-                workspace,
-                [
-                    InferenceMessage(
-                        role=InferenceRole.ASSISTANT,
-                        tool_calls=[
-                            CoreToolCall(
-                                id="call-ask",
-                                name="knuth.ask_user",
-                                arguments={"question": "Which file?"},
-                            )
-                        ],
-                    )
-                ],
-            )
-
-            turn = anyio.run(runtime.run_once, "read something")
-
-            self.assertEqual(turn.status, RunStatus.WAITING_USER)
-            self.assertEqual(turn.answer, "Which file?")
-
-    def test_resume_does_not_replay_waiting_user_request(self) -> None:
-        with tempfile.TemporaryDirectory() as workspace:
-            runtime = self.build_runtime(
-                workspace,
-                [
-                    InferenceMessage(
-                        role=InferenceRole.ASSISTANT,
-                        tool_calls=[
-                            CoreToolCall(
-                                id="call-ask",
-                                name="knuth.ask_user",
-                                arguments={"question": "Which file?"},
-                            )
-                        ],
-                    )
-                ],
-            )
-
-            first = anyio.run(runtime.run_once, "read something")
-            before = anyio.run(runtime.events, first.run_id)
-            resumed = anyio.run(runtime.resume, first.run_id)
-            after = anyio.run(runtime.events, first.run_id)
-
-            self.assertEqual(resumed.status, RunStatus.WAITING_USER)
-            self.assertEqual(resumed.answer, "Which file?")
-            self.assertEqual(len(after), len(before))
-
     def test_approval_resume_executes_pending_tool_call(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             runtime = self.build_runtime(
@@ -550,40 +500,6 @@ class StreamingRuntimeTests(unittest.TestCase):
         self.assertIn("question one", contents)
         self.assertIn("first answer", contents)
         self.assertIn("question two", contents)
-
-    def test_run_streaming_answers_ask_user(self) -> None:
-        async def scenario():
-            with tempfile.TemporaryDirectory() as workspace:
-                client = ScriptedInferenceClient(
-                    [
-                        InferenceMessage(
-                            role=InferenceRole.ASSISTANT,
-                            tool_calls=[
-                                CoreToolCall(
-                                    id="call-ask",
-                                    name="knuth.ask_user",
-                                    arguments={"question": "Which file?"},
-                                )
-                            ],
-                        ),
-                        InferenceMessage(
-                            role=InferenceRole.ASSISTANT, content="Got it"
-                        ),
-                    ]
-                )
-                runtime = self._runtime(workspace, client)
-                collector = _Collector()
-                waiting = await runtime.run_streaming("start", collector)
-                answered = await runtime.run_streaming(
-                    "fact.txt", collector, run_id=waiting.run_id
-                )
-            return waiting, answered
-
-        waiting, answered = anyio.run(scenario)
-        self.assertEqual(waiting.status, RunStatus.WAITING_USER)
-        self.assertEqual(answered.status, RunStatus.SUCCEEDED)
-        self.assertEqual(answered.answer, "Got it")
-
 
 if __name__ == "__main__":
     unittest.main()

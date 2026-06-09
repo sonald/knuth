@@ -27,7 +27,6 @@ from knuth.core.runtime_events import (
     TransientRuntimeEvent,
     TransientRuntimeEventBase,
     TransientRuntimeEventDraft,
-    UserInputRequested,
     UserMessage,
     VerificationFailed,
 )
@@ -44,7 +43,6 @@ _STORED_EVENT_BY_TYPE: dict[str, type[StoredRuntimeEventBase]] = {
     "tool.started": ToolStarted,
     "tool.completed": ToolCompleted,
     "approval.requested": ApprovalRequested,
-    "user_input.requested": UserInputRequested,
     "run.succeeded": RunSucceeded,
     "run.failed": RunFailed,
     "verification.failed": VerificationFailed,

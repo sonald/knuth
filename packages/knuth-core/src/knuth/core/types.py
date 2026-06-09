@@ -17,7 +17,6 @@ class RunStatus(StrEnum):
     CREATED = "created"
     RUNNING = "running"
     WAITING_APPROVAL = "waiting_approval"
-    WAITING_USER = "waiting_user"
     PAUSED = "paused"
     FAILED = "failed"
     SUCCEEDED = "succeeded"

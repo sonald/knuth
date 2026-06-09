@@ -46,7 +46,6 @@ class EventRenderer:
             "tool.started": self._on_tool_started,
             "tool.completed": self._on_tool_completed,
             "approval.requested": self._on_approval_requested,
-            "user_input.requested": self._on_user_input_requested,
         }
 
     async def handle(self, event: RuntimeEvent) -> None:
@@ -108,12 +107,6 @@ class EventRenderer:
         self._console.print(
             Text(f"  ⚠ approval required: {title}{suffix}", style="yellow")
         )
-
-    def _on_user_input_requested(self, event: Any) -> None:
-        self._stop_thinking()
-        self._stop_content()
-        question = event.question or "(no question)"
-        self._console.print(Text(f"  ? {question}", style="cyan"))
 
     # -- thinking spinner -------------------------------------------------
 

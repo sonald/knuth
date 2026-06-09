@@ -1,5 +1,4 @@
 from knuth_toold.builtins import (
-    AskUserTool,
     PythonTool,
     ReadFileTool,
     ShellTool,
@@ -27,7 +26,6 @@ from knuth_toold.registry import ToolRegistry
 
 __all__ = [
     "ApprovalRequest",
-    "AskUserTool",
     "PythonTool",
     "ReadFileTool",
     "ShellTool",

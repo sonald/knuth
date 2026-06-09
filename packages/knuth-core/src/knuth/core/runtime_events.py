@@ -71,7 +71,7 @@ class ToolCompletedDraft(RuntimeEventDraftBase):
     type: Literal["tool.completed"] = "tool.completed"
     intent: ToolIntent
     message: InferenceMessage
-    outcome: Literal["succeeded", "failed", "denied", "answered"]
+    outcome: Literal["succeeded", "failed", "denied"]
     result: ToolResult | None = None
 
 
@@ -82,12 +82,6 @@ class ApprovalRequestedDraft(RuntimeEventDraftBase):
     title: str
     reason: str
     risk: str | None = None
-
-
-class UserInputRequestedDraft(RuntimeEventDraftBase):
-    type: Literal["user_input.requested"] = "user_input.requested"
-    question: str
-    tool_call_id: str | None = None
 
 
 class RunSucceededDraft(RuntimeEventDraftBase):
@@ -120,7 +114,6 @@ DurableRuntimeEventDraft = (
     | ToolStartedDraft
     | ToolCompletedDraft
     | ApprovalRequestedDraft
-    | UserInputRequestedDraft
     | RunSucceededDraft
     | RunFailedDraft
     | VerificationFailedDraft
@@ -209,7 +202,6 @@ ToolProposed = _stored("ToolProposed", ToolProposedDraft)
 ToolStarted = _stored("ToolStarted", ToolStartedDraft)
 ToolCompleted = _stored("ToolCompleted", ToolCompletedDraft)
 ApprovalRequested = _stored("ApprovalRequested", ApprovalRequestedDraft)
-UserInputRequested = _stored("UserInputRequested", UserInputRequestedDraft)
 RunSucceeded = _stored("RunSucceeded", RunSucceededDraft)
 RunFailed = _stored("RunFailed", RunFailedDraft)
 VerificationFailed = _stored("VerificationFailed", VerificationFailedDraft)
@@ -243,7 +235,6 @@ StoredRuntimeEvent = (
     | ToolStarted
     | ToolCompleted
     | ApprovalRequested
-    | UserInputRequested
     | RunSucceeded
     | RunFailed
     | VerificationFailed

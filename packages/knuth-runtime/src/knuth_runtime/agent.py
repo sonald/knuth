@@ -8,11 +8,9 @@ from knuth.core.events import (
     InferenceGenerationCompleted,
     RunCreatedDraft,
     RuntimeEvent,
-    ToolCompletedDraft,
     UserMessageDraft,
 )
-from knuth.core.messages import InferenceMessage, InferenceRole
-from knuth.core.tools import ToolIntent
+from knuth.core.messages import InferenceMessage
 from knuth.core.types import RunStatus
 from knuth_llmd import InferenceConfig
 from knuth_runtime.approval import (
@@ -94,7 +92,7 @@ class AgentRuntime:
 
         - ``run_id is None``: start a fresh run from ``prompt``.
         - ``run_id`` set with ``prompt``: continue the same run with a new user
-          turn (multi-turn memory), or answer a pending ``ask_user`` request.
+          turn (multi-turn memory).
         - ``run_id`` set with ``prompt is None``: resume a paused/awaiting run
           (e.g. after an approval is resolved).
         """
@@ -115,14 +113,10 @@ class AgentRuntime:
             )
             run_id = run.id
         elif prompt is not None:
-            run = await self._services.run_store.get(run_id)
-            if run.status == RunStatus.WAITING_USER:
-                await self._record_user_answer(run_id, prompt)
-            else:
-                await self._services.event_store.append(
-                    run_id,
-                    UserMessageDraft(content=prompt),
-                )
+            await self._services.event_store.append(
+                run_id,
+                UserMessageDraft(content=prompt),
+            )
             await self._services.run_store.set_status(run_id, RunStatus.RUNNING)
         else:
             run = await self._services.run_store.get(run_id)
@@ -140,31 +134,6 @@ class AgentRuntime:
             answer=_answer_from_events(events),
             run_id=run_id,
             status=status,
-        )
-
-    async def _record_user_answer(self, run_id: str, answer: str) -> None:
-        events = await self._services.event_store.list_events(run_id)
-        tool_call_id: str | None = None
-        for event in reversed(events):
-            if event.type == "user_input.requested":
-                tool_call_id = event.tool_call_id
-                break
-        message = InferenceMessage(
-            role=InferenceRole.TOOL_RESULT,
-            tool_call_id=tool_call_id,
-            tool_name="knuth.ask_user",
-            content=answer,
-        )
-        await self._services.event_store.append(
-            run_id,
-            ToolCompletedDraft(
-                intent=ToolIntent(
-                    id=tool_call_id or "call_ask_user",
-                    name="knuth.ask_user",
-                ),
-                message=message,
-                outcome="answered",
-            ),
         )
 
     async def approve(self, approval_id: str) -> Approval:
@@ -281,6 +250,4 @@ def _answer_from_events(events: list[RuntimeEvent]) -> str:
             return event.answer
         if event.type == "approval.requested":
             return f"Waiting for approval: {event.approval_id}"
-        if event.type == "user_input.requested":
-            return event.question or "Waiting for user input"
     return ""
