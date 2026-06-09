@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from typing import cast
 from uuid import uuid4
 
 from knuth.core.events import (
@@ -29,6 +30,7 @@ from knuth.core.events import (
     RunFailedDraft,
     RunSucceededDraft,
     RuntimeEvent,
+    RuntimeEventDraft,
     ToolCompletedDraft,
     ToolIntentDraft,
     ToolProposedDraft,
@@ -40,7 +42,7 @@ from knuth.core.events import (
 )
 from knuth.core.messages import InferenceMessage, InferenceRole
 from knuth.core.tools import ToolIntent, ToolProposalStatus
-from knuth.core.types import ErrorInfo, RunStatus
+from knuth.core.types import ErrorInfo, EventDurability, RunStatus
 from knuth_llmd import InferenceConfig, InferenceRuntimeOptions
 from knuth_runtime.context import RunContext
 from knuth_runtime.services import RuntimeServices
@@ -52,6 +54,30 @@ def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+async def _emit_runtime_event(
+    run_id: str,
+    services: RuntimeServices,
+    event: RuntimeEventDraft,
+    on_event: EventSink | None = None,
+) -> RuntimeEvent:
+    if event.durability == EventDurability.DURABLE:
+        runtime_event = await services.event_store.append(
+            run_id,
+            cast(DurableRuntimeEventDraft, event),
+        )
+    else:
+        runtime_event = emit_transient_runtime_event(
+            run_id,
+            cast(TransientRuntimeEventDraft, event),
+            event_id=f"evt_{uuid4().hex}",
+            created_at=_utc_now(),
+        )
+
+    if on_event is not None:
+        await on_event(runtime_event)
+    return runtime_event
+
+
 async def run_agent_loop(
     run_id: str,
     services: RuntimeServices,
@@ -61,22 +87,8 @@ async def run_agent_loop(
 ) -> RunStatus:
     turns = 0
 
-    async def emit_durable(event: DurableRuntimeEventDraft) -> RuntimeEvent:
-        stored_event = await services.event_store.append(run_id, event)
-        if on_event is not None:
-            await on_event(stored_event)
-        return stored_event
-
-    async def emit_transient(event: TransientRuntimeEventDraft) -> RuntimeEvent:
-        runtime_event = emit_transient_runtime_event(
-            run_id,
-            event,
-            event_id=f"evt_{uuid4().hex}",
-            created_at=_utc_now(),
-        )
-        if on_event is not None:
-            await on_event(runtime_event)
-        return runtime_event
+    async def emit(event: RuntimeEventDraft) -> RuntimeEvent:
+        return await _emit_runtime_event(run_id, services, event, on_event)
 
     while True:
         run = await services.run_store.get(run_id)
@@ -103,7 +115,7 @@ async def run_agent_loop(
             continue
 
         if turns >= run.max_turns:
-            await emit_durable(
+            await emit(
                 RunFailedDraft(
                     reason="max_turns_exceeded",
                     max_turns=run.max_turns,
@@ -119,7 +131,7 @@ async def run_agent_loop(
             workspace_uri=run.metadata.get("workspace_uri"),
         )
         view = await services.context_builder.build(ctx)
-        await emit_durable(
+        await emit(
             ModelStartedDraft(
                 turn=turns,
                 model=services.inference_client.model,
@@ -139,17 +151,17 @@ async def run_agent_loop(
             runtime=runtime_options,
         ):
             if isinstance(event, InferenceReasoningDelta):
-                await emit_transient(ModelReasoningDeltaDraft(delta=event.delta))
+                await emit(ModelReasoningDeltaDraft(delta=event.delta))
             elif isinstance(event, InferenceReasoningCompleted):
-                await emit_transient(ModelReasoningCompletedDraft())
+                await emit(ModelReasoningCompletedDraft())
             elif isinstance(event, InferenceContentDelta):
-                await emit_transient(ModelContentDeltaDraft(delta=event.delta))
+                await emit(ModelContentDeltaDraft(delta=event.delta))
             elif isinstance(event, InferenceToolCallStarted):
-                await emit_transient(
+                await emit(
                     ModelToolCallStartedDraft(index=event.index, id=event.id)
                 )
             elif isinstance(event, InferenceToolCallDelta):
-                await emit_transient(
+                await emit(
                     ModelToolCallDeltaDraft(
                         index=event.index,
                         id=event.id,
@@ -159,14 +171,14 @@ async def run_agent_loop(
                     )
                 )
             elif isinstance(event, InferenceToolCallCompleted):
-                await emit_transient(
+                await emit(
                     ModelToolCallCompletedDraft(tool_call=event.tool_call)
                 )
             elif isinstance(event, InferenceFailed):
                 stream_error = event.error
                 break
             elif isinstance(event, InferenceAborted):
-                await emit_durable(ModelAbortedDraft(reason=event.reason))
+                await emit(ModelAbortedDraft(reason=event.reason))
                 await services.run_store.set_status(run_id, RunStatus.PAUSED)
                 return RunStatus.PAUSED
             elif isinstance(event, InferenceGenerationCompleted):
@@ -175,12 +187,12 @@ async def run_agent_loop(
                 usage = event.usage
 
         if stream_error is not None:
-            await emit_durable(ModelFailedDraft(error=stream_error))
+            await emit(ModelFailedDraft(error=stream_error))
             await services.run_store.set_status(run_id, RunStatus.FAILED)
             return RunStatus.FAILED
 
         if assistant_message is None:
-            await emit_durable(
+            await emit(
                 ModelFailedDraft(
                     error=ErrorInfo(
                         code="missing_generation_end",
@@ -191,7 +203,7 @@ async def run_agent_loop(
             await services.run_store.set_status(run_id, RunStatus.FAILED)
             return RunStatus.FAILED
 
-        await emit_durable(
+        await emit(
             ModelCompletedDraft(
                 turn=turns,
                 message=assistant_message,
@@ -209,13 +221,13 @@ async def run_agent_loop(
             continue
 
         if assistant_message.content and assistant_message.content.strip():
-            await emit_durable(
+            await emit(
                 RunSucceededDraft(answer=assistant_message.content or "", turns=turns)
             )
             await services.run_store.set_status(run_id, RunStatus.SUCCEEDED)
             return RunStatus.SUCCEEDED
 
-        await emit_durable(
+        await emit(
             VerificationFailedDraft(reason="empty_final_answer")
         )
 
@@ -227,10 +239,7 @@ async def handle_tool_calls(
     on_event: EventSink | None = None,
 ) -> RunStatus | None:
     async def emit(event: DurableRuntimeEventDraft) -> RuntimeEvent:
-        event = await services.event_store.append(run_id, event)
-        if on_event is not None:
-            await on_event(event)
-        return event
+        return await _emit_runtime_event(run_id, services, event, on_event)
 
     intents = [ToolIntent.from_tool_call(call) for call in assistant_message.tool_calls]
     for intent in intents:
