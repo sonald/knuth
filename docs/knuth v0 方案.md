@@ -1,3 +1,9 @@
+> **⚠️ SUPERSEDED**：本文档已被 [knuth-v0-design.md](knuth-v0-design.md) 取代（2026-06-10）。
+> 主要修订：持久化改为"事件为唯一权威 + 同步派生投影 + 校验聚合"（RunLedger 模型）、
+> approval/恢复链路闭合、外部写崩溃语义（UNKNOWN + idempotency）、hook 收权（无 MUTATE）、
+> 安全红线前置。本文仅作历史参考，其中 hook 系统（§12）、事件三字段（§10）、
+> ToolBase(BaseModel)（§6）等设计已作废。
+
 下面是我建议的 **knuth v0 核心方案**。重点不是一次性实现所有高级能力，而是先把边界定对：`LLM 只负责推理和提出意图`，`runtime 负责状态和流程`，`toold 负责工具发现与执行`，`event system 负责可观察和可暂停`。这样 v0 很小，但不会把未来的 daemon、approval、rollback、cache、workflow、plugin 都堵死。
 
 

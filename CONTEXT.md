@@ -83,3 +83,31 @@ _Avoid_: user message, durable event, tool definition
 **SystemSectionProvider**:
 The additive seam that yields `SystemSection` values for a run. It only contributes fragments; it cannot alter messages or tools. This is its whole point versus a context rewriter, which has full power over the view. The runtime composes a preamble by gathering each provider's sections in injection order, so a new context source is a new provider rather than a change to the assembly.
 _Avoid_: message rewriter, view transformer, middleware
+
+**RunLedger**:
+The single authoritative write surface for durable run state. Every durable change is one `apply(event)` call that validates aggregate invariants, appends the event, and synchronously updates derived projections inside one transaction. Run status, approvals, and tool invocation states have no direct write path beside it; atomicity is structural, not disciplinary.
+_Avoid_: event store wrapper, dual-write store, message queue, repository
+
+**DecisionEvent**:
+A durable `RuntimeEvent` designed for state reconstruction: it records an orchestration decision or fact (batch planned, invocation started, approval resolved) whose typed fold yields run state. If answering a state question requires heuristics over incidental events, a decision event type is missing and should be added instead of the heuristic.
+_Avoid_: log line, debug trace, transient delta, snapshot dump
+
+**Projection**:
+A derived, rebuildable read model (runs, tool invocations, approvals, conversation) computed by folding decision events. It is updated synchronously in the same transaction as the event append and can always be dropped and refolded; changing a projection's schema is not a data migration. Event type shapes are the only durable contract.
+_Avoid_: authoritative state, source of truth, cache that can silently drift
+
+**ToolInvocation**:
+The per-tool-call state machine projection, keyed by `tool_call_id` and carrying `args_hash`, `effect`, and `idempotency_key`. Its states are proposed, awaiting_approval, approved, denied, running, succeeded, failed, and unknown. It is the unit the agent loop schedules and the unit crash recovery reasons about; it subsumes what other designs call a pending action or execution record.
+_Avoid_: tool intent, pending action, execution log entry, queue item
+
+**ToolBatch**:
+The set of tool calls produced by one assistant turn, opened by `tool.batch_planned` and closed by `tool.batch_closed` only when every invocation in it has a model-visible observation. At most one batch is open per run; an open batch is the run's resume point after approval, pause, or crash.
+_Avoid_: parallel task queue, message group, tool cache
+
+**ContextSnapshot**:
+The frozen, hash-level proof of what one model call saw: message, tool, preamble, and model-config hashes plus counts, recorded on `step.started`. It answers "why did the model do that" by proving whether two builds saw the same input, without persisting the full prompt.
+_Avoid_: full prompt dump, persisted system prompt, message history
+
+**UnknownOutcome**:
+The terminal-pending invocation state for an external-write tool that was started but whose completion was never recorded, typically a crash mid-flight. The side effect may or may not have happened, so it must be resolved by a human decision and never auto-retried; resolution appends the human-confirmed completion event.
+_Avoid_: failed, retryable error, timeout, denial
