@@ -397,8 +397,10 @@ def _litellm_model_name(model: str) -> str:
 
 
 async def _default_completion_fn(**kwargs: object) -> object:
+    import litellm
     from litellm import acompletion
 
+    litellm.suppress_debug_info = True  # keep "Give Feedback" banners out of the CLI
     return await acompletion(**kwargs)
 
 

@@ -7,7 +7,9 @@ from knuth.core.events import (
     InferenceGenerationCompleted,
     RuntimeEvent,
 )
-from knuth.core.messages import InferenceMessage
+from knuth.core.messages import InferenceMessage, InferenceRole
+from knuth.core.runs import AgentRun
+from knuth.core.types import RunStatus
 from knuth_llmd import InferenceConfig
 from knuth_runtime.approval import (
     Approval,
@@ -107,6 +109,24 @@ class AgentRuntime:
         if self._services is None:
             raise RuntimeError("runtime is not configured")
         return (await self._services.run_store.get(run_id)).status
+
+    async def pause(self, run_id: str) -> RunStatus:
+        """Mark an in-flight run as paused so it can be resumed later.
+
+        Only transitions runs that are actively progressing; waiting or
+        terminal statuses are left untouched.
+        """
+        if self._services is None:
+            raise RuntimeError("runtime is not configured")
+        run = await self._services.run_store.get(run_id)
+        if run.status in {RunStatus.CREATED, RunStatus.RUNNING}:
+            run = await self._services.run_store.set_status(run_id, RunStatus.PAUSED)
+        return run.status
+
+    async def runs(self, limit: int = 20) -> list[AgentRun]:
+        if self._services is None:
+            raise RuntimeError("runtime is not configured")
+        return await self._services.run_store.list_runs(limit)
 
     async def events(self, run_id: str) -> list[RuntimeEvent]:
         if self._services is None:

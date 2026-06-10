@@ -231,6 +231,75 @@ class EventDrivenRuntimeTests(unittest.TestCase):
             self.assertEqual(resumed.status, RunStatus.SUCCEEDED)
             self.assertEqual(Path(workspace, "x.txt").read_text(encoding="utf-8"), "hello")
 
+    def test_denied_approval_resumes_and_informs_model(self) -> None:
+        """A denied tool call must not deadlock the run: on resume the model
+        receives a denied tool result and the run can complete."""
+        with tempfile.TemporaryDirectory() as workspace:
+            client = CapturingScriptedClient(
+                [
+                    InferenceMessage(
+                        role=InferenceRole.ASSISTANT,
+                        tool_calls=[
+                            CoreToolCall(
+                                id="call-shell",
+                                name="shell",
+                                arguments={"command": "date"},
+                            )
+                        ],
+                    ),
+                    InferenceMessage(
+                        role=InferenceRole.ASSISTANT,
+                        content="Understood, I will not run that command.",
+                    ),
+                ]
+            )
+            approvals = MemoryApprovalService()
+            registry = create_default_registry(Path(workspace))
+            broker = ToolBroker(registry, PolicyEngine(approvals))
+            runtime = build_memory_runtime(
+                inference_client=client,
+                inference_config=InferenceConfig(),
+                run_store=MemoryRunStore(),
+                event_store=MemoryEventStore(),
+                approvals=approvals,
+                tool_broker=broker,
+            )
+
+            first = anyio.run(runtime.run_once, "run date")
+            self.assertEqual(first.status, RunStatus.WAITING_APPROVAL)
+            pending = anyio.run(runtime.pending_approvals, first.run_id)
+            self.assertEqual(len(pending), 1)
+            anyio.run(runtime.deny, pending[0].id)
+
+            async def resume():
+                async with runtime.resume(first.run_id) as session:
+                    return await session.result()
+
+            resumed = anyio.run(resume)
+
+            self.assertEqual(resumed.status, RunStatus.SUCCEEDED)
+            self.assertEqual(resumed.answer, "Understood, I will not run that command.")
+            # The model's final turn must see the denial as a tool result.
+            final_turn_messages = client.captured_messages[-1]
+            tool_results = [
+                message
+                for message in final_turn_messages
+                if message.role == InferenceRole.TOOL_RESULT
+            ]
+            self.assertTrue(tool_results)
+            self.assertIn("denied", (tool_results[-1].content or "").lower())
+            # No approval is left pending and the denial is durable.
+            self.assertEqual(
+                anyio.run(runtime.pending_approvals, first.run_id), []
+            )
+            events = anyio.run(runtime.events, first.run_id)
+            denied = [
+                event
+                for event in events
+                if event.type == "tool.completed" and event.outcome == "denied"
+            ]
+            self.assertTrue(denied)
+
 
 class StreamingTextClient:
     """Yields a content delta then a generation_end per scripted answer."""

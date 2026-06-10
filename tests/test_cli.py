@@ -46,6 +46,17 @@ class _StreamingFakeRuntime:
         return _FakeRunSession("resumed", run_id, listeners)
 
 
+class _FailingFakeRuntime:
+    def start(self, prompt, *, listeners=()):
+        return _FailingRunSession()
+
+    def continue_run(self, run_id, prompt, *, listeners=()):
+        return _FailingRunSession()
+
+    async def pending_approvals(self, run_id=None):
+        return []
+
+
 class _FakeRunSession:
     def __init__(self, prompt: str, run_id: str, listeners) -> None:
         self._prompt = prompt
@@ -74,6 +85,17 @@ class _FakeRunSession:
             run_id=self._run_id,
             status=RunStatus.SUCCEEDED,
         )
+
+
+class _FailingRunSession:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+    async def result(self) -> RunResult:
+        raise RuntimeError("boom")
 
 
 class CapturingInferenceClient:
@@ -258,6 +280,22 @@ class CliTests(unittest.TestCase):
         self.assertIn("Knuth agent ready", output.getvalue())
         self.assertIn("real-ish: hello", output.getvalue())
 
+    def test_interactive_run_reports_turn_errors_without_crashing_repl(self) -> None:
+        output = io.StringIO()
+        input_stream = io.StringIO("hello\n/exit\n")
+
+        async def runtime_factory() -> _FailingFakeRuntime:
+            return _FailingFakeRuntime()
+
+        with (
+            patch("sys.stdin", input_stream),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["run"], runtime_factory=runtime_factory)
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Run failed: RuntimeError: boom", output.getvalue())
+
     def test_run_help_does_not_expose_workspace_option(self) -> None:
         output = io.StringIO()
 
@@ -307,8 +345,8 @@ class CliTests(unittest.TestCase):
             async def deny(self, approval_id: str):
                 return FakeApproval(approval_id, RunStatus.CANCELLED)
 
-            def resume(self, run_id: str):
-                return _FakeRunSession("resumed", run_id, ())
+            def resume(self, run_id: str, *, listeners=()):
+                return _FakeRunSession("resumed", run_id, listeners)
 
         async def runtime_factory() -> FakeRuntime:
             return FakeRuntime()

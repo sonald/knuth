@@ -72,7 +72,9 @@ class EventRenderer:
     # -- event handlers ----------------------------------------------------
 
     def _on_reasoning_delta(self, event: Any) -> None:
-        self._stop_content()
+        # Keep accumulated answer text buffered across interleaved reasoning;
+        # flushing here would split streamed markdown into broken fragments.
+        self._suspend_content()
         self._start_thinking()
         self._append_reasoning(event.delta)
 
@@ -172,6 +174,7 @@ class EventRenderer:
                 self._render_content(),
                 console=self._console,
                 refresh_per_second=12,
+                transient=True,
             )
             self._content_live.start()
         else:
@@ -180,18 +183,22 @@ class EventRenderer:
     def _render_content(self):
         return Text("".join(self._content_parts))
 
-    def _stop_content(self) -> None:
-        if not self._content_parts:
-            return
-        text = "".join(self._content_parts)
-        renderable = Markdown(text) if text.strip() else Text(text)
+    def _suspend_content(self) -> None:
+        """Hide the live answer region (e.g. while thinking) but keep the buffer."""
         if self._content_live is not None:
-            self._content_live.update(renderable)
             self._content_live.stop()
             self._content_live = None
-        else:
-            self._console.print(renderable)
+
+    def _stop_content(self) -> None:
+        if not self._content_parts:
+            self._suspend_content()
+            return
+        text = "".join(self._content_parts)
         self._content_parts = []
+        self._suspend_content()
+        if not text.strip():
+            return  # whitespace-only content is model noise, not an answer
+        self._console.print(Markdown(text))
 
     # -- tool rendering ---------------------------------------------------
 

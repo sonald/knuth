@@ -71,6 +71,10 @@ class MemoryApprovalService:
         approval = self._approvals.get(approval_id)
         return approval is not None and approval.status == ApprovalStatus.APPROVED
 
+    async def is_denied(self, approval_id: str) -> bool:
+        approval = self._approvals.get(approval_id)
+        return approval is not None and approval.status == ApprovalStatus.DENIED
+
 
 class SQLiteApprovalService(MemoryApprovalService):
     def __init__(self, store: SQLiteStore) -> None:
@@ -155,8 +159,17 @@ class SQLiteApprovalService(MemoryApprovalService):
         return await anyio.to_thread.run_sync(self._is_approved, approval_id)
 
     def _is_approved(self, approval_id: str) -> bool:
+        return self._status_of(approval_id) == ApprovalStatus.APPROVED.value
+
+    async def is_denied(self, approval_id: str) -> bool:
+        return await anyio.to_thread.run_sync(self._is_denied, approval_id)
+
+    def _is_denied(self, approval_id: str) -> bool:
+        return self._status_of(approval_id) == ApprovalStatus.DENIED.value
+
+    def _status_of(self, approval_id: str) -> str | None:
         with self._connect() as conn:
             row = conn.execute(
                 "select status from approvals where id = ?", (approval_id,)
             ).fetchone()
-        return row is not None and row[0] == ApprovalStatus.APPROVED.value
+        return row[0] if row is not None else None

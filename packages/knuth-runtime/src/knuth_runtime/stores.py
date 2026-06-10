@@ -31,6 +31,9 @@ class RunStore(Protocol):
     async def set_status(self, run_id: str, status: RunStatus) -> AgentRun:
         ...
 
+    async def list_runs(self, limit: int = 20) -> list[AgentRun]:
+        ...
+
 
 class EventStore(Protocol):
     async def append(
@@ -72,6 +75,10 @@ class MemoryRunStore:
         )
         self._runs[run_id] = run
         return run
+
+    async def list_runs(self, limit: int = 20) -> list[AgentRun]:
+        runs = sorted(self._runs.values(), key=lambda run: run.created_at, reverse=True)
+        return runs[:limit]
 
 
 class MemoryEventStore:
@@ -206,6 +213,17 @@ class SQLiteStore:
                 "update runs set status = ?, updated_at = ?, data_json = ? where id = ?",
                 (run.status.value, run.updated_at, run.model_dump_json(), run.id),
             )
+
+    async def list_runs(self, limit: int = 20) -> list[AgentRun]:
+        return await anyio.to_thread.run_sync(self._list_runs, limit)
+
+    def _list_runs(self, limit: int) -> list[AgentRun]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "select data_json from runs order by created_at desc limit ?",
+                (limit,),
+            ).fetchall()
+        return [AgentRun.model_validate_json(row[0]) for row in rows]
 
     async def append(
         self,

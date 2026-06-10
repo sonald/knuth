@@ -17,8 +17,18 @@ class PolicyEngine:
         args: dict,
     ) -> PolicyDecision:
         approval_id = approval_id_for(run_id, intent.id)
-        if self.approval_lookup and await self.approval_lookup.is_approved(approval_id):
-            return PolicyDecision(kind=ToolProposalStatus.ALLOWED)
+        if self.approval_lookup:
+            if await self.approval_lookup.is_approved(approval_id):
+                return PolicyDecision(kind=ToolProposalStatus.ALLOWED)
+            if await self.approval_lookup.is_denied(approval_id):
+                return PolicyDecision(
+                    kind=ToolProposalStatus.DENIED,
+                    error=ErrorInfo(
+                        code="approval_denied",
+                        message="The user denied approval for this tool call.",
+                        retryable=False,
+                    ),
+                )
         if manifest.effect in {ToolEffect.EXTERNAL_WRITE, ToolEffect.DANGEROUS}:
             return self._approval(run_id, intent, manifest, args)
         if manifest.effect == ToolEffect.LOCAL_WRITE or manifest.risk == ToolRisk.HIGH:
@@ -47,6 +57,9 @@ class PolicyEngine:
 
 class ApprovalLookup:
     async def is_approved(self, approval_id: str) -> bool:
+        ...
+
+    async def is_denied(self, approval_id: str) -> bool:
         ...
 
 

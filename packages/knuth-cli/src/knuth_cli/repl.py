@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import signal
+import sys
+
 import anyio
-from knuth_runtime import AgentRuntime, RunResult
+from knuth_runtime import AgentRuntime, RunResult, RuntimeObservationError
 from rich.console import Console
 from rich.text import Text
 
@@ -19,12 +22,27 @@ _HELP = """Commands:
   /status          Show the current run status
   /exit, /quit     Leave the session"""
 
+_EXIT_INTERRUPTED = 130
+
+
+class _TurnInterrupted(Exception):
+    """The user pressed Ctrl-C while a turn was in flight."""
+
+    def __init__(self, run_id: str | None) -> None:
+        super().__init__("turn interrupted")
+        self.run_id = run_id
+
 
 async def run_interactive(runtime: AgentRuntime, console: Console) -> int:
     console.print(Text(_BANNER, style="bold"))
     session_run_id: str | None = None
+    allowed_tools: set[str] = set()
     while True:
-        line = await _read_line(console, _PROMPT)
+        try:
+            line = await _read_line(console, _PROMPT)
+        except KeyboardInterrupt:
+            console.print()
+            return 0
         if line is None:  # EOF (Ctrl-D)
             console.print()
             return 0
@@ -38,55 +56,253 @@ async def run_interactive(runtime: AgentRuntime, console: Console) -> int:
                 runtime, console, prompt, session_run_id
             )
             continue
-        session_run_id = await _run_turn(runtime, console, prompt, session_run_id)
+        try:
+            session_run_id = await _run_turn_interruptible(
+                runtime, console, prompt, session_run_id, allowed_tools
+            )
+        except _TurnInterrupted as interrupt:
+            session_run_id = await _pause_after_interrupt(
+                runtime, console, interrupt.run_id or session_run_id
+            )
+        except Exception as exc:
+            console.print(
+                Text(
+                    f"Run failed: {exc.__class__.__name__}: {exc}",
+                    style="bold red",
+                )
+            )
 
 
 async def run_single(runtime: AgentRuntime, console: Console, prompt: str) -> int:
     """Render a single streaming turn (used for ``knuth run <prompt>``)."""
-    await _run_turn(runtime, console, prompt, None)
-    return 0
+    run_id: str | None = None
+    try:
+        run_id, result = await _run_turn_with_result(
+            runtime, console, prompt, None, set()
+        )
+    except _TurnInterrupted as interrupt:
+        await _pause_after_interrupt(runtime, console, interrupt.run_id)
+        return _EXIT_INTERRUPTED
+    except Exception as exc:
+        console.print(
+            Text(f"Run failed: {exc.__class__.__name__}: {exc}", style="bold red")
+        )
+        return 1
+    if result is None:
+        return 1
+    status = result.status
+    footer = f"run {run_id} · {status.value if status else 'unknown'}"
+    console.print(Text(footer, style="dim"))
+    if status == RunStatus.SUCCEEDED:
+        return 0
+    if status == RunStatus.WAITING_APPROVAL:
+        console.print(
+            Text(
+                f"Run is waiting for approval. Approve with `knuth approve <id>` "
+                f"then `knuth resume {run_id}`.",
+                style="yellow",
+            )
+        )
+        return 2
+    if status in {RunStatus.PAUSED}:
+        console.print(
+            Text(f"Run is paused. Resume with `knuth resume {run_id}`.", style="yellow")
+        )
+        return 2
+    return 1
+
+
+async def run_resume(runtime: AgentRuntime, console: Console, run_id: str) -> int:
+    """Resume a paused or waiting run with live rendering and approvals."""
+    renderer = EventRenderer(console)
+    try:
+        async with runtime.resume(run_id, listeners=[renderer]) as session:
+            result = await session.result()
+    finally:
+        renderer.finish()
+    result = await _resolve_approvals(runtime, console, result, run_id, set())
+    status = result.status
+    console.print(
+        Text(f"run {run_id} · {status.value if status else 'unknown'}", style="dim")
+    )
+    if status == RunStatus.SUCCEEDED:
+        return 0
+    if status in {RunStatus.WAITING_APPROVAL, RunStatus.PAUSED}:
+        return 2
+    return 1
+
+
+async def _run_turn_interruptible(
+    runtime: AgentRuntime,
+    console: Console,
+    prompt: str,
+    session_run_id: str | None,
+    allowed_tools: set[str],
+) -> str | None:
+    run_id, _ = await _run_turn_with_result(
+        runtime, console, prompt, session_run_id, allowed_tools
+    )
+    return run_id
+
+
+async def _run_turn_with_result(
+    runtime: AgentRuntime,
+    console: Console,
+    prompt: str,
+    session_run_id: str | None,
+    allowed_tools: set[str],
+) -> tuple[str | None, RunResult | None]:
+    """Run one turn, cancelling it (instead of dying) on Ctrl-C.
+
+    While the turn is in flight SIGINT cancels the turn's scope; the run is
+    then marked paused by the caller so it can be resumed.
+    """
+    observed_run_id: list[str | None] = [session_run_id]
+    result_holder: list[RunResult | None] = [None]
+    try:
+        with anyio.CancelScope() as turn_scope:
+            async with anyio.create_task_group() as tg:
+
+                async def _watch_sigint() -> None:
+                    with anyio.open_signal_receiver(signal.SIGINT) as signals:
+                        async for _ in signals:
+                            turn_scope.cancel()
+                            return
+
+                tg.start_soon(_watch_sigint)
+                try:
+                    observed_run_id[0], result_holder[0] = await _run_turn(
+                        runtime,
+                        console,
+                        prompt,
+                        session_run_id,
+                        allowed_tools,
+                        observed_run_id,
+                    )
+                finally:
+                    tg.cancel_scope.cancel()
+    except BaseExceptionGroup as group:
+        if len(group.exceptions) == 1:
+            raise group.exceptions[0] from None
+        raise
+    if turn_scope.cancelled_caught:
+        raise _TurnInterrupted(observed_run_id[0])
+    return observed_run_id[0], result_holder[0]
+
+
+async def _pause_after_interrupt(
+    runtime: AgentRuntime, console: Console, run_id: str | None
+) -> str | None:
+    console.print(Text("⊘ interrupted", style="yellow"))
+    if run_id is not None:
+        try:
+            status = await runtime.pause(run_id)
+        except Exception:
+            return run_id
+        console.print(
+            Text(f"run {run_id} · {status.value} (resume with /new message or `knuth resume`)", style="dim")
+        )
+    return run_id
 
 
 async def _run_turn(
-    runtime: AgentRuntime, console: Console, prompt: str, session_run_id: str | None
-) -> str | None:
+    runtime: AgentRuntime,
+    console: Console,
+    prompt: str,
+    session_run_id: str | None,
+    allowed_tools: set[str],
+    observed_run_id: list[str | None] | None = None,
+) -> tuple[str | None, RunResult | None]:
     renderer = EventRenderer(console)
     session_factory = (
         runtime.start(prompt, listeners=[renderer])
         if session_run_id is None
         else runtime.continue_run(session_run_id, prompt, listeners=[renderer])
     )
-    async with session_factory as session:
-        result = await session.result()
-    renderer.finish()
+    try:
+        async with session_factory as session:
+            if observed_run_id is not None:
+                observed_run_id[0] = getattr(session, "run_id", session_run_id)
+            result = await session.result()
+    except RuntimeObservationError as exc:
+        result = exc.result if isinstance(exc.result, RunResult) else None
+        console.print(
+            Text(
+                f"Display error while rendering run {exc.run_id}.",
+                style="bold red",
+            )
+        )
+        for failure in exc.failures:
+            console.print(
+                Text(
+                    f"  {failure.listener_name}: {failure.error}",
+                    style="red",
+                )
+            )
+        if result is None:
+            return session_run_id, None
+    finally:
+        renderer.finish()
     run_id = result.run_id
-    result = await _resolve_approvals(runtime, console, result, run_id)
-    return run_id
+    result = await _resolve_approvals(runtime, console, result, run_id, allowed_tools)
+    return run_id, result
 
 
 async def _resolve_approvals(
-    runtime: AgentRuntime, console: Console, result: RunResult, run_id: str | None
+    runtime: AgentRuntime,
+    console: Console,
+    result: RunResult,
+    run_id: str | None,
+    allowed_tools: set[str],
 ) -> RunResult:
     while result.status == RunStatus.WAITING_APPROVAL and run_id is not None:
         pending = await runtime.pending_approvals(run_id)
         if not pending:
             break
         for approval in pending:
-            console.print(
-                Text(f"  ⚠ {approval.title}", style="yellow bold")
-            )
-            if approval.reason:
-                console.print(Text(f"    {approval.reason}", style="dim"))
-            answer = await _read_line(console, "  approve? [y/N] ")
-            if answer is not None and answer.strip().lower() in {"y", "yes"}:
+            tool = str(approval.payload.get("tool") or "")
+            if tool and tool in allowed_tools:
+                await runtime.approve(approval.id)
+                console.print(
+                    Text(f"  ✔ auto-approved {tool} (session)", style="dim")
+                )
+                continue
+            label = tool or approval.title
+            try:
+                answer = await _read_line(console, f"  approve {label}? [y/N/a] ")
+            except KeyboardInterrupt:
+                answer = None
+            if answer is None:
+                _print_approval_handoff(console, run_id, pending)
+                return result
+            choice = answer.strip().lower()
+            if choice in {"a", "always"}:
+                if tool:
+                    allowed_tools.add(tool)
+                await runtime.approve(approval.id)
+            elif choice in {"y", "yes"}:
                 await runtime.approve(approval.id)
             else:
                 await runtime.deny(approval.id)
+                console.print(Text(f"  ✘ denied {label}", style="dim"))
         renderer = EventRenderer(console)
         async with runtime.resume(run_id, listeners=[renderer]) as session:
             result = await session.result()
         renderer.finish()
     return result
+
+
+def _print_approval_handoff(console: Console, run_id: str, pending: list) -> None:
+    """Input is gone (EOF/Ctrl-C); leave approvals pending instead of denying."""
+    console.print(
+        Text(
+            "Input closed; leaving the run waiting for approval.",
+            style="yellow",
+        )
+    )
+    for approval in pending:
+        console.print(Text(f"  knuth approve {approval.id}", style="dim"))
+    console.print(Text(f"  knuth resume {run_id}", style="dim"))
 
 
 async def _handle_slash(
@@ -117,9 +333,14 @@ async def _handle_slash(
 
 
 async def _read_line(console: Console, prompt: str) -> str | None:
+    """Read one line off a worker thread; None on EOF.
+
+    KeyboardInterrupt from Ctrl-C at the prompt propagates to the caller.
+    """
+
     def _input() -> str | None:
         try:
-            return console.input(prompt)
+            return console.input(Text(prompt))
         except EOFError:
             return None
 

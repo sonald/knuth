@@ -5,26 +5,36 @@ from collections.abc import Awaitable, Callable
 
 import anyio
 from rich.console import Console
+from rich.text import Text
 
 from knuth_cli import __version__
-from knuth_cli.repl import run_interactive, run_single
+from knuth_cli.repl import run_interactive, run_resume, run_single
 from knuth_cli.runtime import build_runtime
 from knuth_runtime import AgentRuntime
 
 CommandHandler = Callable[[AgentRuntime, argparse.Namespace], Awaitable[int]]
+
+_EXIT_INTERRUPTED = 130
 
 
 def main(
     argv: list[str] | None = None,
     runtime_factory: Callable[[], Awaitable[AgentRuntime]] = build_runtime,
 ) -> int:
-    return anyio.run(async_main, argv, runtime_factory)
+    try:
+        return anyio.run(async_main, argv, runtime_factory)
+    except KeyboardInterrupt:
+        sys.stderr.write("\nInterrupted.\n")
+        return _EXIT_INTERRUPTED
 
 
 async def _handle_run(runtime: AgentRuntime, args: argparse.Namespace) -> int:
     console = Console()
     prompt = args.once if args.once is not None else args.prompt
     if prompt is not None:
+        if not prompt.strip():
+            sys.stderr.write("error: prompt is empty\n")
+            return 2
         return await run_single(runtime, console, prompt)
     return await run_interactive(runtime, console)
 
@@ -39,6 +49,25 @@ async def _handle_events(runtime: AgentRuntime, args: argparse.Namespace) -> int
 
 async def _handle_status(runtime: AgentRuntime, args: argparse.Namespace) -> int:
     sys.stdout.write(f"{(await runtime.status(args.run_id)).value}\n")
+    return 0
+
+
+async def _handle_runs(runtime: AgentRuntime, args: argparse.Namespace) -> int:
+    console = Console()
+    runs = await runtime.runs(args.limit)
+    if not runs:
+        console.print(Text("No runs.", style="dim"))
+        return 0
+    for run in runs:
+        query = run.query.replace("\n", " ")
+        if len(query) > 60:
+            query = query[:59] + "…"
+        console.print(
+            Text(run.id, style="bold")
+            + Text(f"  {run.status.value:<17}", style="cyan")
+            + Text(f"{run.updated_at}  ", style="dim")
+            + Text(query)
+        )
     return 0
 
 
@@ -63,18 +92,12 @@ async def _handle_deny(runtime: AgentRuntime, args: argparse.Namespace) -> int:
 
 
 async def _handle_resume(runtime: AgentRuntime, args: argparse.Namespace) -> int:
-    async with runtime.resume(args.run_id) as session:
-        turn = await session.result()
-    sys.stdout.write(f"{turn.answer}\n")
-    if turn.run_id is not None:
-        sys.stdout.write(f"run_id={turn.run_id}\n")
-    if turn.status is not None:
-        sys.stdout.write(f"status={turn.status.value}\n")
-    return 0
+    return await run_resume(runtime, Console(), args.run_id)
 
 
 _COMMAND_HANDLERS: dict[str, CommandHandler] = {
     "run": _handle_run,
+    "runs": _handle_runs,
     "events": _handle_events,
     "status": _handle_status,
     "tools": _handle_tools,
@@ -104,8 +127,15 @@ async def async_main(
         metavar="PROMPT",
         help="Run one agent turn and exit. Kept for compatibility.",
     )
+    subparsers.add_parser("runs", help="List recent runs").add_argument(
+        "--limit", type=int, default=20, help="Max runs to list"
+    )
     subparsers.add_parser("tools", help="Tool commands").add_argument(
-        "tool_command", choices=["list"], help="Tool subcommand"
+        "tool_command",
+        nargs="?",
+        choices=["list"],
+        default="list",
+        help="Tool subcommand",
     )
     events_parser = subparsers.add_parser("events", help="Print run events")
     events_parser.add_argument("run_id")
@@ -121,12 +151,23 @@ async def async_main(
     if args.command is None:
         parser.print_help()
         return 0
-    runtime = await runtime_factory()
+    try:
+        runtime = await runtime_factory()
+    except ValueError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        sys.stderr.write(
+            "Set KNUTH_API_KEY / KNUTH_BASE_URL / KNUTH_MODEL or create the config file.\n"
+        )
+        return 1
     handler = _COMMAND_HANDLERS.get(args.command)
     if handler is None:
         parser.error(f"unknown command: {args.command}")
         return 1
-    return await handler(runtime, args)
+    try:
+        return await handler(runtime, args)
+    except KeyError as exc:
+        sys.stderr.write(f"error: unknown run or approval id: {exc.args[0]}\n")
+        return 1
 
 
 if __name__ == "__main__":
