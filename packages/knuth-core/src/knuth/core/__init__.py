@@ -1,11 +1,24 @@
 from knuth.core.events import (
+    ContextSnapshot,
     DurableRuntimeEventDraft,
     InferenceEvent,
+    PlannedToolCall,
     RuntimeEvent,
     RuntimeEventDraft,
     StoredRuntimeEvent,
     TransientRuntimeEvent,
     TransientRuntimeEventDraft,
+)
+from knuth.core.invocations import (
+    Approval,
+    ApprovalStatus,
+    ToolCallDecision,
+    ToolEffect,
+    ToolInvocation,
+    ToolInvocationStatus,
+    ToolRisk,
+    approval_id_for,
+    args_hash_for,
 )
 from knuth.core.messages import (
     InferenceMessage,
@@ -14,20 +27,16 @@ from knuth.core.messages import (
     SystemSectionSource,
     ToolCall,
 )
-from knuth.core.runs import AgentRun
-from knuth.core.tools import (
-    ApprovalRequest,
-    ToolIntent,
-    ToolProposal,
-    ToolProposalStatus,
-    ToolResult,
-    ToolResultStatus,
-)
+from knuth.core.runs import AgentRun, Artifact
+from knuth.core.tools import ToolResult, ToolResultStatus
 from knuth.core.types import ErrorInfo, EventDurability, KnuthModel, RunStatus
 
 __all__ = [
     "AgentRun",
-    "ApprovalRequest",
+    "Approval",
+    "ApprovalStatus",
+    "Artifact",
+    "ContextSnapshot",
     "DurableRuntimeEventDraft",
     "ErrorInfo",
     "EventDurability",
@@ -35,18 +44,23 @@ __all__ = [
     "InferenceMessage",
     "InferenceRole",
     "KnuthModel",
+    "PlannedToolCall",
     "RunStatus",
     "RuntimeEvent",
     "RuntimeEventDraft",
     "StoredRuntimeEvent",
     "SystemSection",
     "SystemSectionSource",
-    "ToolIntent",
-    "ToolProposal",
-    "ToolProposalStatus",
     "ToolCall",
+    "ToolCallDecision",
+    "ToolEffect",
+    "ToolInvocation",
+    "ToolInvocationStatus",
     "ToolResult",
     "ToolResultStatus",
+    "ToolRisk",
     "TransientRuntimeEvent",
     "TransientRuntimeEventDraft",
+    "approval_id_for",
+    "args_hash_for",
 ]

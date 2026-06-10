@@ -46,6 +46,7 @@ class EventRenderer:
         self._content_live: Live | None = None
         self._content_parts: list[str] = []
 
+        self._tool_names: dict[str, str] = {}
         self._dispatch: dict[str, Callable[[Any], None]] = {
             "model.reasoning.delta": self._on_reasoning_delta,
             "model.reasoning.completed": self._on_reasoning_completed,
@@ -54,8 +55,9 @@ class EventRenderer:
             "model.completed": self._on_model_completed,
             "model.failed": self._on_model_failed,
             "model.aborted": self._on_model_aborted,
-            "tool.started": self._on_tool_started,
-            "tool.completed": self._on_tool_completed,
+            "tool.batch_planned": self._on_batch_planned,
+            "tool.invocation_started": self._on_tool_started,
+            "tool.invocation_completed": self._on_tool_completed,
             "approval.requested": self._on_approval_requested,
         }
 
@@ -104,10 +106,15 @@ class EventRenderer:
         self._stop_content()
         self._console.print(Text("⊘ aborted", style="yellow"))
 
+    def _on_batch_planned(self, event: Any) -> None:
+        for call in event.calls:
+            self._tool_names[call.tool_call_id] = call.name
+
     def _on_tool_started(self, event: Any) -> None:
         self._stop_thinking()
         self._stop_content()
-        self._console.print(Text(f"  ⏳ {event.intent.name}…", style="dim"))
+        name = self._tool_names.get(event.tool_call_id, event.tool_call_id)
+        self._console.print(Text(f"  ⏳ {name}…", style="dim"))
 
     def _on_tool_completed(self, event: Any) -> None:
         self._print_tool_completed(event)
@@ -210,13 +217,12 @@ class EventRenderer:
     def _print_tool_completed(self, event: Any) -> None:
         self._stop_thinking()
         self._stop_content()
-        name = event.intent.name
+        name = event.tool_name
         if event.outcome == "denied":
             self._console.print(Text(f"  ✘ {name} denied", style="red"))
             return
-        result = event.result
-        ok = True if result is None else result.ok
-        body = "" if result is None else result.content or (result.error.message if result.error else "")
+        ok = event.outcome == "succeeded"
+        body = event.observation or event.observation_preview or ""
         mark = "✔" if ok else "✘"
         style = "green" if ok else "red"
         summary = _truncate(str(body).strip().replace("\n", " "), _MAX_RESULT_LEN)

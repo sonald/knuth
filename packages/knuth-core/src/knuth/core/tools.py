@@ -5,54 +5,12 @@ from typing import Any
 
 from pydantic import Field
 
-from knuth.core.messages import ToolCall
 from knuth.core.types import ErrorInfo, KnuthModel
-
-
-class ToolProposalStatus(StrEnum):
-    ALLOWED = "allowed"
-    REQUIRES_APPROVAL = "requires_approval"
-    DENIED = "denied"
 
 
 class ToolResultStatus(StrEnum):
     SUCCESS = "success"
     ERROR = "error"
-
-
-class ApprovalRequest(KnuthModel):
-    id: str
-    run_id: str
-    title: str
-    reason: str
-    risk: str
-    payload: dict[str, Any]
-
-
-class ToolIntent(KnuthModel):
-    id: str
-    name: str
-    arguments: dict[str, Any] = Field(default_factory=dict)
-    index: int = 0
-    raw: dict[str, Any] = Field(default_factory=dict)
-
-    @classmethod
-    def from_tool_call(cls, call: ToolCall) -> "ToolIntent":
-        return cls(
-            id=call.id or f"call_{call.index}",
-            name=call.name,
-            arguments=call.arguments,
-            index=call.index,
-            raw=call.raw,
-        )
-
-
-class ToolProposal(KnuthModel):
-    status: ToolProposalStatus
-    intent: ToolIntent
-    normalized_args: dict[str, Any] = Field(default_factory=dict)
-    approval: ApprovalRequest | None = None
-    error: ErrorInfo | None = None
 
 
 class ToolResult(KnuthModel):

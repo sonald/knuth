@@ -366,5 +366,127 @@ class CliTests(unittest.TestCase):
             self.assertIn(expected, output.getvalue())
 
 
+class _BlockingFakeStdin:
+    """Stdin double whose readline blocks until a line is pushed."""
+
+    def __init__(self) -> None:
+        import queue
+
+        self._lines: "queue.Queue[object]" = queue.Queue()
+
+    def push(self, line: object) -> None:
+        self._lines.put(line)
+
+    def readline(self) -> str:
+        line = self._lines.get()
+        if isinstance(line, BaseException):
+            raise line
+        return str(line)
+
+
+class StdinReaderTests(unittest.TestCase):
+    """The single-reader discipline: an abandoned read must never leak its
+    line into (or tear) the next prompt — the bug behind the CJK
+    UnicodeDecodeError crash in the REPL."""
+
+    def test_abandoned_request_drops_its_line(self) -> None:
+        from knuth_cli.repl import _StdinReader
+
+        fake = _BlockingFakeStdin()
+        reader = _StdinReader()
+        with patch("sys.stdin", fake):
+            first = reader.submit()
+            first.abandoned = True  # caller hit Ctrl-C and gave up
+            second = reader.submit()
+            fake.push("stale line\n")  # typed for the abandoned prompt
+            fake.push("fresh line\n")
+            self.assertTrue(second.done.wait(timeout=5))
+
+        self.assertFalse(first.done.is_set())
+        self.assertEqual(second.line, "fresh line")
+
+    def test_reads_are_served_strictly_in_order(self) -> None:
+        from knuth_cli.repl import _StdinReader
+
+        fake = _BlockingFakeStdin()
+        reader = _StdinReader()
+        with patch("sys.stdin", fake):
+            first = reader.submit()
+            second = reader.submit()
+            fake.push("one\n")
+            fake.push("two\n")
+            self.assertTrue(first.done.wait(timeout=5))
+            self.assertTrue(second.done.wait(timeout=5))
+
+        self.assertEqual(first.line, "one")
+        self.assertEqual(second.line, "two")
+
+    def test_decode_error_is_surfaced_not_fatal(self) -> None:
+        from knuth_cli.repl import _DECODE_ERROR, _StdinReader
+
+        fake = _BlockingFakeStdin()
+        reader = _StdinReader()
+        with patch("sys.stdin", fake):
+            request = reader.submit()
+            fake.push(
+                UnicodeDecodeError("utf-8", b"\xef", 0, 1, "invalid continuation byte")
+            )
+            self.assertTrue(request.done.wait(timeout=5))
+            # The reader thread survives and serves the next request.
+            recovered = reader.submit()
+            fake.push("ok\n")
+            self.assertTrue(recovered.done.wait(timeout=5))
+
+        self.assertIs(request.line, _DECODE_ERROR)
+        self.assertEqual(recovered.line, "ok")
+
+    def test_eof_resolves_to_none(self) -> None:
+        from knuth_cli.repl import _StdinReader
+
+        fake = _BlockingFakeStdin()
+        reader = _StdinReader()
+        with patch("sys.stdin", fake):
+            request = reader.submit()
+            fake.push("")  # readline returning "" means EOF
+            self.assertTrue(request.done.wait(timeout=5))
+
+        self.assertIsNone(request.line)
+
+    def test_torn_utf8_bytes_from_byte_wise_erase_do_not_poison_next_read(self) -> None:
+        """Backspacing over CJK input without IUTF8 leaves partial bytes in
+        the kernel line buffer. The torn line must surface as a decode error
+        and be fully consumed, leaving the next read clean."""
+        import queue as queue_module
+
+        from knuth_cli.repl import _DECODE_ERROR, _StdinReader
+
+        class _BlockingBytesStdin:
+            encoding = "utf-8"
+
+            def __init__(self) -> None:
+                self._lines: "queue_module.Queue[bytes]" = queue_module.Queue()
+                self.buffer = self
+
+            def push(self, line: bytes) -> None:
+                self._lines.put(line)
+
+            def readline(self) -> bytes:
+                return self._lines.get()
+
+        fake = _BlockingBytesStdin()
+        reader = _StdinReader()
+        with patch("sys.stdin", fake):
+            torn = reader.submit()
+            # "进" (E8 BF 9B) backspaced once at the byte level, then "程".
+            fake.push("x".encode() + b"\xe8\xbf" + "程\n".encode())
+            self.assertTrue(torn.done.wait(timeout=5))
+            clean = reader.submit()
+            fake.push("显示进程\n".encode())
+            self.assertTrue(clean.done.wait(timeout=5))
+
+        self.assertIs(torn.line, _DECODE_ERROR)
+        self.assertEqual(clean.line, "显示进程")
+
+
 if __name__ == "__main__":
     unittest.main()

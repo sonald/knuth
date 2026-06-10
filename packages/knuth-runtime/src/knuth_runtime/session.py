@@ -6,14 +6,14 @@ from typing import Self
 import anyio
 
 from knuth.core.events import (
-    RunCreatedDraft,
     RunInvocationEndedDraft,
     RunInvocationStartedDraft,
+    RunResumedDraft,
     UserMessageDraft,
 )
-from knuth.core.runs import AgentRun
 from knuth.core.types import ErrorInfo, RunStatus
 from knuth_llmd import InferenceConfig, InferenceRuntimeOptions
+
 from knuth_runtime.invocation import RunInvocationMode, RuntimeInvocation
 from knuth_runtime.loop import run_agent_loop
 from knuth_runtime.observation import (
@@ -24,6 +24,10 @@ from knuth_runtime.observation import (
 )
 from knuth_runtime.result import RunResult, answer_from_events
 from knuth_runtime.services import RuntimeServices
+
+_RESUMABLE_STATUSES = frozenset(
+    {RunStatus.RUNNING, RunStatus.WAITING_APPROVAL, RunStatus.PAUSED}
+)
 
 
 class RunSession:
@@ -72,7 +76,7 @@ class RunSession:
         self._observation = LiveRuntimeObservation(self._task_group)
         for listener in self._initial_listeners:
             await self._observation.add_listener(listener)
-        created_run = await self._prepare_run_id()
+        await self._prepare_run_id()
         invocation = RuntimeInvocation(
             run_id=self.run_id,
             mode=self._mode,
@@ -80,7 +84,7 @@ class RunSession:
             observation=self._observation,
         )
         await invocation.emit(RunInvocationStartedDraft(mode=self._mode))
-        await self._prepare_run(invocation, created_run)
+        await self._prepare_run(invocation)
         self._task_group.start_soon(self._drive, invocation)
         return self
 
@@ -121,40 +125,34 @@ class RunSession:
             raise RuntimeError("RunSession completed without a result")
         return result
 
-    async def _prepare_run_id(self) -> AgentRun | None:
+    async def _prepare_run_id(self) -> None:
         if self._mode == "start":
             if self._prompt is None:
                 raise ValueError("prompt is required to start a new run")
-            run = await self._services.run_store.create(self._prompt)
+            run = await self._services.ledger.create_run(self._prompt)
             self._run_id = run.id
-            return run
+            return
         if self._run_id is None:
             raise ValueError("run_id is required")
-        return None
 
-    async def _prepare_run(
-        self, invocation: RuntimeInvocation, created_run: AgentRun | None
-    ) -> None:
+    async def _prepare_run(self, invocation: RuntimeInvocation) -> None:
         if self._mode == "start":
-            if self._prompt is None or created_run is None:
-                raise RuntimeError("start session missing created run")
-            await invocation.emit(
-                RunCreatedDraft(
-                    query=created_run.query,
-                    metadata=created_run.metadata,
-                )
-            )
+            if self._prompt is None:
+                raise RuntimeError("start session missing prompt")
             await invocation.emit(UserMessageDraft(content=self._prompt))
             return
+        run = await self._services.ledger.get_run(invocation.run_id)
         if self._mode == "continue":
             if self._prompt is None:
                 raise ValueError("prompt is required to continue a run")
             await invocation.emit(UserMessageDraft(content=self._prompt))
-            await self._services.run_store.set_status(invocation.run_id, RunStatus.RUNNING)
+            if run.status == RunStatus.SUCCEEDED:
+                await invocation.emit(RunResumedDraft(cause="user_message"))
             return
-        run = await self._services.run_store.get(invocation.run_id)
-        if run.status in {RunStatus.WAITING_APPROVAL, RunStatus.PAUSED}:
-            await self._services.run_store.set_status(invocation.run_id, RunStatus.RUNNING)
+        # resume: unlock through the ledger; pending approvals make this fail
+        # loudly instead of silently re-entering the loop.
+        if run.status in _RESUMABLE_STATUSES:
+            await invocation.emit(RunResumedDraft(cause="user_resume"))
 
     async def _drive(self, invocation: RuntimeInvocation) -> None:
         status: RunStatus | None = None
@@ -165,7 +163,7 @@ class RunSession:
                 self._inference_config,
                 runtime_options=self._runtime_options,
             )
-            events = await self._services.event_store.list_events(invocation.run_id)
+            events = await self._services.ledger.list_events(invocation.run_id)
             self._final_result = RunResult(
                 answer=answer_from_events(events),
                 run_id=invocation.run_id,

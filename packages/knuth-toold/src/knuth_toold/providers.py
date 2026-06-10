@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Protocol
 
-from knuth_toold.base import ToolContext, ToolManifest, ToolResult
+from knuth.core.invocations import ToolInvocation
+from knuth.core.tools import ToolResult
+
+from knuth_toold.base import ToolManifest, ToolRuntimeContext
 
 
 class ToolProvider(Protocol):
@@ -13,8 +16,7 @@ class ToolProvider(Protocol):
 
     async def call_tool(
         self,
-        name: str,
-        args: dict[str, Any],
-        ctx: ToolContext,
+        invocation: ToolInvocation,
+        ctx: ToolRuntimeContext,
     ) -> ToolResult:
         ...

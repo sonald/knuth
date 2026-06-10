@@ -10,7 +10,7 @@ from rich.text import Text
 from knuth_cli import __version__
 from knuth_cli.repl import run_interactive, run_resume, run_single
 from knuth_cli.runtime import build_runtime
-from knuth_runtime import AgentRuntime
+from knuth_runtime import AgentRuntime, LedgerError
 
 CommandHandler = Callable[[AgentRuntime, argparse.Namespace], Awaitable[int]]
 
@@ -95,6 +95,22 @@ async def _handle_resume(runtime: AgentRuntime, args: argparse.Namespace) -> int
     return await run_resume(runtime, Console(), args.run_id)
 
 
+async def _handle_resolve(runtime: AgentRuntime, args: argparse.Namespace) -> int:
+    invocation = await runtime.resolve_unknown(
+        args.tool_call_id, args.outcome, args.note
+    )
+    sys.stdout.write(f"{invocation.tool_call_id}\t{invocation.status.value}\n")
+    return 0
+
+
+async def _handle_approvals(runtime: AgentRuntime, args: argparse.Namespace) -> int:
+    for approval in await runtime.pending_approvals(args.run_id):
+        sys.stdout.write(
+            f"{approval.id}\t{approval.run_id}\t{approval.title}\n"
+        )
+    return 0
+
+
 _COMMAND_HANDLERS: dict[str, CommandHandler] = {
     "run": _handle_run,
     "runs": _handle_runs,
@@ -104,6 +120,8 @@ _COMMAND_HANDLERS: dict[str, CommandHandler] = {
     "approve": _handle_approve,
     "deny": _handle_deny,
     "resume": _handle_resume,
+    "resolve": _handle_resolve,
+    "approvals": _handle_approvals,
 }
 
 
@@ -147,6 +165,19 @@ async def async_main(
     approve_parser.add_argument("approval_id")
     deny_parser = subparsers.add_parser("deny", help="Deny a pending request")
     deny_parser.add_argument("approval_id")
+    resolve_parser = subparsers.add_parser(
+        "resolve",
+        help="Resolve an UNKNOWN external-write tool outcome after a crash",
+    )
+    resolve_parser.add_argument("tool_call_id")
+    resolve_parser.add_argument(
+        "--outcome", choices=["succeeded", "failed"], required=True
+    )
+    resolve_parser.add_argument("--note", default=None)
+    approvals_parser = subparsers.add_parser(
+        "approvals", help="List pending approvals"
+    )
+    approvals_parser.add_argument("--run-id", dest="run_id", default=None)
     args = parser.parse_args(argv)
     if args.command is None:
         parser.print_help()
@@ -167,6 +198,9 @@ async def async_main(
         return await handler(runtime, args)
     except KeyError as exc:
         sys.stderr.write(f"error: unknown run or approval id: {exc.args[0]}\n")
+        return 1
+    except LedgerError as exc:
+        sys.stderr.write(f"error: {exc}\n")
         return 1
 
 

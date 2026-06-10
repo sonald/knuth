@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import queue
 import signal
 import sys
+import threading
+from dataclasses import dataclass, field
 
 import anyio
 from knuth_runtime import AgentRuntime, RunResult, RuntimeObservationError
@@ -260,7 +263,7 @@ async def _resolve_approvals(
         if not pending:
             break
         for approval in pending:
-            tool = str(approval.payload.get("tool") or "")
+            tool = str(approval.preview.get("tool") or "")
             if tool and tool in allowed_tools:
                 await runtime.approve(approval.id)
                 console.print(
@@ -332,16 +335,150 @@ async def _handle_slash(
     return session_run_id
 
 
-async def _read_line(console: Console, prompt: str) -> str | None:
-    """Read one line off a worker thread; None on EOF.
+_DECODE_ERROR = object()
 
-    KeyboardInterrupt from Ctrl-C at the prompt propagates to the caller.
+# Darwin defines IUTF8 (0x00004000) but Python's termios module does not
+# always expose it; Linux exposes termios.IUTF8 directly.
+_DARWIN_IUTF8 = 0x00004000
+
+
+def _enable_utf8_erase() -> None:
+    """Set IUTF8 on the stdin tty so canonical-mode backspace erases whole
+    UTF-8 characters.
+
+    Reads here happen in a worker thread without readline, so the kernel
+    does the line editing. Without IUTF8 a backspace removes one byte, and
+    editing CJK input leaves torn multibyte sequences in the line buffer.
+    """
+    try:
+        import termios
+
+        if not sys.stdin.isatty():
+            return
+        iutf8 = getattr(
+            termios,
+            "IUTF8",
+            _DARWIN_IUTF8 if sys.platform == "darwin" else None,
+        )
+        if iutf8 is None:
+            return
+        fd = sys.stdin.fileno()
+        attrs = termios.tcgetattr(fd)
+        if not attrs[0] & iutf8:
+            attrs[0] |= iutf8
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except Exception:
+        # Best effort: the decode-error retry below remains the fallback.
+        pass
+
+
+@dataclass
+class _ReadRequest:
+    """One pending line read; ``abandoned`` drops the line instead of
+    delivering it to a caller that already gave up (Ctrl-C, cancellation)."""
+
+    done: threading.Event = field(default_factory=threading.Event)
+    line: object = None
+    abandoned: bool = False
+
+    def resolve(self, line: object) -> None:
+        self.line = line
+        self.done.set()
+
+
+class _StdinReader:
+    """Owns the only thread that ever reads stdin.
+
+    ``input()`` in ad-hoc worker threads is unsafe here: a read abandoned by
+    Ctrl-C leaves its thread blocked inside ``input()``, and the next prompt
+    spawns a second reader racing it on the same buffer. Interleaved reads
+    tear multibyte UTF-8 sequences apart (UnicodeDecodeError on CJK input).
+    Serializing every read through one thread makes that impossible.
     """
 
-    def _input() -> str | None:
-        try:
-            return console.input(Text(prompt))
-        except EOFError:
-            return None
+    def __init__(self) -> None:
+        self._requests: queue.Queue[_ReadRequest] = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._tty_prepared = False
 
-    return await anyio.to_thread.run_sync(_input)
+    def submit(self) -> _ReadRequest:
+        if not self._tty_prepared:
+            self._tty_prepared = True
+            _enable_utf8_erase()
+        request = _ReadRequest()
+        self._requests.put(request)
+        self._ensure_thread()
+        return request
+
+    def _ensure_thread(self) -> None:
+        with self._lock:
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(
+                    target=self._loop, name="knuth-stdin-reader", daemon=True
+                )
+                self._thread.start()
+
+    def _loop(self) -> None:
+        while True:
+            request = self._requests.get()
+            raw = self._read_one_line()
+            if request.abandoned:
+                # The caller is gone; swallowing the line keeps it from
+                # leaking into (or tearing) the next read.
+                continue
+            request.resolve(raw)
+
+    def _read_one_line(self) -> object:
+        """Read one line, decoding at the byte layer when possible.
+
+        Decoding bytes ourselves keeps a torn UTF-8 sequence from poisoning
+        the text wrapper's incremental decoder state: the bad line is fully
+        consumed and the next read starts clean.
+        """
+        stdin = sys.stdin
+        buffer = getattr(stdin, "buffer", None)
+        try:
+            if buffer is not None:
+                raw_bytes = buffer.readline()
+                if raw_bytes == b"":
+                    return None
+                encoding = getattr(stdin, "encoding", None) or "utf-8"
+                return raw_bytes.decode(encoding).rstrip("\n")
+            raw = stdin.readline()
+        except UnicodeDecodeError:
+            return _DECODE_ERROR
+        except Exception:
+            return None
+        return None if raw == "" else raw.rstrip("\n")
+
+
+_stdin_reader = _StdinReader()
+
+
+async def _read_line(console: Console, prompt: str) -> str | None:
+    """Read one line through the single stdin reader; None on EOF.
+
+    KeyboardInterrupt from Ctrl-C at the prompt propagates to the caller;
+    the in-flight read is marked abandoned so its line is discarded rather
+    than corrupting the next prompt.
+    """
+    while True:
+        console.print(Text(prompt), end="")
+        request = _stdin_reader.submit()
+        try:
+            await anyio.to_thread.run_sync(
+                request.done.wait, abandon_on_cancel=True
+            )
+        except BaseException:
+            request.abandoned = True
+            raise
+        if request.line is _DECODE_ERROR:
+            console.print(
+                Text(
+                    "Could not decode input as UTF-8; please try again.",
+                    style="yellow",
+                )
+            )
+            continue
+        return request.line if request.line is None else str(request.line)

@@ -2,34 +2,34 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
+import anyio
 from jsonschema import ValidationError, validate
 
-from knuth.core.messages import InferenceMessage, InferenceRole
-from knuth.core.tools import (
-    ApprovalRequest,
-    ToolIntent,
-    ToolProposal,
-    ToolProposalStatus,
-    ToolResult,
-    ToolResultStatus,
+from knuth.core.invocations import (
+    ToolCallDecision,
+    ToolEffect,
+    ToolInvocation,
+    ToolRisk,
 )
+from knuth.core.tools import ToolResult
 from knuth.core.types import ErrorInfo, KnuthModel
-from knuth_toold.base import ToolContext
+
+from knuth_toold.base import ToolManifest, ToolRuntimeContext
 from knuth_toold.registry import ToolRegistry
 
 
 class PolicyDecision(KnuthModel):
-    kind: ToolProposalStatus
-    approval: ApprovalRequest | None = None
+    decision: ToolCallDecision
     error: ErrorInfo | None = None
+    approval_title: str | None = None
+    approval_reason: str | None = None
 
 
 class PolicyEngine(Protocol):
     async def evaluate_tool_call(
         self,
         run_id: str,
-        intent: "ToolIntent",
-        manifest: Any,
+        manifest: ToolManifest,
         args: dict[str, Any],
     ) -> PolicyDecision:
         ...
@@ -39,31 +39,31 @@ class AllowAllPolicy:
     async def evaluate_tool_call(
         self,
         run_id: str,
-        intent: "ToolIntent",
-        manifest: Any,
+        manifest: ToolManifest,
         args: dict[str, Any],
     ) -> PolicyDecision:
-        return PolicyDecision(kind=ToolProposalStatus.ALLOWED)
+        return PolicyDecision(decision=ToolCallDecision.ALLOWED)
 
 
-class ToolExecutionRecord(KnuthModel):
-    intent: ToolIntent
-    result: ToolResult
+class ToolProposal(KnuthModel):
+    """Outcome of proposing one tool call: policy decision plus manifest facts."""
 
-    def to_tool_result_message(self) -> InferenceMessage:
-        return InferenceMessage(
-            role=InferenceRole.TOOL_RESULT,
-            tool_call_id=self.intent.id,
-            tool_name=self.intent.name,
-            content=self.result.to_observation_text(),
-            metadata={
-                "tool_status": self.result.status.value,
-                "artifacts": self.result.artifacts,
-            },
-        )
+    tool_name: str
+    decision: ToolCallDecision
+    effect: ToolEffect = ToolEffect.READ
+    risk: ToolRisk = ToolRisk.LOW
+    error: ErrorInfo | None = None
+    approval_title: str | None = None
+    approval_reason: str | None = None
 
 
 class ToolBroker:
+    """Runtime-facing gateway for tool workflow.
+
+    ``propose`` is a pure decision (registry + schema + policy); approval state
+    lives in the ledger, never here, so proposing is safely repeatable.
+    """
+
     def __init__(
         self,
         registry: ToolRegistry,
@@ -78,27 +78,30 @@ class ToolBroker:
         await self.registry.refresh()
         return [manifest.to_func_spec() for manifest in self.registry.list_visible_manifests()]
 
-    async def propose(self, run_id: str, intent: ToolIntent) -> ToolProposal:
+    async def propose(
+        self, run_id: str, tool_name: str, args: dict[str, Any]
+    ) -> ToolProposal:
         await self.registry.refresh()
         try:
-            manifest = self.registry.get_manifest(intent.name)
+            manifest = self.registry.get_manifest(tool_name)
         except KeyError:
             return ToolProposal(
-                status=ToolProposalStatus.DENIED,
-                intent=intent,
+                tool_name=tool_name,
+                decision=ToolCallDecision.DENIED,
                 error=ErrorInfo(
                     code="tool_not_found",
-                    message=f"Tool not found: {intent.name}",
+                    message=f"Tool not found: {tool_name}",
                     retryable=False,
                 ),
             )
         try:
-            validate(instance=intent.arguments, schema=manifest.parameters)
+            validate(instance=args, schema=manifest.parameters)
         except ValidationError as exc:
             return ToolProposal(
-                status=ToolProposalStatus.DENIED,
-                intent=intent,
-                normalized_args=intent.arguments,
+                tool_name=tool_name,
+                decision=ToolCallDecision.DENIED,
+                effect=manifest.effect,
+                risk=manifest.risk,
                 error=ErrorInfo(
                     code="invalid_tool_arguments",
                     message=exc.message,
@@ -107,54 +110,43 @@ class ToolBroker:
             )
         decision = await self.policy_engine.evaluate_tool_call(
             run_id=run_id,
-            intent=intent,
             manifest=manifest,
-            args=intent.arguments,
+            args=args,
         )
-        if decision.kind == ToolProposalStatus.DENIED:
-            return ToolProposal(
-                status=ToolProposalStatus.DENIED,
-                intent=intent,
-                normalized_args=intent.arguments,
-                error=decision.error,
-            )
-        if decision.kind == ToolProposalStatus.REQUIRES_APPROVAL:
-            return ToolProposal(
-                status=ToolProposalStatus.REQUIRES_APPROVAL,
-                intent=intent,
-                normalized_args=intent.arguments,
-                approval=decision.approval,
-            )
         return ToolProposal(
-            status=ToolProposalStatus.ALLOWED,
-            intent=intent,
-            normalized_args=intent.arguments,
+            tool_name=tool_name,
+            decision=decision.decision,
+            effect=manifest.effect,
+            risk=manifest.risk,
+            error=decision.error,
+            approval_title=decision.approval_title,
+            approval_reason=decision.approval_reason,
         )
 
-    async def execute(self, run_id: str, proposal: ToolProposal) -> ToolExecutionRecord:
-        if proposal.status != ToolProposalStatus.ALLOWED:
-            return ToolExecutionRecord(
-                intent=proposal.intent,
-                result=ToolResult(
-                    status=ToolResultStatus.ERROR,
-                    error=proposal.error
-                    or ErrorInfo(
-                        code="tool_not_allowed",
-                        message=f"Tool proposal is {proposal.status.value}",
-                    ),
-                ),
-            )
-        provider = self.registry.get_provider_for_tool(proposal.intent.name)
+    async def execute(self, invocation: ToolInvocation) -> ToolResult:
         try:
-            result = await provider.call_tool(
-                proposal.intent.name,
-                proposal.normalized_args,
-                ToolContext(
-                    run_id=run_id,
-                    tool_call_id=proposal.intent.id,
-                    workspace_uri=self.workspace_uri,
-                ),
+            manifest = self.registry.get_manifest(invocation.tool_name)
+        except KeyError:
+            return ToolResult.from_error(
+                "tool_not_found", f"Tool not found: {invocation.tool_name}"
+            )
+        provider = self.registry.get_provider_for_tool(invocation.tool_name)
+        ctx = ToolRuntimeContext(
+            run_id=invocation.run_id,
+            tool_call_id=invocation.tool_call_id,
+            workspace_uri=self.workspace_uri,
+            idempotency_key=invocation.idempotency_key,
+        )
+        try:
+            if manifest.timeout_s is not None:
+                with anyio.fail_after(manifest.timeout_s):
+                    return await provider.call_tool(invocation, ctx)
+            return await provider.call_tool(invocation, ctx)
+        except TimeoutError:
+            return ToolResult.from_error(
+                "tool_timeout",
+                f"Tool {invocation.tool_name} timed out after {manifest.timeout_s}s",
+                retryable=True,
             )
         except Exception as exc:
-            result = ToolResult.from_error(exc.__class__.__name__, str(exc))
-        return ToolExecutionRecord(intent=proposal.intent, result=result)
+            return ToolResult.from_error(exc.__class__.__name__, str(exc))

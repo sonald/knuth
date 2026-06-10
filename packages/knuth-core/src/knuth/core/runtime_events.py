@@ -5,9 +5,30 @@ from typing import Any, Literal
 from pydantic import Field
 
 from knuth.core.inference_events import UsageInfo
-from knuth.core.messages import InferenceMessage, ToolCall
-from knuth.core.tools import ToolIntent, ToolProposal, ToolResult
+from knuth.core.invocations import ToolCallDecision, ToolEffect, ToolRisk
+from knuth.core.messages import ToolCall
 from knuth.core.types import ErrorInfo, EventDurability, KnuthModel, RunStatus
+
+
+class ContextSnapshot(KnuthModel):
+    """Hash-level proof of what one model call saw, frozen at build time."""
+
+    messages_hash: str
+    tools_hash: str
+    preamble_hash: str
+    model_config_hash: str
+    message_count: int
+    tool_count: int
+
+
+class PlannedToolCall(KnuthModel):
+    """One frozen tool call inside a ``tool.batch_planned`` event."""
+
+    tool_call_id: str
+    index: int = 0
+    name: str
+    args: dict[str, Any] = Field(default_factory=dict)
+    args_hash: str
 
 
 class RuntimeEventDraftBase(KnuthModel):
@@ -26,62 +47,26 @@ class UserMessageDraft(RuntimeEventDraftBase):
     content: str
 
 
-class ModelStartedDraft(RuntimeEventDraftBase):
-    type: Literal["model.started"] = "model.started"
-    turn: int
-    model: str
-    message_count: int
-    tool_count: int
+class RunResumedDraft(RuntimeEventDraftBase):
+    type: Literal["run.resumed"] = "run.resumed"
+    cause: Literal["approval_resolved", "user_message", "user_resume"]
 
 
-class ModelCompletedDraft(RuntimeEventDraftBase):
-    type: Literal["model.completed"] = "model.completed"
-    turn: int
-    message: InferenceMessage
-    finish_reason: str | None = None
-    usage: UsageInfo | None = None
-
-
-class ModelAbortedDraft(RuntimeEventDraftBase):
-    type: Literal["model.aborted"] = "model.aborted"
+class RunPausedDraft(RuntimeEventDraftBase):
+    type: Literal["run.paused"] = "run.paused"
     reason: str
+    source: Literal["control", "hook"] = "control"
 
 
-class ModelFailedDraft(RuntimeEventDraftBase):
-    type: Literal["model.failed"] = "model.failed"
+class RunCancelledDraft(RuntimeEventDraftBase):
+    type: Literal["run.cancelled"] = "run.cancelled"
+    reason: str
+    source: Literal["control", "hook"] = "control"
+
+
+class RunFailedDraft(RuntimeEventDraftBase):
+    type: Literal["run.failed"] = "run.failed"
     error: ErrorInfo
-
-
-class ToolIntentDraft(RuntimeEventDraftBase):
-    type: Literal["tool.intent"] = "tool.intent"
-    intent: ToolIntent
-
-
-class ToolProposedDraft(RuntimeEventDraftBase):
-    type: Literal["tool.proposed"] = "tool.proposed"
-    proposal: ToolProposal
-
-
-class ToolStartedDraft(RuntimeEventDraftBase):
-    type: Literal["tool.started"] = "tool.started"
-    intent: ToolIntent
-
-
-class ToolCompletedDraft(RuntimeEventDraftBase):
-    type: Literal["tool.completed"] = "tool.completed"
-    intent: ToolIntent
-    message: InferenceMessage
-    outcome: Literal["succeeded", "failed", "denied"]
-    result: ToolResult | None = None
-
-
-class ApprovalRequestedDraft(RuntimeEventDraftBase):
-    type: Literal["approval.requested"] = "approval.requested"
-    approval_id: str
-    tool_call_id: str | None = None
-    title: str
-    reason: str
-    risk: str | None = None
 
 
 class RunSucceededDraft(RuntimeEventDraftBase):
@@ -90,33 +75,143 @@ class RunSucceededDraft(RuntimeEventDraftBase):
     turns: int
 
 
-class RunFailedDraft(RuntimeEventDraftBase):
-    type: Literal["run.failed"] = "run.failed"
+class StepStartedDraft(RuntimeEventDraftBase):
+    type: Literal["step.started"] = "step.started"
+    step_id: str
+    index: int
+    snapshot: ContextSnapshot
+
+
+class ModelCompletedDraft(RuntimeEventDraftBase):
+    type: Literal["model.completed"] = "model.completed"
+    step_id: str
+    content: str | None = None
+    tool_calls: list[ToolCall] = Field(default_factory=list)
+    finish_reason: str | None = None
+    usage: UsageInfo | None = None
+
+
+class ModelFailedDraft(RuntimeEventDraftBase):
+    type: Literal["model.failed"] = "model.failed"
+    step_id: str | None = None
+    error: ErrorInfo
+
+
+class ModelAbortedDraft(RuntimeEventDraftBase):
+    type: Literal["model.aborted"] = "model.aborted"
+    step_id: str | None = None
     reason: str
-    max_turns: int | None = None
+
+
+class ToolBatchPlannedDraft(RuntimeEventDraftBase):
+    type: Literal["tool.batch_planned"] = "tool.batch_planned"
+    batch_id: str
+    step_id: str
+    calls: list[PlannedToolCall]
+
+
+class ToolProposedDraft(RuntimeEventDraftBase):
+    type: Literal["tool.proposed"] = "tool.proposed"
+    tool_call_id: str
+    decision: ToolCallDecision
+    effect: ToolEffect = ToolEffect.READ
+    risk: ToolRisk = ToolRisk.LOW
+    error: ErrorInfo | None = None
+
+
+class ApprovalRequestedDraft(RuntimeEventDraftBase):
+    type: Literal["approval.requested"] = "approval.requested"
+    approval_id: str
+    tool_call_id: str
+    args_hash: str
+    title: str
+    reason: str
+    risk: str
+    preview: dict[str, Any] = Field(default_factory=dict)
+
+
+class ApprovalResolvedDraft(RuntimeEventDraftBase):
+    type: Literal["approval.resolved"] = "approval.resolved"
+    approval_id: str
+    resolution: Literal["approved", "denied"]
+    resolved_by: str | None = None
+
+
+class ToolInvocationStartedDraft(RuntimeEventDraftBase):
+    type: Literal["tool.invocation_started"] = "tool.invocation_started"
+    tool_call_id: str
+    idempotency_key: str
+    attempt: int = 1
+
+
+class ToolInvocationCompletedDraft(RuntimeEventDraftBase):
+    type: Literal["tool.invocation_completed"] = "tool.invocation_completed"
+    tool_call_id: str
+    tool_name: str
+    outcome: Literal["succeeded", "failed", "denied"]
+    observation: str | None = None
+    observation_ref: str | None = None
+    observation_preview: str | None = None
+    meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolInvocationMarkedUnknownDraft(RuntimeEventDraftBase):
+    type: Literal["tool.invocation_marked_unknown"] = "tool.invocation_marked_unknown"
+    tool_call_id: str
+    reason: str
+
+
+class ToolBatchClosedDraft(RuntimeEventDraftBase):
+    type: Literal["tool.batch_closed"] = "tool.batch_closed"
+    batch_id: str
 
 
 class VerificationFailedDraft(RuntimeEventDraftBase):
     type: Literal["verification.failed"] = "verification.failed"
-    ok: Literal[False] = False
     reason: str
+    feedback: str
+
+
+class ContextCompactedDraft(RuntimeEventDraftBase):
+    """Reserved: history compaction as an appended fact. Not implemented in v0."""
+
+    type: Literal["context.compacted"] = "context.compacted"
+    replaces_through_seq: int
+    summary: str | None = None
+    summary_ref: str | None = None
+
+
+class RunCheckpointDraft(RuntimeEventDraftBase):
+    """Reserved: fold anchor. Not implemented in v0."""
+
+    type: Literal["run.checkpoint"] = "run.checkpoint"
+    through_seq: int
+    state_ref: str | None = None
 
 
 DurableRuntimeEventDraft = (
     RunCreatedDraft
     | UserMessageDraft
-    | ModelStartedDraft
-    | ModelCompletedDraft
-    | ModelAbortedDraft
-    | ModelFailedDraft
-    | ToolIntentDraft
-    | ToolProposedDraft
-    | ToolStartedDraft
-    | ToolCompletedDraft
-    | ApprovalRequestedDraft
-    | RunSucceededDraft
+    | RunResumedDraft
+    | RunPausedDraft
+    | RunCancelledDraft
     | RunFailedDraft
+    | RunSucceededDraft
+    | StepStartedDraft
+    | ModelCompletedDraft
+    | ModelFailedDraft
+    | ModelAbortedDraft
+    | ToolBatchPlannedDraft
+    | ToolProposedDraft
+    | ApprovalRequestedDraft
+    | ApprovalResolvedDraft
+    | ToolInvocationStartedDraft
+    | ToolInvocationCompletedDraft
+    | ToolInvocationMarkedUnknownDraft
+    | ToolBatchClosedDraft
     | VerificationFailedDraft
+    | ContextCompactedDraft
+    | RunCheckpointDraft
 )
 
 
@@ -207,18 +302,30 @@ def _stored(name: str, draft: type[RuntimeEventDraftBase]):
 
 RunCreated = _stored("RunCreated", RunCreatedDraft)
 UserMessage = _stored("UserMessage", UserMessageDraft)
-ModelStarted = _stored("ModelStarted", ModelStartedDraft)
-ModelCompleted = _stored("ModelCompleted", ModelCompletedDraft)
-ModelAborted = _stored("ModelAborted", ModelAbortedDraft)
-ModelFailed = _stored("ModelFailed", ModelFailedDraft)
-ToolIntentEvent = _stored("ToolIntentEvent", ToolIntentDraft)
-ToolProposed = _stored("ToolProposed", ToolProposedDraft)
-ToolStarted = _stored("ToolStarted", ToolStartedDraft)
-ToolCompleted = _stored("ToolCompleted", ToolCompletedDraft)
-ApprovalRequested = _stored("ApprovalRequested", ApprovalRequestedDraft)
-RunSucceeded = _stored("RunSucceeded", RunSucceededDraft)
+RunResumed = _stored("RunResumed", RunResumedDraft)
+RunPaused = _stored("RunPaused", RunPausedDraft)
+RunCancelled = _stored("RunCancelled", RunCancelledDraft)
 RunFailed = _stored("RunFailed", RunFailedDraft)
+RunSucceeded = _stored("RunSucceeded", RunSucceededDraft)
+StepStarted = _stored("StepStarted", StepStartedDraft)
+ModelCompleted = _stored("ModelCompleted", ModelCompletedDraft)
+ModelFailed = _stored("ModelFailed", ModelFailedDraft)
+ModelAborted = _stored("ModelAborted", ModelAbortedDraft)
+ToolBatchPlanned = _stored("ToolBatchPlanned", ToolBatchPlannedDraft)
+ToolProposed = _stored("ToolProposed", ToolProposedDraft)
+ApprovalRequested = _stored("ApprovalRequested", ApprovalRequestedDraft)
+ApprovalResolved = _stored("ApprovalResolved", ApprovalResolvedDraft)
+ToolInvocationStarted = _stored("ToolInvocationStarted", ToolInvocationStartedDraft)
+ToolInvocationCompleted = _stored(
+    "ToolInvocationCompleted", ToolInvocationCompletedDraft
+)
+ToolInvocationMarkedUnknown = _stored(
+    "ToolInvocationMarkedUnknown", ToolInvocationMarkedUnknownDraft
+)
+ToolBatchClosed = _stored("ToolBatchClosed", ToolBatchClosedDraft)
 VerificationFailed = _stored("VerificationFailed", VerificationFailedDraft)
+ContextCompacted = _stored("ContextCompacted", ContextCompactedDraft)
+RunCheckpoint = _stored("RunCheckpoint", RunCheckpointDraft)
 
 
 def _transient(name: str, draft: type[TransientRuntimeEventDraftBase]):
@@ -244,18 +351,26 @@ RunInvocationEnded = _transient("RunInvocationEnded", RunInvocationEndedDraft)
 StoredRuntimeEvent = (
     RunCreated
     | UserMessage
-    | ModelStarted
-    | ModelCompleted
-    | ModelAborted
-    | ModelFailed
-    | ToolIntentEvent
-    | ToolProposed
-    | ToolStarted
-    | ToolCompleted
-    | ApprovalRequested
-    | RunSucceeded
+    | RunResumed
+    | RunPaused
+    | RunCancelled
     | RunFailed
+    | RunSucceeded
+    | StepStarted
+    | ModelCompleted
+    | ModelFailed
+    | ModelAborted
+    | ToolBatchPlanned
+    | ToolProposed
+    | ApprovalRequested
+    | ApprovalResolved
+    | ToolInvocationStarted
+    | ToolInvocationCompleted
+    | ToolInvocationMarkedUnknown
+    | ToolBatchClosed
     | VerificationFailed
+    | ContextCompacted
+    | RunCheckpoint
 )
 
 TransientRuntimeEvent = (

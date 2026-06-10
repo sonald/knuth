@@ -13,6 +13,7 @@ from knuth.core.events import (
     emit_transient_runtime_event,
 )
 from knuth.core.types import EventDurability
+
 from knuth_runtime.observation import LiveRuntimeObservation
 from knuth_runtime.services import RuntimeServices
 
@@ -28,7 +29,7 @@ class RuntimeInvocation:
 
     async def emit(self, event: RuntimeEventDraft) -> RuntimeEvent:
         if event.durability == EventDurability.DURABLE:
-            runtime_event = await self.services.event_store.append(
+            runtime_event = await self.services.ledger.apply(
                 self.run_id,
                 cast(DurableRuntimeEventDraft, event),
             )

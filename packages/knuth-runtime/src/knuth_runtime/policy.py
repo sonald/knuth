@@ -1,67 +1,35 @@
 from __future__ import annotations
 
-from knuth.core.types import ErrorInfo
-from knuth_toold.base import ToolEffect, ToolManifest, ToolRisk
-from knuth_toold.broker import ApprovalRequest, PolicyDecision, ToolIntent, ToolProposalStatus
+from typing import Any
+
+from knuth.core.invocations import ToolCallDecision, ToolEffect, ToolRisk
+from knuth_toold.base import ToolManifest
+from knuth_toold.broker import PolicyDecision
 
 
 class PolicyEngine:
-    def __init__(self, approval_lookup: "ApprovalLookup | None" = None) -> None:
-        self.approval_lookup = approval_lookup
+    """Pure policy: decides from manifest facts and arguments only.
+
+    Approval state lives in the ledger, never here, so evaluation is safely
+    repeatable — proposing twice yields the same decision.
+    """
 
     async def evaluate_tool_call(
         self,
         run_id: str,
-        intent: ToolIntent,
         manifest: ToolManifest,
-        args: dict,
+        args: dict[str, Any],
     ) -> PolicyDecision:
-        approval_id = approval_id_for(run_id, intent.id)
-        if self.approval_lookup:
-            if await self.approval_lookup.is_approved(approval_id):
-                return PolicyDecision(kind=ToolProposalStatus.ALLOWED)
-            if await self.approval_lookup.is_denied(approval_id):
-                return PolicyDecision(
-                    kind=ToolProposalStatus.DENIED,
-                    error=ErrorInfo(
-                        code="approval_denied",
-                        message="The user denied approval for this tool call.",
-                        retryable=False,
-                    ),
-                )
-        if manifest.effect in {ToolEffect.EXTERNAL_WRITE, ToolEffect.DANGEROUS}:
-            return self._approval(run_id, intent, manifest, args)
-        if manifest.effect == ToolEffect.LOCAL_WRITE or manifest.risk == ToolRisk.HIGH:
-            return self._approval(run_id, intent, manifest, args)
-        return PolicyDecision(kind=ToolProposalStatus.ALLOWED)
-
-    def _approval(
-        self,
-        run_id: str,
-        intent: ToolIntent,
-        manifest: ToolManifest,
-        args: dict,
-    ) -> PolicyDecision:
-        return PolicyDecision(
-            kind=ToolProposalStatus.REQUIRES_APPROVAL,
-            approval=ApprovalRequest(
-                id=approval_id_for(run_id, intent.id),
-                run_id=run_id,
-                title=f"Approve tool call: {intent.name}",
-                reason=f"Tool has effect={manifest.effect.value}, risk={manifest.risk.value}",
-                risk=manifest.risk.value,
-                payload={"tool": intent.name, "tool_call_id": intent.id, "args_preview": args},
-            ),
-        )
-
-
-class ApprovalLookup:
-    async def is_approved(self, approval_id: str) -> bool:
-        ...
-
-    async def is_denied(self, approval_id: str) -> bool:
-        ...
-
-
-def approval_id_for(run_id: str, tool_call_id: str) -> str:
-    return f"appr_{run_id}_{tool_call_id}"
+        if (
+            manifest.effect
+            in {ToolEffect.EXTERNAL_WRITE, ToolEffect.DANGEROUS, ToolEffect.LOCAL_WRITE}
+            or manifest.risk == ToolRisk.HIGH
+        ):
+            return PolicyDecision(
+                decision=ToolCallDecision.REQUIRES_APPROVAL,
+                approval_title=f"Approve tool call: {manifest.name}",
+                approval_reason=(
+                    f"Tool has effect={manifest.effect.value}, risk={manifest.risk.value}"
+                ),
+            )
+        return PolicyDecision(decision=ToolCallDecision.ALLOWED)
