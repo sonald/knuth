@@ -17,6 +17,8 @@ from knuth.core.runtime_events import (
     ModelToolCallStarted,
     RunCreated,
     RunFailed,
+    RunInvocationEnded,
+    RunInvocationStarted,
     RunSucceeded,
     StoredRuntimeEvent,
     StoredRuntimeEventBase,
@@ -55,6 +57,8 @@ _TRANSIENT_EVENT_BY_TYPE: dict[str, type[TransientRuntimeEventBase]] = {
     "model.tool_call.started": ModelToolCallStarted,
     "model.tool_call.delta": ModelToolCallDelta,
     "model.tool_call.completed": ModelToolCallCompleted,
+    "run.invocation.started": RunInvocationStarted,
+    "run.invocation.ended": RunInvocationEnded,
 }
 
 _STORED_RUNTIME_EVENT_ADAPTER = TypeAdapter(StoredRuntimeEvent)

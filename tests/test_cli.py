@@ -34,19 +34,46 @@ def _write_yaml(path: Path, values: dict[str, object]) -> None:
 
 
 class _StreamingFakeRuntime:
-    """Fake runtime that emits a content stream for ``run_streaming``."""
+    """Fake runtime that emits a content stream for session listeners."""
 
-    async def run_streaming(self, prompt, on_event, *, run_id=None) -> RunResult:
-        answer = f"real-ish: {prompt}"
-        await on_event(
-            emit_transient_runtime_event(
-                run_id or "run-1",
-                ModelContentDeltaDraft(delta=answer),
-                event_id="evt-1",
-                created_at="2026-06-05T00:00:00Z",
-            )
+    def start(self, prompt, *, listeners=()):
+        return _FakeRunSession(prompt, "run-1", listeners)
+
+    def continue_run(self, run_id, prompt, *, listeners=()):
+        return _FakeRunSession(prompt, run_id, listeners)
+
+    def resume(self, run_id, *, listeners=()):
+        return _FakeRunSession("resumed", run_id, listeners)
+
+
+class _FakeRunSession:
+    def __init__(self, prompt: str, run_id: str, listeners) -> None:
+        self._prompt = prompt
+        self._run_id = run_id
+        self._listeners = tuple(listeners)
+
+    async def __aenter__(self):
+        answer = f"real-ish: {self._prompt}"
+        event = emit_transient_runtime_event(
+            self._run_id,
+            ModelContentDeltaDraft(delta=answer),
+            event_id="evt-1",
+            created_at="2026-06-05T00:00:00Z",
         )
-        return RunResult(answer=answer, run_id=run_id or "run-1", status=RunStatus.SUCCEEDED)
+        for listener in self._listeners:
+            if listener.interest.matches(event):
+                await listener.handle_event(event)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+    async def result(self) -> RunResult:
+        return RunResult(
+            answer=f"real-ish: {self._prompt}",
+            run_id=self._run_id,
+            status=RunStatus.SUCCEEDED,
+        )
 
 
 class CapturingInferenceClient:
@@ -280,12 +307,8 @@ class CliTests(unittest.TestCase):
             async def deny(self, approval_id: str):
                 return FakeApproval(approval_id, RunStatus.CANCELLED)
 
-            async def resume(self, run_id: str) -> RunResult:
-                return RunResult(
-                    answer="resumed",
-                    run_id=run_id,
-                    status=RunStatus.SUCCEEDED,
-                )
+            def resume(self, run_id: str):
+                return _FakeRunSession("resumed", run_id, ())
 
         async def runtime_factory() -> FakeRuntime:
             return FakeRuntime()

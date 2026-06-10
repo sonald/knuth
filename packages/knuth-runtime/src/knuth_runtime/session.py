@@ -1,0 +1,187 @@
+from __future__ import annotations
+
+from collections.abc import Iterable
+from typing import Self
+
+import anyio
+
+from knuth.core.events import (
+    RunCreatedDraft,
+    RunInvocationEndedDraft,
+    RunInvocationStartedDraft,
+    UserMessageDraft,
+)
+from knuth.core.runs import AgentRun
+from knuth.core.types import ErrorInfo, RunStatus
+from knuth_llmd import InferenceConfig, InferenceRuntimeOptions
+from knuth_runtime.invocation import RunInvocationMode, RuntimeInvocation
+from knuth_runtime.loop import run_agent_loop
+from knuth_runtime.observation import (
+    ListenerHandle,
+    LiveRuntimeObservation,
+    RuntimeEventListener,
+    RuntimeObservationError,
+)
+from knuth_runtime.result import RunResult, answer_from_events
+from knuth_runtime.services import RuntimeServices
+
+
+class RunSession:
+    def __init__(
+        self,
+        *,
+        mode: RunInvocationMode,
+        services: RuntimeServices,
+        inference_config: InferenceConfig,
+        prompt: str | None = None,
+        run_id: str | None = None,
+        listeners: Iterable[RuntimeEventListener] = (),
+        runtime_options: InferenceRuntimeOptions | None = None,
+    ) -> None:
+        self._mode = mode
+        self._services = services
+        self._inference_config = inference_config
+        self._prompt = prompt
+        self._run_id = run_id
+        self._initial_listeners = tuple(listeners)
+        self._runtime_options = runtime_options
+        self._task_group_cm = None
+        self._task_group = None
+        self._observation: LiveRuntimeObservation | None = None
+        self._done = anyio.Event()
+        self._entered = False
+        self._final_result: RunResult | None = None
+        self._error: BaseException | None = None
+
+    @property
+    def run_id(self) -> str:
+        if self._run_id is None:
+            raise RuntimeError("run_id is available after entering the session")
+        return self._run_id
+
+    @property
+    def final_result(self) -> RunResult | None:
+        return self._final_result
+
+    async def __aenter__(self) -> Self:
+        if self._entered:
+            raise RuntimeError("RunSession cannot be entered more than once")
+        self._entered = True
+        self._task_group_cm = anyio.create_task_group()
+        self._task_group = await self._task_group_cm.__aenter__()
+        self._observation = LiveRuntimeObservation(self._task_group)
+        for listener in self._initial_listeners:
+            await self._observation.add_listener(listener)
+        created_run = await self._prepare_run_id()
+        invocation = RuntimeInvocation(
+            run_id=self.run_id,
+            mode=self._mode,
+            services=self._services,
+            observation=self._observation,
+        )
+        await invocation.emit(RunInvocationStartedDraft(mode=self._mode))
+        await self._prepare_run(invocation, created_run)
+        self._task_group.start_soon(self._drive, invocation)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._task_group is None or self._task_group_cm is None:
+            return
+        if not self._done.is_set():
+            self._task_group.cancel_scope.cancel()
+        elif self._observation is not None:
+            await self._observation.aclose()
+        await self._task_group_cm.__aexit__(exc_type, exc, tb)
+
+    async def add_listener(self, listener: RuntimeEventListener) -> ListenerHandle:
+        if not self._entered or self._observation is None:
+            raise RuntimeError("RunSession.add_listener() requires an active session")
+        return await self._observation.add_listener(listener)
+
+    async def result(self) -> RunResult:
+        if not self._entered:
+            raise RuntimeError("RunSession.result() requires an active session")
+        await self._done.wait()
+        if self._error is not None:
+            raise self._error
+        result = self._final_result
+        failures = (
+            self._observation.required_failures
+            if self._observation is not None
+            else ()
+        )
+        if failures:
+            raise RuntimeObservationError(
+                "required runtime event listener failed",
+                run_id=self.run_id,
+                result=result,
+                failures=failures,
+            )
+        if result is None:
+            raise RuntimeError("RunSession completed without a result")
+        return result
+
+    async def _prepare_run_id(self) -> AgentRun | None:
+        if self._mode == "start":
+            if self._prompt is None:
+                raise ValueError("prompt is required to start a new run")
+            run = await self._services.run_store.create(self._prompt)
+            self._run_id = run.id
+            return run
+        if self._run_id is None:
+            raise ValueError("run_id is required")
+        return None
+
+    async def _prepare_run(
+        self, invocation: RuntimeInvocation, created_run: AgentRun | None
+    ) -> None:
+        if self._mode == "start":
+            if self._prompt is None or created_run is None:
+                raise RuntimeError("start session missing created run")
+            await invocation.emit(
+                RunCreatedDraft(
+                    query=created_run.query,
+                    metadata=created_run.metadata,
+                )
+            )
+            await invocation.emit(UserMessageDraft(content=self._prompt))
+            return
+        if self._mode == "continue":
+            if self._prompt is None:
+                raise ValueError("prompt is required to continue a run")
+            await invocation.emit(UserMessageDraft(content=self._prompt))
+            await self._services.run_store.set_status(invocation.run_id, RunStatus.RUNNING)
+            return
+        run = await self._services.run_store.get(invocation.run_id)
+        if run.status in {RunStatus.WAITING_APPROVAL, RunStatus.PAUSED}:
+            await self._services.run_store.set_status(invocation.run_id, RunStatus.RUNNING)
+
+    async def _drive(self, invocation: RuntimeInvocation) -> None:
+        status: RunStatus | None = None
+        error: ErrorInfo | None = None
+        try:
+            status = await run_agent_loop(
+                invocation,
+                self._inference_config,
+                runtime_options=self._runtime_options,
+            )
+            events = await self._services.event_store.list_events(invocation.run_id)
+            self._final_result = RunResult(
+                answer=answer_from_events(events),
+                run_id=invocation.run_id,
+                status=status,
+            )
+        except Exception as exc:
+            self._error = exc
+            error = ErrorInfo(code=exc.__class__.__name__, message=str(exc))
+        finally:
+            await invocation.emit(
+                RunInvocationEndedDraft(
+                    mode=self._mode,
+                    status=status,
+                    error=error,
+                )
+            )
+            if self._observation is not None:
+                await self._observation.aclose()
+            self._done.set()

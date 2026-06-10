@@ -24,9 +24,13 @@ _Avoid_: inference event, provider chunk, generic event
 Best-effort delivery of `RuntimeEvent` values to active observers while a run is executing. It is for current UI, logging, and debugging views, not for durable history, recovery, or work dispatch.
 _Avoid_: message queue, durable event stream, tool execution queue
 
-**RuntimeEventHandler**:
-An observer that reacts to delivered `RuntimeEvent` values for rendering, logging, debugging, or fan-out. It does not return control decisions and must not be used as the path for pausing, terminating, approving, denying, or otherwise changing run state.
-_Avoid_: hook, control command, work dispatcher, state transition handler
+**RuntimeEventListener**:
+An object registered with a live run invocation to observe selected `RuntimeEvent` values for rendering, logging, debugging, metrics, or fan-out. It declares its event interest and reacts to delivered events, but it does not return control decisions and must not be used as the path for pausing, terminating, approving, denying, or otherwise changing run state.
+_Avoid_: hook, control command, work dispatcher, state transition handler, callback-only event handler
+
+**RuntimeEventInterest**:
+The observation-layer declaration of which `RuntimeEvent` values a `RuntimeEventListener` wants to receive. It may match exact dotted event types, dotted type prefixes, and durable or transient event durability, but it does not add namespace or name fields to the event model.
+_Avoid_: event schema, namespace, subscription command, hook point
 
 **BlockingHook**:
 An awaited runtime extension point that can decide whether the agent loop continues, pauses, or terminates at a named point. It is a control seam, not a data mutation seam; context, tools, and policy changes belong to their explicit providers or brokers.
@@ -39,6 +43,14 @@ _Avoid_: event type, debug trace point, middleware stage, arbitrary callback
 **RuntimeControl**:
 The awaited runtime control surface for state-changing run operations such as starting, continuing, resuming, approving, denying, pausing, or cancelling a run. It owns run lifecycle transitions around the agent loop through explicit operations rather than one parameter-overloaded entrypoint; observers and CLI handlers call it rather than reconstructing lifecycle events themselves.
 _Avoid_: live observation, event handler, CLI flow, message queue, overloaded run API
+
+**RunInvocation**:
+A single live attempt to advance a durable `Run`, such as starting it, continuing it with a new user message, or resuming it after approval or pause. It is represented to callers by a temporary `RunSession` and may emit transient invocation lifecycle events; it is not the durable conversation history itself.
+_Avoid_: run, durable session, event store stream, daemon connection
+
+**RunSession**:
+The temporary async lifecycle handle for one `RunInvocation`. It owns the invocation task, live observation hub, listener queues, and result awaiting for that invocation; durable status and history remain available through `RuntimeControl` queries and `EventStore`.
+_Avoid_: durable run model, event listener, CLI session, stored event log
 
 **Run**:
 The durable conversation history and current orchestration state for an agent interaction. A `SUCCEEDED` run means the latest agent-loop invocation completed successfully; it may be continued with a new user message, unlike `FAILED` or `CANCELLED`.

@@ -105,7 +105,14 @@ usage: UsageInfo | None
 - `model.tool_call.delta`
 - `model.tool_call.completed`
 
+第一批 transient run invocation observation：
+
+- `run.invocation.started`
+- `run.invocation.ended`
+
 这些 transient projection 可以发给 live observer，但默认不进 `EventStore`。
+
+`run.invocation.*` 描述一次 live invocation 的观察生命周期，不是 durable run history，不作为恢复依据。
 
 durable tool workflow 从 `tool.intent` 开始。`model.tool_call.completed` 不作为恢复依据；恢复依据来自 durable `model.completed.message` 以及后续 `tool.intent` / `tool.proposed` / `tool.started` / `tool.completed`。
 
@@ -124,13 +131,13 @@ created_at
 
 `seq` 只表示 durable EventStore timeline 中的顺序。transient runtime events 不拥有 store `seq`，也不假装属于 durable timeline。
 
-`durability` 由事件 class 提供默认值。durable draft 进入 `EventStore.append()`；transient runtime events 直接发给 live sink / future EventBus。
+`durability` 由事件 class 提供默认值。durable draft 进入 `EventStore.append()`；transient runtime events 直接发给当前 `RunSession` 的 live observation。
 
 类型层面区分 `DurableRuntimeEventDraft` 和 `TransientRuntimeEventDraft`。`EventStore.append()` 只接受 `DurableRuntimeEventDraft`，防止 transient model stream projection 被误写入 durable history。
 
-## Runtime Live Sink
+## Runtime Live Observation
 
-runtime 对外的 live sink 只发送 `RuntimeEvent`。
+runtime 对外的 live observation 只发送 `RuntimeEvent`。
 
 LLM 到 runtime 的内部流是：
 
@@ -141,11 +148,11 @@ LLM -> InferenceEvent -> runtime
 runtime 对外观察流是：
 
 ```text
-runtime -> transient RuntimeEvent -> on_event / UI
-runtime -> durable RuntimeEvent -> EventStore + on_event
+runtime -> transient RuntimeEvent -> RunSession LiveRuntimeObservation -> RuntimeEventListener
+runtime -> durable RuntimeEvent -> EventStore + RunSession LiveRuntimeObservation -> RuntimeEventListener
 ```
 
-因此 `run_agent_loop()` 的 `on_event` 不再混发 `InferenceEvent | RuntimeEvent`，而是只发强类型 `RuntimeEvent`。CLI/WebSocket 不应该直接依赖 LLM-level event shape。
+因此 live observation 不混发 `InferenceEvent | RuntimeEvent`，而是只发强类型 `RuntimeEvent`。CLI/WebSocket 不应该直接依赖 LLM-level event shape。
 
 ## 字段约定
 
@@ -175,6 +182,8 @@ usage: UsageInfo | None
 ```
 
 `tool.intent` 保存 `ToolIntent`，不保存原始 `ToolCall`。`ToolCall` 属于 LLM/runtime 边界；进入工具工作流后，runtime 语言是 `ToolIntent`。
+
+`model.tool_call.started` / `model.tool_call.delta` 使用 `tool_call_id` 表示 provider 给出的 tool call id，不使用字段名 `id`。`RuntimeEvent.id` 始终是 runtime event id。
 
 `tool.completed` 保留为一个事件类型，但去掉 `denied: bool` 这类旁路标记，改用明确 outcome：
 
@@ -225,7 +234,7 @@ events (
 
 Context reconstruction、CLI renderer、runtime tests 和 store tests 都要迁移到强类型事件字段。
 
-这个设计刻意让 `EventStore` 只保存 durable history，不承担 live EventBus 职责。transient runtime events 先通过 `on_event` 发送；未来如果引入 EventBus，再把这条路径抽出来。
+这个设计刻意让 `EventStore` 只保存 durable history，不承担 live observation 职责。transient runtime events 通过当前 `RunSession` 的 invocation-scoped live observation hub 发送给 `RuntimeEventListener`。
 
 ## 考虑过的替代方案
 

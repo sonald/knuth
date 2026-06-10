@@ -8,6 +8,8 @@ import anyio
 from knuth.core.events import (
     InferenceContentDelta,
     InferenceGenerationCompleted,
+    InferenceToolCallDelta,
+    InferenceToolCallStarted,
     RunCreatedDraft,
 )
 from knuth.core.messages import (
@@ -32,6 +34,7 @@ from knuth_runtime.context import (
     assemble_preamble,
     reconstruct_messages_from_events,
 )
+from knuth_runtime.observation import RuntimeEventInterest, RuntimeObservationError
 from knuth_runtime.policy import PolicyEngine
 from knuth_toold import ToolBroker, create_default_registry
 
@@ -218,7 +221,11 @@ class EventDrivenRuntimeTests(unittest.TestCase):
             first = anyio.run(runtime.run_once, "write x")
             pending = anyio.run(runtime.pending_approvals, first.run_id)
             anyio.run(runtime.approve, pending[0].id)
-            resumed = anyio.run(runtime.resume, first.run_id)
+            async def resume():
+                async with runtime.resume(first.run_id) as session:
+                    return await session.result()
+
+            resumed = anyio.run(resume)
 
             self.assertEqual(first.status, RunStatus.WAITING_APPROVAL)
             self.assertEqual(resumed.status, RunStatus.SUCCEEDED)
@@ -250,6 +257,33 @@ class StreamingTextClient:
             seq=2,
             run_id=config.run_id,
             message=message,
+        )
+
+
+class StreamingToolCallProjectionClient:
+    model = "streaming-tool-call-model"
+
+    async def stream(self, messages, tools, config, runtime=None):
+        yield InferenceToolCallStarted(
+            generation_id="gen-tool",
+            seq=1,
+            run_id=config.run_id,
+            index=0,
+            id="call-1",
+        )
+        yield InferenceToolCallDelta(
+            generation_id="gen-tool",
+            seq=2,
+            run_id=config.run_id,
+            index=0,
+            id="call-1",
+            name_delta="shell",
+        )
+        yield InferenceGenerationCompleted(
+            generation_id="gen-tool",
+            seq=3,
+            run_id=config.run_id,
+            message=InferenceMessage(role=InferenceRole.ASSISTANT, content="done"),
         )
 
 
@@ -406,11 +440,21 @@ class AssemblePreambleTests(unittest.TestCase):
 
 
 class _Collector:
+    interest = RuntimeEventInterest.all()
+
     def __init__(self) -> None:
         self.events: list = []
 
-    async def __call__(self, event) -> None:
+    async def handle_event(self, event) -> None:
         self.events.append(event)
+
+
+class _RequiredFailingListener:
+    interest = RuntimeEventInterest.for_types("model.content.delta")
+    required = True
+
+    async def handle_event(self, event) -> None:
+        raise RuntimeError("renderer failed")
 
 
 class StreamingRuntimeTests(unittest.TestCase):
@@ -427,12 +471,13 @@ class StreamingRuntimeTests(unittest.TestCase):
             tool_broker=broker,
         )
 
-    def test_run_streaming_forwards_runtime_event_projection(self) -> None:
+    def test_run_session_forwards_runtime_event_projection(self) -> None:
         async def scenario():
             collector = _Collector()
             with tempfile.TemporaryDirectory() as workspace:
                 runtime = self._runtime(workspace, StreamingTextClient(["Hello there"]))
-                result = await runtime.run_streaming("hi", collector)
+                async with runtime.start("hi", listeners=[collector]) as session:
+                    result = await session.result()
             return result, collector.events
 
         result, collected = anyio.run(scenario)
@@ -440,12 +485,53 @@ class StreamingRuntimeTests(unittest.TestCase):
         types = [event.type for event in collected]
         self.assertIn("model.content.delta", types)
         self.assertIn("model.completed", types)
+        self.assertIn("run.invocation.started", types)
+        self.assertIn("run.created", types)
+        self.assertIn("user.message", types)
+        self.assertIn("run.invocation.ended", types)
         self.assertNotIn("inference.content.delta", types)
         self.assertTrue(all(not event.type.startswith("inference.") for event in collected))
         deltas = [event.delta for event in collected if event.type == "model.content.delta"]
         self.assertEqual(deltas, ["Hello there"])
 
-    def test_run_streaming_forwards_tool_lifecycle(self) -> None:
+    def test_required_listener_failure_raises_observation_error_with_result(self) -> None:
+        async def scenario():
+            with tempfile.TemporaryDirectory() as workspace:
+                runtime = self._runtime(workspace, StreamingTextClient(["Hello there"]))
+                async with runtime.start(
+                    "hi", listeners=[_RequiredFailingListener()]
+                ) as session:
+                    with self.assertRaises(RuntimeObservationError) as raised:
+                        await session.result()
+                    return raised.exception
+
+        error = anyio.run(scenario)
+
+        self.assertEqual(error.result.status, RunStatus.SUCCEEDED)
+        self.assertEqual(error.result.answer, "Hello there")
+        self.assertEqual(len(error.failures), 1)
+
+    def test_run_session_projects_streamed_tool_call_start_without_id_collision(self) -> None:
+        async def scenario():
+            collector = _Collector()
+            with tempfile.TemporaryDirectory() as workspace:
+                runtime = self._runtime(workspace, StreamingToolCallProjectionClient())
+                async with runtime.start("use a tool", listeners=[collector]) as session:
+                    result = await session.result()
+            return result, collector.events
+
+        result, collected = anyio.run(scenario)
+
+        self.assertEqual(result.status, RunStatus.SUCCEEDED)
+        started = [
+            event for event in collected if event.type == "model.tool_call.started"
+        ]
+        deltas = [event for event in collected if event.type == "model.tool_call.delta"]
+        self.assertEqual(started[0].id.startswith("evt_"), True)
+        self.assertEqual(started[0].tool_call_id, "call-1")
+        self.assertEqual(deltas[0].tool_call_id, "call-1")
+
+    def test_run_session_forwards_tool_lifecycle(self) -> None:
         async def scenario():
             collector = _Collector()
             with tempfile.TemporaryDirectory() as workspace:
@@ -469,7 +555,8 @@ class StreamingRuntimeTests(unittest.TestCase):
                     ]
                 )
                 runtime = self._runtime(workspace, client)
-                result = await runtime.run_streaming("read it", collector)
+                async with runtime.start("read it", listeners=[collector]) as session:
+                    result = await session.result()
             return result, collector.events
 
         result, collected = anyio.run(scenario)
@@ -478,17 +565,19 @@ class StreamingRuntimeTests(unittest.TestCase):
         self.assertIn("tool.started", types)
         self.assertIn("tool.completed", types)
 
-    def test_run_streaming_keeps_multi_turn_memory(self) -> None:
+    def test_run_session_keeps_multi_turn_memory(self) -> None:
         async def scenario():
             with tempfile.TemporaryDirectory() as workspace:
                 runtime = self._runtime(
                     workspace, StreamingTextClient(["first answer", "second answer"])
                 )
                 collector = _Collector()
-                first = await runtime.run_streaming("question one", collector)
-                second = await runtime.run_streaming(
-                    "question two", collector, run_id=first.run_id
-                )
+                async with runtime.start("question one", listeners=[collector]) as session:
+                    first = await session.result()
+                async with runtime.continue_run(
+                    first.run_id, "question two", listeners=[collector]
+                ) as session:
+                    second = await session.result()
                 events = await runtime.events(first.run_id)
             return first, second, events
 

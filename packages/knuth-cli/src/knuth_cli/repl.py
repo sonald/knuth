@@ -51,9 +51,13 @@ async def _run_turn(
     runtime: AgentRuntime, console: Console, prompt: str, session_run_id: str | None
 ) -> str | None:
     renderer = EventRenderer(console)
-    result = await runtime.run_streaming(
-        prompt, renderer.handle, run_id=session_run_id
+    session_factory = (
+        runtime.start(prompt, listeners=[renderer])
+        if session_run_id is None
+        else runtime.continue_run(session_run_id, prompt, listeners=[renderer])
     )
+    async with session_factory as session:
+        result = await session.result()
     renderer.finish()
     run_id = result.run_id
     result = await _resolve_approvals(runtime, console, result, run_id)
@@ -79,7 +83,8 @@ async def _resolve_approvals(
             else:
                 await runtime.deny(approval.id)
         renderer = EventRenderer(console)
-        result = await runtime.run_streaming(None, renderer.handle, run_id=run_id)
+        async with runtime.resume(run_id, listeners=[renderer]) as session:
+            result = await session.result()
         renderer.finish()
     return result
 

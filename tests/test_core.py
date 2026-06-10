@@ -1,7 +1,14 @@
 import unittest
 
-from knuth.core.events import RunCreated
+from knuth.core.events import (
+    RunCreated,
+    RunInvocationEndedDraft,
+    RunInvocationStartedDraft,
+    ModelToolCallStartedDraft,
+    emit_transient_runtime_event,
+)
 from knuth.core.messages import InferenceMessage, InferenceRole, ToolCall
+from knuth.core.types import EventDurability
 
 
 class CoreModelTests(unittest.TestCase):
@@ -55,6 +62,38 @@ class CoreModelTests(unittest.TestCase):
 
         self.assertEqual(event.schema_version, "v0")
         self.assertEqual(event.__pydantic_extra__["future_field"], "kept")
+
+    def test_run_invocation_events_are_transient_runtime_events(self) -> None:
+        started = emit_transient_runtime_event(
+            "run-1",
+            RunInvocationStartedDraft(mode="start"),
+            event_id="evt-started",
+            created_at="2026-06-09T00:00:00Z",
+        )
+        ended = emit_transient_runtime_event(
+            "run-1",
+            RunInvocationEndedDraft(mode="start", status="succeeded"),
+            event_id="evt-ended",
+            created_at="2026-06-09T00:00:01Z",
+        )
+
+        self.assertEqual(started.type, "run.invocation.started")
+        self.assertEqual(started.mode, "start")
+        self.assertEqual(started.durability, EventDurability.TRANSIENT)
+        self.assertFalse(hasattr(started, "seq"))
+        self.assertEqual(ended.type, "run.invocation.ended")
+        self.assertEqual(ended.status, "succeeded")
+
+    def test_model_tool_call_started_keeps_event_id_and_tool_call_id_separate(self) -> None:
+        event = emit_transient_runtime_event(
+            "run-1",
+            ModelToolCallStartedDraft(index=0, tool_call_id="call-1"),
+            event_id="evt-tool-started",
+            created_at="2026-06-09T00:00:02Z",
+        )
+
+        self.assertEqual(event.id, "evt-tool-started")
+        self.assertEqual(event.tool_call_id, "call-1")
 
 
 if __name__ == "__main__":

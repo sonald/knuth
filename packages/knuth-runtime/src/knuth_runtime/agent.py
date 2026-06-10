@@ -1,17 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import Iterable
 from pathlib import Path
 
 from knuth.core.events import (
     InferenceGenerationCompleted,
-    RunCreatedDraft,
     RuntimeEvent,
-    UserMessageDraft,
 )
 from knuth.core.messages import InferenceMessage
-from knuth.core.types import RunStatus
 from knuth_llmd import InferenceConfig
 from knuth_runtime.approval import (
     Approval,
@@ -23,18 +19,13 @@ from knuth_runtime.context import (
     ContextBuilder,
     SystemSectionProvider,
 )
-from knuth_runtime.loop import run_agent_loop
+from knuth_runtime.observation import RuntimeEventListener
 from knuth_runtime.policy import PolicyEngine
+from knuth_runtime.result import RunResult
 from knuth_runtime.services import RuntimeServices
+from knuth_runtime.session import RunSession
 from knuth_runtime.stores import EventStore, RunStore, SQLiteStore
 from knuth_toold import ToolBroker, create_default_registry
-
-
-@dataclass(frozen=True)
-class RunResult:
-    answer: str
-    run_id: str | None = None
-    status: RunStatus | None = None
 
 
 class AgentRuntime:
@@ -47,93 +38,57 @@ class AgentRuntime:
         self._inference_config = inference_config
 
     async def run_once(self, prompt: str) -> RunResult:
-        if self._services is None or self._inference_config is None:
-            raise RuntimeError("runtime is not configured")
-        run = await self._services.run_store.create(prompt)
-        await self._services.event_store.append(
-            run.id,
-            RunCreatedDraft(query=run.query, metadata=run.metadata),
-        )
-        await self._services.event_store.append(
-            run.id,
-            UserMessageDraft(content=prompt),
-        )
-        status = await run_agent_loop(run.id, self._services, self._inference_config)
-        events = await self._services.event_store.list_events(run.id)
-        answer = _answer_from_events(events)
-        return RunResult(
-            answer=answer,
-            run_id=run.id,
-            status=status,
-        )
+        async with self.start(prompt) as session:
+            return await session.result()
 
-    async def resume(self, run_id: str) -> RunResult:
-        if self._services is None or self._inference_config is None:
-            raise RuntimeError("runtime is not configured")
-        run = await self._services.run_store.get(run_id)
-        if run.status in {RunStatus.WAITING_APPROVAL, RunStatus.PAUSED}:
-            await self._services.run_store.set_status(run_id, RunStatus.RUNNING)
-        status = await run_agent_loop(run_id, self._services, self._inference_config)
-        events = await self._services.event_store.list_events(run_id)
-        return RunResult(
-            answer=_answer_from_events(events),
-            run_id=run_id,
-            status=status,
-        )
-
-    async def run_streaming(
+    def start(
         self,
-        prompt: str | None,
-        on_event: Callable[[RuntimeEvent], Awaitable[None]],
+        prompt: str,
         *,
-        run_id: str | None = None,
-    ) -> RunResult:
-        """Drive a run while forwarding live events to ``on_event``.
-
-        - ``run_id is None``: start a fresh run from ``prompt``.
-        - ``run_id`` set with ``prompt``: continue the same run with a new user
-          turn (multi-turn memory).
-        - ``run_id`` set with ``prompt is None``: resume a paused/awaiting run
-          (e.g. after an approval is resolved).
-        """
+        listeners: Iterable[RuntimeEventListener] = (),
+    ) -> RunSession:
         if self._services is None or self._inference_config is None:
             raise RuntimeError("runtime is not configured")
-
-        if run_id is None:
-            if prompt is None:
-                raise ValueError("prompt is required to start a new run")
-            run = await self._services.run_store.create(prompt)
-            await self._services.event_store.append(
-                run.id,
-                RunCreatedDraft(query=run.query, metadata=run.metadata),
-            )
-            await self._services.event_store.append(
-                run.id,
-                UserMessageDraft(content=prompt),
-            )
-            run_id = run.id
-        elif prompt is not None:
-            await self._services.event_store.append(
-                run_id,
-                UserMessageDraft(content=prompt),
-            )
-            await self._services.run_store.set_status(run_id, RunStatus.RUNNING)
-        else:
-            run = await self._services.run_store.get(run_id)
-            if run.status in {RunStatus.WAITING_APPROVAL, RunStatus.PAUSED}:
-                await self._services.run_store.set_status(run_id, RunStatus.RUNNING)
-
-        status = await run_agent_loop(
-            run_id,
-            self._services,
-            self._inference_config,
-            on_event=on_event,
+        return RunSession(
+            mode="start",
+            services=self._services,
+            inference_config=self._inference_config,
+            prompt=prompt,
+            listeners=listeners,
         )
-        events = await self._services.event_store.list_events(run_id)
-        return RunResult(
-            answer=_answer_from_events(events),
+
+    def continue_run(
+        self,
+        run_id: str,
+        prompt: str,
+        *,
+        listeners: Iterable[RuntimeEventListener] = (),
+    ) -> RunSession:
+        if self._services is None or self._inference_config is None:
+            raise RuntimeError("runtime is not configured")
+        return RunSession(
+            mode="continue",
+            services=self._services,
+            inference_config=self._inference_config,
             run_id=run_id,
-            status=status,
+            prompt=prompt,
+            listeners=listeners,
+        )
+
+    def resume(
+        self,
+        run_id: str,
+        *,
+        listeners: Iterable[RuntimeEventListener] = (),
+    ) -> RunSession:
+        if self._services is None or self._inference_config is None:
+            raise RuntimeError("runtime is not configured")
+        return RunSession(
+            mode="resume",
+            services=self._services,
+            inference_config=self._inference_config,
+            run_id=run_id,
+            listeners=listeners,
         )
 
     async def approve(self, approval_id: str) -> Approval:
@@ -242,12 +197,3 @@ def build_memory_runtime(
         ),
     )
     return AgentRuntime(services=services, inference_config=inference_config)
-
-
-def _answer_from_events(events: list[RuntimeEvent]) -> str:
-    for event in reversed(events):
-        if event.type == "run.succeeded":
-            return event.answer
-        if event.type == "approval.requested":
-            return f"Waiting for approval: {event.approval_id}"
-    return ""

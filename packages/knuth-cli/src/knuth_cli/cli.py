@@ -63,7 +63,8 @@ async def _handle_deny(runtime: AgentRuntime, args: argparse.Namespace) -> int:
 
 
 async def _handle_resume(runtime: AgentRuntime, args: argparse.Namespace) -> int:
-    turn = await runtime.resume(args.run_id)
+    async with runtime.resume(args.run_id) as session:
+        turn = await session.result()
     sys.stdout.write(f"{turn.answer}\n")
     if turn.run_id is not None:
         sys.stdout.write(f"run_id={turn.run_id}\n")

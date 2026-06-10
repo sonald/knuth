@@ -1,7 +1,7 @@
 """Rich rendering of a streaming agent run.
 
-``EventRenderer`` consumes the runtime events forwarded by ``run_agent_loop`` via
-the ``on_event`` callback and turns them into a Claude Code style terminal view:
+``EventRenderer`` consumes runtime events delivered through ``RunSession`` live
+observation and turns them into a Claude Code style terminal view:
 a thinking spinner, streamed assistant text, and live tool-call lines.
 """
 
@@ -14,6 +14,7 @@ from typing import Any
 
 from knuth.core.events import RuntimeEvent
 from knuth.core.messages import ToolCall
+from knuth_runtime.observation import RuntimeEventInterest, RuntimeEventOverflowPolicy
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
@@ -26,6 +27,16 @@ _MAX_REASONING_TAIL = 80
 
 
 class EventRenderer:
+    interest = RuntimeEventInterest.for_prefixes(
+        "model.",
+        "tool.",
+        "approval.",
+        "run.invocation.",
+    )
+    required = True
+    buffer_size = 1000
+    overflow_policy = RuntimeEventOverflowPolicy.BLOCK
+
     def __init__(self, console: Console) -> None:
         self._console = console
         self._thinking: Live | None = None
@@ -48,7 +59,7 @@ class EventRenderer:
             "approval.requested": self._on_approval_requested,
         }
 
-    async def handle(self, event: RuntimeEvent) -> None:
+    async def handle_event(self, event: RuntimeEvent) -> None:
         handler = self._dispatch.get(event.type)
         if handler is not None:
             handler(event)

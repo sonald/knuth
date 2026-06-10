@@ -1,10 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
-from typing import cast
-from uuid import uuid4
-
 from knuth.core.events import (
     ApprovalRequestedDraft,
     DurableRuntimeEventDraft,
@@ -35,59 +30,28 @@ from knuth.core.events import (
     ToolIntentDraft,
     ToolProposedDraft,
     ToolStartedDraft,
-    TransientRuntimeEventDraft,
     VerificationFailedDraft,
-    emit_transient_runtime_event,
 )
 from knuth.core.messages import InferenceMessage, InferenceRole
 from knuth.core.tools import ToolIntent, ToolProposalStatus
-from knuth.core.types import ErrorInfo, EventDurability, RunStatus
+from knuth.core.types import ErrorInfo, RunStatus
 from knuth_llmd import InferenceConfig, InferenceRuntimeOptions
 from knuth_runtime.context import RunContext
+from knuth_runtime.invocation import RuntimeInvocation
 from knuth_runtime.services import RuntimeServices
-
-EventSink = Callable[[RuntimeEvent], Awaitable[None]]
-
-
-def _utc_now() -> str:
-    return datetime.now(UTC).isoformat()
-
-
-async def _emit_runtime_event(
-    run_id: str,
-    services: RuntimeServices,
-    event: RuntimeEventDraft,
-    on_event: EventSink | None = None,
-) -> RuntimeEvent:
-    if event.durability == EventDurability.DURABLE:
-        runtime_event = await services.event_store.append(
-            run_id,
-            cast(DurableRuntimeEventDraft, event),
-        )
-    else:
-        runtime_event = emit_transient_runtime_event(
-            run_id,
-            cast(TransientRuntimeEventDraft, event),
-            event_id=f"evt_{uuid4().hex}",
-            created_at=_utc_now(),
-        )
-
-    if on_event is not None:
-        await on_event(runtime_event)
-    return runtime_event
 
 
 async def run_agent_loop(
-    run_id: str,
-    services: RuntimeServices,
+    invocation: RuntimeInvocation,
     inference_config: InferenceConfig,
     runtime_options: InferenceRuntimeOptions | None = None,
-    on_event: EventSink | None = None,
 ) -> RunStatus:
+    run_id = invocation.run_id
+    services = invocation.services
     turns = 0
 
     async def emit(event: RuntimeEventDraft) -> RuntimeEvent:
-        return await _emit_runtime_event(run_id, services, event, on_event)
+        return await invocation.emit(event)
 
     while True:
         run = await services.run_store.get(run_id)
@@ -105,9 +69,7 @@ async def run_agent_loop(
 
         pending_message = await _pending_assistant_tool_message(run_id, services)
         if pending_message is not None:
-            status = await handle_tool_calls(
-                run_id, pending_message, services, on_event
-            )
+            status = await handle_tool_calls(invocation, pending_message)
             if status is not None:
                 return status
             continue
@@ -156,13 +118,16 @@ async def run_agent_loop(
                 await emit(ModelContentDeltaDraft(delta=event.delta))
             elif isinstance(event, InferenceToolCallStarted):
                 await emit(
-                    ModelToolCallStartedDraft(index=event.index, id=event.id)
+                    ModelToolCallStartedDraft(
+                        index=event.index,
+                        tool_call_id=event.id,
+                    )
                 )
             elif isinstance(event, InferenceToolCallDelta):
                 await emit(
                     ModelToolCallDeltaDraft(
                         index=event.index,
-                        id=event.id,
+                        tool_call_id=event.id,
                         name_delta=event.name_delta,
                         arguments_json_delta=event.arguments_json_delta,
                         raw=event.raw,
@@ -211,9 +176,7 @@ async def run_agent_loop(
         )
 
         if assistant_message.tool_calls:
-            status = await handle_tool_calls(
-                run_id, assistant_message, services, on_event
-            )
+            status = await handle_tool_calls(invocation, assistant_message)
             if status is not None:
                 return status
             continue
@@ -225,19 +188,18 @@ async def run_agent_loop(
             await services.run_store.set_status(run_id, RunStatus.SUCCEEDED)
             return RunStatus.SUCCEEDED
 
-        await emit(
-            VerificationFailedDraft(reason="empty_final_answer")
-        )
+        await emit(VerificationFailedDraft(reason="empty_final_answer"))
 
 
 async def handle_tool_calls(
-    run_id: str,
+    invocation: RuntimeInvocation,
     assistant_message: InferenceMessage,
-    services: RuntimeServices,
-    on_event: EventSink | None = None,
 ) -> RunStatus | None:
+    run_id = invocation.run_id
+    services = invocation.services
+
     async def emit(event: DurableRuntimeEventDraft) -> RuntimeEvent:
-        return await _emit_runtime_event(run_id, services, event, on_event)
+        return await invocation.emit(event)
 
     intents = [ToolIntent.from_tool_call(call) for call in assistant_message.tool_calls]
     proposals = []

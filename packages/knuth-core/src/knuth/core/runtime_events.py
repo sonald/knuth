@@ -7,7 +7,7 @@ from pydantic import Field
 from knuth.core.inference_events import UsageInfo
 from knuth.core.messages import InferenceMessage, ToolCall
 from knuth.core.tools import ToolIntent, ToolProposal, ToolResult
-from knuth.core.types import ErrorInfo, EventDurability, KnuthModel
+from knuth.core.types import ErrorInfo, EventDurability, KnuthModel, RunStatus
 
 
 class RuntimeEventDraftBase(KnuthModel):
@@ -141,13 +141,13 @@ class ModelContentDeltaDraft(TransientRuntimeEventDraftBase):
 class ModelToolCallStartedDraft(TransientRuntimeEventDraftBase):
     type: Literal["model.tool_call.started"] = "model.tool_call.started"
     index: int
-    id: str | None = None
+    tool_call_id: str | None = None
 
 
 class ModelToolCallDeltaDraft(TransientRuntimeEventDraftBase):
     type: Literal["model.tool_call.delta"] = "model.tool_call.delta"
     index: int
-    id: str | None = None
+    tool_call_id: str | None = None
     name_delta: str | None = None
     arguments_json_delta: str | None = None
     raw: dict[str, Any] = Field(default_factory=dict)
@@ -158,6 +158,18 @@ class ModelToolCallCompletedDraft(TransientRuntimeEventDraftBase):
     tool_call: ToolCall
 
 
+class RunInvocationStartedDraft(TransientRuntimeEventDraftBase):
+    type: Literal["run.invocation.started"] = "run.invocation.started"
+    mode: Literal["start", "continue", "resume"]
+
+
+class RunInvocationEndedDraft(TransientRuntimeEventDraftBase):
+    type: Literal["run.invocation.ended"] = "run.invocation.ended"
+    mode: Literal["start", "continue", "resume"]
+    status: RunStatus | None = None
+    error: ErrorInfo | None = None
+
+
 TransientRuntimeEventDraft = (
     ModelReasoningDeltaDraft
     | ModelReasoningCompletedDraft
@@ -165,6 +177,8 @@ TransientRuntimeEventDraft = (
     | ModelToolCallStartedDraft
     | ModelToolCallDeltaDraft
     | ModelToolCallCompletedDraft
+    | RunInvocationStartedDraft
+    | RunInvocationEndedDraft
 )
 
 RuntimeEventDraft = DurableRuntimeEventDraft | TransientRuntimeEventDraft
@@ -221,6 +235,10 @@ ModelToolCallDelta = _transient("ModelToolCallDelta", ModelToolCallDeltaDraft)
 ModelToolCallCompleted = _transient(
     "ModelToolCallCompleted", ModelToolCallCompletedDraft
 )
+RunInvocationStarted = _transient(
+    "RunInvocationStarted", RunInvocationStartedDraft
+)
+RunInvocationEnded = _transient("RunInvocationEnded", RunInvocationEndedDraft)
 
 
 StoredRuntimeEvent = (
@@ -247,6 +265,8 @@ TransientRuntimeEvent = (
     | ModelToolCallStarted
     | ModelToolCallDelta
     | ModelToolCallCompleted
+    | RunInvocationStarted
+    | RunInvocationEnded
 )
 
 RuntimeEvent = StoredRuntimeEvent | TransientRuntimeEvent
