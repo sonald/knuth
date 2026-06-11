@@ -263,7 +263,7 @@ async def _resolve_approvals(
         if not pending:
             break
         for approval in pending:
-            tool = str(approval.preview.get("tool") or "")
+            tool = str(approval.approval_preview.get("tool") or "")
             if tool and tool in allowed_tools:
                 await runtime.approve(approval.id)
                 console.print(

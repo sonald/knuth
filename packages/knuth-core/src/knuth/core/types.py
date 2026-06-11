@@ -7,10 +7,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class KnuthModel(BaseModel):
-    model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     schema_version: str = "v0"
-    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class RunStatus(StrEnum):

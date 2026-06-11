@@ -68,11 +68,9 @@ class ToolBroker:
         self,
         registry: ToolRegistry,
         policy_engine: PolicyEngine | None = None,
-        workspace_uri: str | None = None,
     ) -> None:
         self.registry = registry
         self.policy_engine = policy_engine or AllowAllPolicy()
-        self.workspace_uri = workspace_uri
 
     async def list_visible_tools(self, run_id: str) -> list[dict[str, Any]]:
         await self.registry.refresh()
@@ -134,8 +132,6 @@ class ToolBroker:
         ctx = ToolRuntimeContext(
             run_id=invocation.run_id,
             tool_call_id=invocation.tool_call_id,
-            workspace_uri=self.workspace_uri,
-            idempotency_key=invocation.idempotency_key,
         )
         try:
             if manifest.timeout_s is not None:

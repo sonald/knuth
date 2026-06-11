@@ -348,6 +348,16 @@ class CliTests(unittest.TestCase):
             def resume(self, run_id: str, *, listeners=()):
                 return _FakeRunSession("resumed", run_id, listeners)
 
+            async def refold(self):
+                from knuth_runtime import RefoldStats
+
+                return RefoldStats(runs=2, events=17)
+
+            async def recover_crashed_runs(self, run_id=None):
+                from knuth_runtime import CrashRecoveryReport
+
+                return [CrashRecoveryReport(run_id="run-9", failed=1, unknown=1)]
+
         async def runtime_factory() -> FakeRuntime:
             return FakeRuntime()
 
@@ -358,12 +368,34 @@ class CliTests(unittest.TestCase):
             (["approve", "appr-1"], "appr-1"),
             (["deny", "appr-1"], "appr-1"),
             (["resume", "run-1"], "resumed"),
+            (["admin", "refold"], "refolded 2 runs from 17 events"),
+            (["recover"], "run-9\tpaused\tfailed=1\tunknown=1"),
         ]:
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 exit_code = main(argv, runtime_factory=runtime_factory)
             self.assertEqual(exit_code, 0)
             self.assertIn(expected, output.getvalue())
+
+    def test_global_flags_reach_the_runtime_factory(self) -> None:
+        captured = {}
+
+        class FakeRuntime:
+            async def status(self, run_id: str) -> RunStatus:
+                return RunStatus.SUCCEEDED
+
+        async def runtime_factory(*, enable_plugins=False, debug=False):
+            captured.update(enable_plugins=enable_plugins, debug=debug)
+            return FakeRuntime()
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            exit_code = main(
+                ["--debug", "--enable-plugins", "status", "run-1"],
+                runtime_factory=runtime_factory,
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(captured, {"enable_plugins": True, "debug": True})
 
 
 class _BlockingFakeStdin:

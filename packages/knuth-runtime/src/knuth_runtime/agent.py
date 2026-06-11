@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -20,18 +21,36 @@ from knuth.core.types import RunStatus
 from knuth_llmd import InferenceConfig
 from knuth_toold import ToolBroker, create_default_registry
 
-from knuth_runtime.context import ContextBuilder, SystemSectionProvider
+from knuth_runtime.context import (
+    ContextBuilder,
+    ContextRedactor,
+    SystemSectionProvider,
+)
 from knuth_runtime.ledger import (
     EventRedactor,
     MemoryRunLedger,
+    RefoldStats,
     RunLedger,
     SQLiteRunLedger,
 )
+from knuth_runtime.debug import DebugEventSink
+from knuth_runtime.loop import settle_crashed_invocations
 from knuth_runtime.observation import RuntimeEventListener
 from knuth_runtime.policy import PolicyEngine
+from knuth_runtime.redaction import RegexSecretRedactor
 from knuth_runtime.result import RunResult
 from knuth_runtime.services import RuntimeServices
 from knuth_runtime.session import RunSession
+
+
+@dataclass(frozen=True)
+class CrashRecoveryReport:
+    """Outcome of recovering one crashed run: in-flight invocations settled
+    by effect split, then the run paused so its durable status stops lying."""
+
+    run_id: str
+    failed: int
+    unknown: int
 
 
 class AgentRuntime:
@@ -43,9 +62,11 @@ class AgentRuntime:
         self,
         services: RuntimeServices,
         inference_config: InferenceConfig,
+        default_listeners: Iterable[RuntimeEventListener] = (),
     ) -> None:
         self._services = services
         self._inference_config = inference_config
+        self._default_listeners = tuple(default_listeners)
 
     async def run_once(self, prompt: str) -> RunResult:
         async with self.start(prompt) as session:
@@ -62,7 +83,7 @@ class AgentRuntime:
             services=self._services,
             inference_config=self._inference_config,
             prompt=prompt,
-            listeners=listeners,
+            listeners=(*self._default_listeners, *listeners),
         )
 
     def continue_run(
@@ -78,7 +99,7 @@ class AgentRuntime:
             inference_config=self._inference_config,
             run_id=run_id,
             prompt=prompt,
-            listeners=listeners,
+            listeners=(*self._default_listeners, *listeners),
         )
 
     def resume(
@@ -92,7 +113,7 @@ class AgentRuntime:
             services=self._services,
             inference_config=self._inference_config,
             run_id=run_id,
-            listeners=listeners,
+            listeners=(*self._default_listeners, *listeners),
         )
 
     async def approve(self, approval_id: str) -> Approval:
@@ -135,7 +156,7 @@ class AgentRuntime:
                 tool_name=invocation.tool_name,
                 outcome=outcome,
                 observation=observation,
-                meta={"resolved_by": "user"},
+                tool_status="resolved_by_user",
             ),
         )
         return await ledger.get_invocation(tool_call_id)
@@ -168,6 +189,57 @@ class AgentRuntime:
     async def pending_approvals(self, run_id: str | None = None) -> list[Approval]:
         return await self._services.ledger.pending_approvals(run_id)
 
+    async def refold(self) -> RefoldStats:
+        """Drop the derived projections and rebuild them from the event log.
+
+        Projection schema changes are not data migrations (design rule three);
+        this is the rebuild path that makes that rule real.
+        """
+        return await self._services.ledger.refold()
+
+    async def recover_crashed_runs(
+        self, run_id: str | None = None
+    ) -> list[CrashRecoveryReport]:
+        """Settle work a dead process left in flight (design §5.2).
+
+        For every RUNNING run (or just ``run_id``): running invocations are
+        settled by effect split — retryable effects fail with a crash
+        observation, external writes become UNKNOWN — and the run is paused,
+        so durable state no longer claims an execution that is not happening.
+
+        v0 has no worker lease, so liveness cannot be proven from the ledger;
+        this runs only on explicit request (``knuth recover``), never
+        automatically against runs another process may still be driving.
+        """
+        ledger = self._services.ledger
+        if run_id is not None:
+            candidates = [await ledger.get_run(run_id)]
+        else:
+            candidates = await ledger.list_runs(limit=1000, status=RunStatus.RUNNING)
+
+        reports: list[CrashRecoveryReport] = []
+        for run in candidates:
+            if run.status != RunStatus.RUNNING:
+                continue
+            state = await ledger.run_state(run.id)
+
+            async def apply_event(draft, _run_id: str = run.id) -> None:
+                await ledger.apply(_run_id, draft)
+
+            failed = unknown = 0
+            if state.open_batch is not None:
+                failed, unknown = await settle_crashed_invocations(
+                    apply_event, state.open_batch
+                )
+            await ledger.apply(
+                run.id,
+                RunPausedDraft(reason="recovered after crash; resume to continue"),
+            )
+            reports.append(
+                CrashRecoveryReport(run_id=run.id, failed=failed, unknown=unknown)
+            )
+        return reports
+
 
 class _DemoInferenceClient:
     model = "knuth-demo"
@@ -192,7 +264,12 @@ def build_sqlite_runtime(
     section_providers: list[SystemSectionProvider] | None = None,
     redactor: EventRedactor | None = None,
     enable_plugins: bool = False,
+    debug_sink_dir: Path | str | None = None,
 ) -> AgentRuntime:
+    # Redaction is a v0 security floor (design §8): the ledger is append-only,
+    # so secrets must be stripped before apply. Default on; pass a custom
+    # redactor to change what counts as a secret.
+    redactor = redactor or RegexSecretRedactor()
     ledger = SQLiteRunLedger(db_path or Path("~/.knuth/knuth.db"), redactor=redactor)
     registry = create_default_registry(
         enable_entry_point_discovery=enable_plugins
@@ -206,9 +283,17 @@ def build_sqlite_runtime(
             ledger,
             broker,
             section_providers=section_providers,
+            redactor=redactor if isinstance(redactor, ContextRedactor) else None,
         ),
     )
-    return AgentRuntime(services=services, inference_config=inference_config)
+    default_listeners: tuple[RuntimeEventListener, ...] = ()
+    if debug_sink_dir is not None:
+        default_listeners = (DebugEventSink(debug_sink_dir),)
+    return AgentRuntime(
+        services=services,
+        inference_config=inference_config,
+        default_listeners=default_listeners,
+    )
 
 
 async def build_default_runtime(db_path: Path | str | None = None) -> AgentRuntime:

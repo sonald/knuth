@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import json
 import sys
 from collections.abc import Awaitable, Callable
@@ -15,6 +16,17 @@ from knuth_runtime import AgentRuntime, LedgerError
 CommandHandler = Callable[[AgentRuntime, argparse.Namespace], Awaitable[int]]
 
 _EXIT_INTERRUPTED = 130
+
+
+def _factory_kwargs(runtime_factory, args: argparse.Namespace) -> dict:
+    """Pass global flags through to factories that accept them; test fakes
+    with narrower signatures keep working unchanged."""
+    params = inspect.signature(runtime_factory).parameters
+    return {
+        name: getattr(args, name)
+        for name in ("enable_plugins", "debug")
+        if name in params and hasattr(args, name)
+    }
 
 
 def main(
@@ -111,6 +123,33 @@ async def _handle_approvals(runtime: AgentRuntime, args: argparse.Namespace) -> 
     return 0
 
 
+async def _handle_admin(runtime: AgentRuntime, args: argparse.Namespace) -> int:
+    if args.admin_command == "refold":
+        stats = await runtime.refold()
+        sys.stdout.write(
+            f"refolded {stats.runs} runs from {stats.events} events\n"
+        )
+    return 0
+
+
+async def _handle_recover(runtime: AgentRuntime, args: argparse.Namespace) -> int:
+    reports = await runtime.recover_crashed_runs(args.run_id)
+    if not reports:
+        sys.stdout.write("no crashed runs\n")
+        return 0
+    for report in reports:
+        sys.stdout.write(
+            f"{report.run_id}\tpaused\tfailed={report.failed}"
+            f"\tunknown={report.unknown}\n"
+        )
+        if report.unknown:
+            sys.stdout.write(
+                "  resolve unknown outcomes with"
+                " `knuth resolve <tool_call_id> --outcome ...`\n"
+            )
+    return 0
+
+
 _COMMAND_HANDLERS: dict[str, CommandHandler] = {
     "run": _handle_run,
     "runs": _handle_runs,
@@ -122,6 +161,8 @@ _COMMAND_HANDLERS: dict[str, CommandHandler] = {
     "resume": _handle_resume,
     "resolve": _handle_resolve,
     "approvals": _handle_approvals,
+    "admin": _handle_admin,
+    "recover": _handle_recover,
 }
 
 
@@ -135,6 +176,19 @@ async def async_main(
         "--version",
         action="version",
         version=f"%(prog)s {__version__}",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Write the full event stream (including transient reasoning and"
+        " raw deltas) to ~/.knuth/debug/<run_id>.jsonl",
+    )
+    parser.add_argument(
+        "--enable-plugins",
+        action="store_true",
+        dest="enable_plugins",
+        help="Discover third-party tools via entry points. Runs plugin code"
+        " in-process; enable only for plugins you trust.",
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -178,12 +232,25 @@ async def async_main(
         "approvals", help="List pending approvals"
     )
     approvals_parser.add_argument("--run-id", dest="run_id", default=None)
+    admin_parser = subparsers.add_parser("admin", help="Maintenance commands")
+    admin_subparsers = admin_parser.add_subparsers(
+        dest="admin_command", required=True
+    )
+    admin_subparsers.add_parser(
+        "refold", help="Rebuild derived projections from the event log"
+    )
+    recover_parser = subparsers.add_parser(
+        "recover",
+        help="Settle in-flight work left by a crashed process and pause"
+        " the affected runs",
+    )
+    recover_parser.add_argument("run_id", nargs="?", default=None)
     args = parser.parse_args(argv)
     if args.command is None:
         parser.print_help()
         return 0
     try:
-        runtime = await runtime_factory()
+        runtime = await runtime_factory(**_factory_kwargs(runtime_factory, args))
     except ValueError as exc:
         sys.stderr.write(f"error: {exc}\n")
         sys.stderr.write(

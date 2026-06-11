@@ -160,7 +160,6 @@ runtime -> durable RuntimeEvent -> EventStore + RunSession LiveRuntimeObservatio
 
 ```python
 query: str
-metadata: dict[str, Any]
 ```
 
 `model.started` 记录：

@@ -62,11 +62,10 @@ class ToolInvocation(KnuthModel):
     effect: ToolEffect = ToolEffect.READ
     risk: ToolRisk = ToolRisk.LOW
     approval_id: str | None = None
-    idempotency_key: str | None = None
-    attempts: int = 0
-    observed: bool = False
-    denial_reason: str | None = None
-    updated_seq: int = 0
+    attempt: int = 0
+    observation_recorded: bool = False
+    denied_observation: str | None = None
+    last_event_seq: int = 0
 
 
 class ApprovalStatus(StrEnum):
@@ -87,7 +86,7 @@ class Approval(KnuthModel):
     title: str
     reason: str
     risk: str
-    preview: dict[str, Any] = Field(default_factory=dict)
+    approval_preview: dict[str, Any] = Field(default_factory=dict)
     created_at: str
     resolved_at: str | None = None
     resolved_by: str | None = None

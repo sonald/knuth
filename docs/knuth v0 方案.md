@@ -1,6 +1,6 @@
 > **⚠️ SUPERSEDED**：本文档已被 [knuth-v0-design.md](knuth-v0-design.md) 取代（2026-06-10）。
 > 主要修订：持久化改为"事件为唯一权威 + 同步派生投影 + 校验聚合"（RunLedger 模型）、
-> approval/恢复链路闭合、外部写崩溃语义（UNKNOWN + idempotency）、hook 收权（无 MUTATE）、
+> approval/恢复链路闭合、外部写崩溃语义（UNKNOWN + 人工裁决）、hook 收权（无 MUTATE）、
 > 安全红线前置。本文仅作历史参考，其中 hook 系统（§12）、事件三字段（§10）、
 > ToolBase(BaseModel)（§6）等设计已作废。
 
@@ -121,13 +121,12 @@ LiteLLM 适合作为 v0 provider adapter，因为它官方提供异步 completio
 
 ## 3. knuth-core：基础类型
 
-建议所有 Pydantic model 都带 `schema_version` 和 `metadata`，并保留向前兼容的扩展空间。具体用哪种 Pydantic 配置方式属于实现细节，方案只约束事件 payload、工具 metadata 这类结构需要可演进。
+建议所有 Pydantic model 都带 `schema_version`。向前演进通过新增显式字段或新事件类型完成，不保留开放字段逃生口。
 
 ```python
 # knuth/core/types.py
 class KnuthModel:
     schema_version: str
-    metadata: dict
 
 
 class RunStatus:
@@ -161,7 +160,7 @@ class ErrorInfo(KnuthModel):
 1. `tool_result` 必须能关联到原始 tool call；
 2. `assistant` 必须能携带 tool calls；
 3. content 后面可能不只是纯字符串；
-4. metadata 要保留 provider/raw 信息。
+4. provider/raw 信息只能留在明确命名的边界字段里。
 
 LiteLLM 的输入参数文档里也有 `tool_call_id` 这类字段，用来表示某条 tool response 是对哪个 tool call 的响应。([LiteLLM](https://docs.litellm.ai/docs/completion/input?utm_source=chatgpt.com))
 
@@ -190,7 +189,6 @@ class InferenceMessage(KnuthModel):
     tool_call_id: str | None = None
     tool_name: str | None = None
     name: str | None = None
-    metadata: dict
 
     # provider-specific conversion belongs in llmd, not runtime.
     def to_litellm_message(self) -> dict: ...
@@ -301,14 +299,14 @@ class StreamAccumulator:
 你现在的 `ToolBase` 把三件事混在一起了：
 
 1. 给 LLM 看的 function spec；
-2. runtime 用的风险、并行、缓存 metadata；
+2. runtime 用的风险、并行、缓存属性；
 3. 真正的执行代码。
 
 v0 建议拆成：
 
 ```text
 ToolManifest
-  - runtime metadata
+  - runtime-visible tool properties
   - name, description, parameters, risk, cacheable, parallelable
 
 ToolSpec
@@ -345,7 +343,6 @@ class ToolManifest:
 class ToolContext:
     run_id: str
     tool_call_id: str
-    workspace_uri: str | None
 
 
 class ToolResult:
@@ -456,7 +453,6 @@ class ApprovalRequest(KnuthModel):
     reason: str
     risk: str
     payload: dict
-    metadata: dict
 
 
 class ToolProposal(KnuthModel):
@@ -572,7 +568,6 @@ class Approval(KnuthModel):
     payload: dict
     created_at: str
     resolved_at: str | None
-    metadata: dict
 
 
 class ApprovalService:
@@ -591,16 +586,11 @@ class ApprovalService:
 # knuth/runtime/run.py
 class AgentRun(KnuthModel):
     id: str
-    user_id: str | None
     query: str
     status: RunStatus
     created_at: str
     updated_at: str
-    parent_run_id: str | None
-    title: str | None
     max_turns: int
-    budget: dict
-    metadata: dict
 ```
 
 RuntimeEvent：
@@ -674,9 +664,6 @@ ContextView
 # knuth/runtime/context.py
 class RunContext(KnuthModel):
     run_id: str
-    user_id: str | None
-    workspace_uri: str | None
-    metadata: dict
 
 
 class ContextView(KnuthModel):
@@ -684,7 +671,6 @@ class ContextView(KnuthModel):
     messages: list[InferenceMessage]
     tools: list[dict]
     diagnostics: dict
-    metadata: dict
 ```
 
 Middleware 接口：
@@ -722,7 +708,7 @@ HistoryCompactionMiddleware
   - v0 可以先不做复杂 summarization
 
 SensitiveContentFilterMiddleware
-  - 过滤不该送进模型的 metadata/secrets
+  - 过滤不该送进模型的私有字段 / secrets
 
 BudgetMiddleware
   - 控制最大消息数或近似 token
@@ -751,7 +737,7 @@ tool.completed
   -> tool_result message
 
 system.note
-  -> system 或 assistant metadata，视具体用途
+  -> system 或 assistant message，视具体用途
 ```
 
 ------
@@ -924,9 +910,7 @@ class Artifact(KnuthModel):
     id: str
     run_id: str
     kind: str
-    title: str | None
-    uri: str
-    metadata: dict
+    sha256: str
     created_at: str
 
 
@@ -965,7 +949,6 @@ v0 不要复杂。先定义接口：
 class VerificationResult(KnuthModel):
     ok: bool
     reason: str | None
-    metadata: dict
 
 
 class Verifier:

@@ -9,10 +9,12 @@ from knuth.core.invocations import (
 
 from knuth_runtime.agent import (
     AgentRuntime,
+    CrashRecoveryReport,
     build_default_runtime,
     build_memory_runtime,
     build_sqlite_runtime,
 )
+from knuth_runtime.debug import DEFAULT_DEBUG_SINK_DIR, DebugEventSink
 from knuth_runtime.context import (
     ContextRedactor,
     StaticSectionProvider,
@@ -23,9 +25,15 @@ from knuth_runtime.ledger import (
     LedgerError,
     MemoryRunLedger,
     OpenToolBatch,
+    RefoldStats,
     RunLedger,
     RunLedgerState,
     SQLiteRunLedger,
+)
+from knuth_runtime.redaction import (
+    DEFAULT_SECRET_PATTERNS,
+    RegexSecretRedactor,
+    SecretPattern,
 )
 from knuth_runtime.observation import (
     RuntimeEventInterest,
@@ -41,12 +49,19 @@ __all__ = [
     "Approval",
     "ApprovalStatus",
     "ContextRedactor",
+    "CrashRecoveryReport",
+    "DEFAULT_DEBUG_SINK_DIR",
+    "DEFAULT_SECRET_PATTERNS",
+    "DebugEventSink",
     "EventRedactor",
     "LedgerError",
     "MemoryRunLedger",
     "OpenToolBatch",
+    "RefoldStats",
+    "RegexSecretRedactor",
     "RunLedger",
     "RunLedgerState",
+    "SecretPattern",
     "RunResult",
     "RunSession",
     "RuntimeEventInterest",

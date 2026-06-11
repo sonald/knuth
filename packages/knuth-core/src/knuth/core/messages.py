@@ -4,7 +4,7 @@ import json
 from enum import StrEnum
 from typing import Any
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 
 from knuth.core.types import KnuthModel
 
@@ -31,7 +31,9 @@ class SystemSection(KnuthModel):
 
 
 class ToolCall(KnuthModel):
-    id: str | None = None
+    tool_call_id: str | None = Field(
+        default=None, validation_alias=AliasChoices("tool_call_id", "id")
+    )
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
     arguments_json: str | None = None
@@ -43,7 +45,7 @@ class ToolCall(KnuthModel):
         """Provider tool-call id, or the positional fallback when the provider
         omitted one. Every consumer must share this fallback, or planned-batch
         ids stop matching the model.completed tool calls."""
-        return self.id or f"call_{self.index}"
+        return self.tool_call_id or f"call_{self.index}"
 
     def arguments_as_json(self) -> str:
         if self.arguments_json is not None:
@@ -79,7 +81,7 @@ class InferenceMessage(KnuthModel):
         if self.role == InferenceRole.ASSISTANT and self.tool_calls:
             message["tool_calls"] = [
                 {
-                    "id": call.id,
+                    "id": call.tool_call_id,
                     "type": "function",
                     "function": {
                         "name": call.name,

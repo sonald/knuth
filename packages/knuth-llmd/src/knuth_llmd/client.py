@@ -233,7 +233,7 @@ class StreamAccumulator:
             if not isinstance(parsed, Mapping):
                 parsed = {}
             call = CoreToolCall(
-                id=current["id"] or f"call_{index}",
+                tool_call_id=current["id"] or f"call_{index}",
                 name=current["name"],
                 arguments=dict(parsed),
                 arguments_json=arguments_json,
@@ -256,7 +256,7 @@ class StreamAccumulator:
                 parsed = {}
             calls.append(
                 CoreToolCall(
-                    id=current["id"] or f"call_{index}",
+                    tool_call_id=current["id"] or f"call_{index}",
                     name=current["name"],
                     arguments=dict(parsed),
                     arguments_json=arguments_json,

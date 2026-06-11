@@ -18,17 +18,15 @@ class _ExecutionContextTool:
 
     def __init__(self, cwd: Path | str | None = None) -> None:
         path = Path.cwd() if cwd is None else Path(cwd)
-        self._default_workspace = path.resolve()
+        self._execution_dir = path.resolve()
 
-    def _base_path(self, ctx: ToolRuntimeContext) -> Path:
-        if ctx.workspace_uri:
-            return ctx.workspace_path
-        return self._default_workspace
+    def _base_path(self) -> Path:
+        return self._execution_dir
 
-    def _execution_path(self, ctx: ToolRuntimeContext, raw_path: object) -> Path:
+    def _execution_path(self, raw_path: object) -> Path:
         if not isinstance(raw_path, str) or not raw_path:
             raise ValueError("path must be a non-empty string")
-        base = self._base_path(ctx)
+        base = self._base_path()
         path = (base / raw_path).resolve()
         if not path.is_relative_to(base):
             raise ValueError("path must stay within the execution directory")
@@ -56,7 +54,7 @@ class ReadFileTool(_ExecutionContextTool):
     async def invoke(
         self, invocation: ToolInvocation, ctx: ToolRuntimeContext
     ) -> ToolResult:
-        path = self._execution_path(ctx, invocation.args.get("path"))
+        path = self._execution_path(invocation.args.get("path"))
         async with await anyio.open_file(path, encoding="utf-8") as file:
             content = await file.read()
         return ToolResult.success(content=content, data={"path": str(path)})
@@ -84,26 +82,24 @@ class WriteFileTool(_ExecutionContextTool):
     async def invoke(
         self, invocation: ToolInvocation, ctx: ToolRuntimeContext
     ) -> ToolResult:
-        path = self._execution_path(ctx, invocation.args.get("path"))
+        path = self._execution_path(invocation.args.get("path"))
         content = invocation.args.get("content")
         if not isinstance(content, str):
             raise ValueError("content must be a string")
         await anyio.Path(path.parent).mkdir(parents=True, exist_ok=True)
         async with await anyio.open_file(path, "w", encoding="utf-8") as file:
             await file.write(content)
-        base = self._base_path(ctx)
+        base = self._base_path()
         return ToolResult.success(content=f"Wrote {path.relative_to(base)}")
 
 
 class _SubprocessTool(_ExecutionContextTool):
-    async def _run(
-        self, ctx: ToolRuntimeContext, command: list[str], timeout_s: float
-    ) -> ToolResult:
+    async def _run(self, command: list[str], timeout_s: float) -> ToolResult:
         with anyio.fail_after(timeout_s):
             completed = await anyio.run_process(
                 command,
                 stdin=None,
-                cwd=self._base_path(ctx),
+                cwd=self._base_path(),
                 check=False,
             )
         stdout = completed.stdout.decode()
@@ -142,7 +138,7 @@ class ShellTool(_SubprocessTool):
         command = invocation.args.get("command")
         if not isinstance(command, str) or not command:
             raise ValueError("command must be a non-empty string")
-        return await self._run(ctx, ["/bin/sh", "-c", command], timeout_s=30)
+        return await self._run(["/bin/sh", "-c", command], timeout_s=30)
 
 
 class PythonTool(_SubprocessTool):
@@ -168,7 +164,7 @@ class PythonTool(_SubprocessTool):
         code = invocation.args.get("code")
         if not isinstance(code, str) or not code:
             raise ValueError("code must be a non-empty string")
-        return await self._run(ctx, [sys.executable, "-c", code], timeout_s=30)
+        return await self._run([sys.executable, "-c", code], timeout_s=30)
 
 
 def create_default_registry(

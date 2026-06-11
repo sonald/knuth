@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from uuid import uuid4
 
 from knuth.core.events import (
@@ -54,7 +55,7 @@ from knuth_runtime.invocation import RuntimeInvocation
 from knuth_runtime.ledger import OpenToolBatch, RunLedgerState
 
 # Observations above this size are offloaded to the artifact side store; the
-# event keeps a ref and a preview (design §1.2).
+# event keeps an artifact_ref and an observation_preview (design §1.2).
 OBSERVATION_INLINE_LIMIT = 8 * 1024
 _OBSERVATION_PREVIEW_CHARS = 512
 
@@ -132,8 +133,6 @@ async def _run_step(
 
     ctx = RunContext(
         run_id=run_id,
-        user_id=state.run.user_id,
-        workspace_uri=state.run.metadata.get("workspace_uri"),
     )
     view = await services.context_builder.build(
         ctx,
@@ -220,7 +219,7 @@ async def _run_step(
     # ledger by construction.
     tool_calls = [
         ToolCall(
-            id=call.effective_id,
+            tool_call_id=call.effective_id,
             name=call.name,
             arguments=call.arguments,
             index=call.index,
@@ -276,6 +275,42 @@ async def _run_step(
     return None
 
 
+async def settle_crashed_invocations(
+    emit: Callable[..., Awaitable[object]],
+    batch: OpenToolBatch,
+) -> tuple[int, int]:
+    """Crash recovery, split by effect (design §5.2): retryable effects fail
+    loudly so the model can retry; external writes may have happened and
+    become UNKNOWN pending human resolution.
+
+    Returns ``(failed, unknown)`` counts. Shared by the loop's in-batch
+    recovery and the explicit ``recover`` control surface.
+    """
+    failed = unknown = 0
+    for inv in batch.by_status(ToolInvocationStatus.RUNNING):
+        if inv.effect in EXTERNAL_EFFECTS:
+            await emit(
+                ToolInvocationMarkedUnknownDraft(
+                    tool_call_id=inv.tool_call_id,
+                    reason="runtime crashed while the tool was running;"
+                    " the external side effect may or may not have happened",
+                )
+            )
+            unknown += 1
+        else:
+            await emit(
+                ToolInvocationCompletedDraft(
+                    tool_call_id=inv.tool_call_id,
+                    tool_name=inv.tool_name,
+                    outcome="failed",
+                    observation=_CRASH_OBSERVATION,
+                    tool_status="crashed",
+                )
+            )
+            failed += 1
+    return failed, unknown
+
+
 async def _drive_open_batch(
     invocation: RuntimeInvocation,
     state: RunLedgerState,
@@ -287,27 +322,7 @@ async def _drive_open_batch(
     batch = state.open_batch
     assert batch is not None
 
-    # Crash recovery, split by effect: retryable effects fail loudly so the
-    # model can retry; external writes may have happened and become UNKNOWN.
-    for inv in batch.by_status(ToolInvocationStatus.RUNNING):
-        if inv.effect in EXTERNAL_EFFECTS:
-            await invocation.emit(
-                ToolInvocationMarkedUnknownDraft(
-                    tool_call_id=inv.tool_call_id,
-                    reason="runtime crashed while the tool was running;"
-                    " the external side effect may or may not have happened",
-                )
-            )
-        else:
-            await invocation.emit(
-                ToolInvocationCompletedDraft(
-                    tool_call_id=inv.tool_call_id,
-                    tool_name=inv.tool_name,
-                    outcome="failed",
-                    observation=_CRASH_OBSERVATION,
-                    meta={"reason": "crashed"},
-                )
-            )
+    await settle_crashed_invocations(invocation.emit, batch)
 
     # Propose: pure decision, safe to repeat after a crash.
     for inv in batch.by_status(ToolInvocationStatus.PROPOSED):
@@ -332,7 +347,7 @@ async def _drive_open_batch(
                     reason=proposal.approval_reason
                     or f"Tool has effect={proposal.effect.value}, risk={proposal.risk.value}",
                     risk=proposal.risk.value,
-                    preview={"tool": inv.tool_name, "args": inv.args},
+                    approval_preview={"tool": inv.tool_name, "args": inv.args},
                 )
             )
 
@@ -344,13 +359,18 @@ async def _drive_open_batch(
     # Denied invocations need a model-visible observation before the batch
     # can close; the denial text lets the model recover next turn.
     for inv in batch.invocations:
-        if inv.status == ToolInvocationStatus.DENIED and not inv.observed:
+        if (
+            inv.status == ToolInvocationStatus.DENIED
+            and not inv.observation_recorded
+        ):
             await invocation.emit(
                 ToolInvocationCompletedDraft(
                     tool_call_id=inv.tool_call_id,
                     tool_name=inv.tool_name,
                     outcome="denied",
-                    observation=f"Tool call denied: {inv.denial_reason or 'denied'}",
+                    observation=(
+                        f"Tool call denied: {inv.denied_observation or 'denied'}"
+                    ),
                 )
             )
 
@@ -368,7 +388,7 @@ async def _drive_open_batch(
                         title=f"Approve tool call: {inv.tool_name}",
                         reason=f"Tool has effect={inv.effect.value}, risk={inv.risk.value}",
                         risk=inv.risk.value,
-                        preview={"tool": inv.tool_name, "args": inv.args},
+                        approval_preview={"tool": inv.tool_name, "args": inv.args},
                     )
                 )
         return RunStatus.WAITING_APPROVAL
@@ -382,29 +402,24 @@ async def _drive_open_batch(
         )
         return RunStatus.PAUSED
 
-    # Execute the approved calls serially in plan order. Each invocation gets
-    # an idempotency key so idempotent external APIs can dedupe retries.
+    # Execute the approved calls serially in plan order.
     for inv in batch.by_status(ToolInvocationStatus.APPROVED):
-        attempt = inv.attempts + 1
-        idempotency_key = f"{run_id}:{inv.tool_call_id}:{attempt}"
+        attempt = inv.attempt + 1
         await invocation.emit(
             ToolInvocationStartedDraft(
                 tool_call_id=inv.tool_call_id,
-                idempotency_key=idempotency_key,
                 attempt=attempt,
             )
         )
-        result = await services.tool_broker.execute(
-            inv.model_copy(update={"idempotency_key": idempotency_key})
-        )
+        result = await services.tool_broker.execute(inv)
         observation = result.to_observation_text()
-        observation_ref = None
+        artifact_ref = None
         observation_preview = None
         if len(observation) > OBSERVATION_INLINE_LIMIT:
             artifact = await services.ledger.put_artifact(
                 run_id, "tool_observation", observation
             )
-            observation_ref = artifact.id
+            artifact_ref = artifact.id
             observation_preview = observation[:_OBSERVATION_PREVIEW_CHARS]
             observation = None
         await invocation.emit(
@@ -413,9 +428,9 @@ async def _drive_open_batch(
                 tool_name=inv.tool_name,
                 outcome="succeeded" if result.ok else "failed",
                 observation=observation,
-                observation_ref=observation_ref,
+                artifact_ref=artifact_ref,
                 observation_preview=observation_preview,
-                meta={"tool_status": result.status.value},
+                tool_status=result.status.value,
             )
         )
 

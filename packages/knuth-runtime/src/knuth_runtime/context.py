@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from abc import ABC, abstractmethod
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from pydantic import Field
 
@@ -38,8 +38,6 @@ def assemble_preamble(sections: list[SystemSection]) -> str | None:
 
 class RunContext(KnuthModel):
     run_id: str
-    user_id: str | None = None
-    workspace_uri: str | None = None
 
 
 class ContextView(KnuthModel):
@@ -75,6 +73,7 @@ class StaticSectionProvider(SystemSectionProvider):
         return [SystemSection(source=self._source, text=self._text)]
 
 
+@runtime_checkable
 class ContextRedactor(Protocol):
     """Redact stage seam: strips secrets before any other transformation sees
     the view. Runs first among the mutating stages by construction."""
@@ -201,8 +200,8 @@ async def reconstruct_messages_from_events(
             )
         elif event.type == "tool.invocation_completed":
             observation = event.observation
-            if observation is None and event.observation_ref is not None:
-                observation = await resolve_artifact_text(event.observation_ref)
+            if observation is None and event.artifact_ref is not None:
+                observation = await resolve_artifact_text(event.artifact_ref)
             messages.append(
                 InferenceMessage(
                     role=InferenceRole.TOOL_RESULT,

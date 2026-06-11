@@ -9,7 +9,9 @@ from knuth.core.events import (
     InferenceGenerationCompleted,
     InferenceToolCallDelta,
     InferenceToolCallStarted,
+    ModelReasoningDeltaDraft,
     RunCreatedDraft,
+    emit_transient_runtime_event,
 )
 from knuth.core.invocations import (
     ToolCallDecision,
@@ -26,12 +28,17 @@ from knuth.core.messages import (
     ToolCall as CoreToolCall,
 )
 from knuth.core.runtime_events import (
+    ApprovalRequestedDraft,
+    ApprovalResolvedDraft,
     ContextSnapshot,
     ModelCompletedDraft,
     PlannedToolCall,
     RunResumedDraft,
+    RunSucceededDraft,
     StepStartedDraft,
+    ToolBatchClosedDraft,
     ToolBatchPlannedDraft,
+    ToolInvocationCompletedDraft,
     ToolInvocationStartedDraft,
     ToolProposedDraft,
     UserMessageDraft,
@@ -40,8 +47,11 @@ from knuth.core.runtime_events import (
 from knuth.core.types import RunStatus
 from knuth_llmd import InferenceConfig
 from knuth_runtime import (
+    CrashRecoveryReport,
+    DebugEventSink,
     LedgerError,
     MemoryRunLedger,
+    RegexSecretRedactor,
     SQLiteRunLedger,
     build_memory_runtime,
     build_sqlite_runtime,
@@ -87,7 +97,7 @@ class RunLedgerTests(unittest.TestCase):
         ledger = MemoryRunLedger()
 
         async def scenario():
-            run = await ledger.create_run("hello", {"workspace_uri": "file:///tmp"})
+            run = await ledger.create_run("hello")
             events = await ledger.list_events(run.id)
             return run, events
 
@@ -96,7 +106,7 @@ class RunLedgerTests(unittest.TestCase):
         self.assertEqual(run.last_seq, 1)
         self.assertEqual(events[0].type, "run.created")
         self.assertEqual(events[0].seq, 1)
-        self.assertEqual(events[0].metadata["workspace_uri"], "file:///tmp")
+        self.assertEqual(events[0].query, "hello")
 
     def test_sqlite_ledger_round_trips_events_and_projections(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -124,7 +134,7 @@ class RunLedgerTests(unittest.TestCase):
                     run.id,
                     StepStartedDraft(step_id="step-1", index=1, snapshot=_snapshot()),
                 )
-                call = CoreToolCall(id="call-1", name="read_file", arguments={"path": "x"})
+                call = CoreToolCall(tool_call_id="call-1", name="read_file", arguments={"path": "x"})
                 await ledger.apply(
                     run.id,
                     ModelCompletedDraft(step_id="step-1", tool_calls=[call]),
@@ -201,7 +211,7 @@ class RunLedgerTests(unittest.TestCase):
                 ModelCompletedDraft(
                     step_id="s1",
                     content=None,
-                    tool_calls=[CoreToolCall(id="c1", name="read_file", arguments={"path": "x"})],
+                    tool_calls=[CoreToolCall(tool_call_id="c1", name="read_file", arguments={"path": "x"})],
                 ),
             )
             await ledger.apply(
@@ -241,7 +251,7 @@ class RunLedgerTests(unittest.TestCase):
                 run.id,
                 ModelCompletedDraft(
                     step_id="s1",
-                    tool_calls=[CoreToolCall(id="c1", name="read_file", arguments={})],
+                    tool_calls=[CoreToolCall(tool_call_id="c1", name="read_file", arguments={})],
                 ),
             )
             with self.assertRaisesRegex(LedgerError, "do not match"):
@@ -358,6 +368,187 @@ class RedactionTests(unittest.TestCase):
         events = anyio.run(scenario)
         self.assertEqual(events[-1].content, "key=[redacted]")
 
+    def test_default_redactor_masks_known_secret_shapes(self) -> None:
+        redactor = RegexSecretRedactor()
+        masked = redactor.redact_text(
+            "openai sk-abcdefghijklmnopqrstuvwxyz123456 and"
+            " Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload"
+            " and api_key=hunter2hunter2"
+        )
+        self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz123456", masked)
+        self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", masked)
+        self.assertNotIn("hunter2hunter2", masked)
+        self.assertIn("[REDACTED:openai_key]", masked)
+        self.assertIn("[REDACTED:bearer_token]", masked)
+        self.assertIn("[REDACTED:credential]", masked)
+
+    def test_secret_tool_args_are_redacted_and_rehashed_before_append(self) -> None:
+        ledger = MemoryRunLedger(redactor=RegexSecretRedactor())
+        secret_args = {"path": "x.txt", "password": "supersecretvalue"}
+
+        async def scenario():
+            run_id = await _setup_proposed_batch(
+                ledger, decision=ToolCallDecision.ALLOWED, args=secret_args
+            )
+            events = await ledger.list_events(run_id)
+            invocation = await ledger.get_invocation("c1")
+            return events, invocation
+
+        events, invocation = anyio.run(scenario)
+        planned = next(e for e in events if e.type == "tool.batch_planned")
+        self.assertEqual(
+            planned.calls[0].args["password"], "[REDACTED:sensitive_key]"
+        )
+        # The hash binds approvals to the args as frozen in the ledger: it
+        # must cover the redacted form, or the aggregate would have rejected
+        # the event.
+        self.assertEqual(planned.calls[0].args_hash, args_hash_for(planned.calls[0].args))
+        self.assertEqual(invocation.args["password"], "[REDACTED:sensitive_key]")
+
+    def test_approval_preview_is_redacted_before_append(self) -> None:
+        ledger = MemoryRunLedger(redactor=RegexSecretRedactor())
+        secret_args = {"path": "x.txt", "password": "supersecretvalue"}
+
+        async def scenario():
+            run_id = await _setup_proposed_batch(
+                ledger,
+                decision=ToolCallDecision.REQUIRES_APPROVAL,
+                args=secret_args,
+            )
+            invocation = await ledger.get_invocation("c1")
+            await ledger.apply(
+                run_id,
+                ApprovalRequestedDraft(
+                    approval_id=f"appr_{run_id}_c1",
+                    tool_call_id="c1",
+                    args_hash=invocation.args_hash,
+                    title="t",
+                    reason="r",
+                    risk="medium",
+                    approval_preview={"tool": "write_file", "args": secret_args},
+                ),
+            )
+            return await ledger.get_approval(f"appr_{run_id}_c1")
+
+        approval = anyio.run(scenario)
+        self.assertEqual(
+            approval.approval_preview["args"]["password"],
+            "[REDACTED:sensitive_key]",
+        )
+
+    def test_artifact_content_is_redacted_before_write(self) -> None:
+        ledger = MemoryRunLedger(redactor=RegexSecretRedactor())
+
+        async def scenario():
+            run = await ledger.create_run("q")
+            artifact = await ledger.put_artifact(
+                run.id, "tool_observation", "token sk-abcdefghijklmnopqrstuvwxyz123456"
+            )
+            return await ledger.get_artifact_text(artifact.id)
+
+        text = anyio.run(scenario)
+        self.assertEqual(text, "token [REDACTED:openai_key]")
+
+    def test_context_redact_stage_masks_message_content(self) -> None:
+        from knuth_runtime.context import ContextView, RunContext
+
+        redactor = RegexSecretRedactor()
+        view = ContextView(
+            run_id="r1",
+            messages=[
+                InferenceMessage(
+                    role=InferenceRole.SYSTEM,
+                    content="Use api_key=hunter2hunter2 for the backend.",
+                )
+            ],
+            tools=[],
+        )
+
+        redacted = anyio.run(redactor.redact, RunContext(run_id="r1"), view)
+        self.assertEqual(
+            redacted.messages[0].content,
+            "Use api_key=[REDACTED:credential] for the backend.",
+        )
+
+
+async def _drive_full_run(ledger) -> str:
+    """A complete run: approval round-trip, execution, batch close, success."""
+    run_id = await _setup_awaiting_approval(ledger)
+    await ledger.apply(
+        run_id,
+        ApprovalResolvedDraft(
+            approval_id=f"appr_{run_id}_c1", resolution="approved"
+        ),
+    )
+    await ledger.apply(run_id, RunResumedDraft(cause="user_resume"))
+    await ledger.apply(
+        run_id,
+        ToolInvocationStartedDraft(
+            tool_call_id="c1", attempt=1
+        ),
+    )
+    await ledger.apply(
+        run_id,
+        ToolInvocationCompletedDraft(
+            tool_call_id="c1",
+            tool_name="write_file",
+            outcome="succeeded",
+            observation="ok",
+        ),
+    )
+    await ledger.apply(run_id, ToolBatchClosedDraft(batch_id="b1"))
+    await ledger.apply(run_id, RunSucceededDraft(answer="done", turns=1))
+    return run_id
+
+
+class RefoldTests(unittest.TestCase):
+    def _projections(self, ledger, run_id):
+        async def scenario():
+            return (
+                await ledger.get_run(run_id),
+                await ledger.get_invocation("c1"),
+                await ledger.get_approval(f"appr_{run_id}_c1"),
+            )
+
+        return anyio.run(scenario)
+
+    def test_refold_rebuilds_identical_projections(self) -> None:
+        # Projections are derived caches (design rule three): replaying the
+        # event log must land on byte-identical state on both backends.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for ledger in (
+                MemoryRunLedger(),
+                SQLiteRunLedger(Path(temp_dir, "k.db")),
+            ):
+                with self.subTest(ledger=type(ledger).__name__):
+                    run_id = anyio.run(_drive_full_run, ledger)
+                    before = self._projections(ledger, run_id)
+                    stats = anyio.run(ledger.refold)
+                    after = self._projections(ledger, run_id)
+                    self.assertEqual(stats.runs, 1)
+                    self.assertGreater(stats.events, 0)
+                    for original, refolded in zip(before, after, strict=True):
+                        self.assertEqual(
+                            original.model_dump(), refolded.model_dump()
+                        )
+
+    def test_refold_repairs_corrupted_projection(self) -> None:
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir, "k.db")
+            ledger = SQLiteRunLedger(db_path)
+            run_id = anyio.run(_drive_full_run, ledger)
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("update runs set status = 'failed'")
+                conn.execute("update tool_invocations set status = 'unknown'")
+
+            anyio.run(ledger.refold)
+
+            run, invocation, _ = self._projections(ledger, run_id)
+            self.assertEqual(run.status, RunStatus.SUCCEEDED)
+            self.assertEqual(invocation.status, ToolInvocationStatus.SUCCEEDED)
+
 
 async def _setup_proposed_batch(
     ledger,
@@ -377,7 +568,7 @@ async def _setup_proposed_batch(
         run.id,
         ModelCompletedDraft(
             step_id="s1",
-            tool_calls=[CoreToolCall(id="c1", name=tool_name, arguments=args)],
+            tool_calls=[CoreToolCall(tool_call_id="c1", name=tool_name, arguments=args)],
         ),
     )
     await ledger.apply(
@@ -484,7 +675,7 @@ class EventDrivenRuntimeTests(unittest.TestCase):
                             content="",
                             tool_calls=[
                                 CoreToolCall(
-                                    id="call-1",
+                                    tool_call_id="call-1",
                                     name="read_file",
                                     arguments={"path": "fact.txt"},
                                 )
@@ -549,7 +740,7 @@ class EventDrivenRuntimeTests(unittest.TestCase):
                             role=InferenceRole.ASSISTANT,
                             tool_calls=[
                                 CoreToolCall(
-                                    id="call-write",
+                                    tool_call_id="call-write",
                                     name="write_file",
                                     arguments={"path": "x.txt", "content": "hello"},
                                 )
@@ -592,7 +783,7 @@ class EventDrivenRuntimeTests(unittest.TestCase):
                             role=InferenceRole.ASSISTANT,
                             tool_calls=[
                                 CoreToolCall(
-                                    id="call-write",
+                                    tool_call_id="call-write",
                                     name="write_file",
                                     arguments={"path": "x.txt", "content": "hello"},
                                 )
@@ -621,7 +812,7 @@ class EventDrivenRuntimeTests(unittest.TestCase):
                         role=InferenceRole.ASSISTANT,
                         tool_calls=[
                             CoreToolCall(
-                                id="call-shell",
+                                tool_call_id="call-shell",
                                 name="shell",
                                 arguments={"command": "date"},
                             )
@@ -695,7 +886,7 @@ class EventDrivenRuntimeTests(unittest.TestCase):
                         role=InferenceRole.ASSISTANT,
                         tool_calls=[
                             CoreToolCall(
-                                id="call-1",
+                                tool_call_id="call-1",
                                 name="read_file",
                                 arguments={"path": "big.txt"},
                             )
@@ -712,7 +903,7 @@ class EventDrivenRuntimeTests(unittest.TestCase):
             event for event in events if event.type == "tool.invocation_completed"
         ]
         self.assertIsNone(completed[0].observation)
-        self.assertIsNotNone(completed[0].observation_ref)
+        self.assertIsNotNone(completed[0].artifact_ref)
         self.assertTrue(completed[0].observation_preview)
         # The model still sees the full text through the conversation fold.
         final_turn = client.captured_messages[-1]
@@ -755,7 +946,6 @@ class CrashRecoveryTests(unittest.TestCase):
                 run_id,
                 ToolInvocationStartedDraft(
                     tool_call_id="c1",
-                    idempotency_key=f"{run_id}:c1:1",
                     attempt=1,
                 ),
             )
@@ -817,6 +1007,105 @@ class CrashRecoveryTests(unittest.TestCase):
             self.assertEqual(resolved.status, ToolInvocationStatus.SUCCEEDED)
             final = self._resume(runtime, run_id)
             self.assertEqual(final.status, RunStatus.SUCCEEDED)
+
+    def test_recover_scan_settles_retryable_work_and_pauses_run(self) -> None:
+        ledger = MemoryRunLedger()
+        run_id = self._simulate_crash_mid_execution(ledger, effect=ToolEffect.READ)
+        with tempfile.TemporaryDirectory() as workspace:
+            runtime = self._runtime_with_ledger(
+                workspace,
+                ScriptedInferenceClient(
+                    [InferenceMessage(role=InferenceRole.ASSISTANT, content="done")]
+                ),
+                ledger,
+            )
+            reports = anyio.run(runtime.recover_crashed_runs)
+            self.assertEqual(
+                reports, [CrashRecoveryReport(run_id=run_id, failed=1, unknown=0)]
+            )
+            self.assertEqual(anyio.run(runtime.status, run_id), RunStatus.PAUSED)
+
+            async def invocation_status():
+                return (await ledger.get_invocation("c1")).status
+
+            self.assertEqual(anyio.run(invocation_status), ToolInvocationStatus.FAILED)
+
+            # A recovered run resumes normally: the loop closes the settled
+            # batch and the model sees the crash observation.
+            result = self._resume(runtime, run_id)
+            self.assertEqual(result.status, RunStatus.SUCCEEDED)
+
+    def test_recover_scan_marks_external_write_unknown(self) -> None:
+        ledger = MemoryRunLedger()
+        run_id = self._simulate_crash_mid_execution(
+            ledger, effect=ToolEffect.EXTERNAL_WRITE
+        )
+        with tempfile.TemporaryDirectory() as workspace:
+            runtime = self._runtime_with_ledger(
+                workspace, ScriptedInferenceClient([]), ledger
+            )
+            reports = anyio.run(runtime.recover_crashed_runs)
+            self.assertEqual(
+                reports, [CrashRecoveryReport(run_id=run_id, failed=0, unknown=1)]
+            )
+
+            async def invocation_status():
+                return (await ledger.get_invocation("c1")).status
+
+            self.assertEqual(
+                anyio.run(invocation_status), ToolInvocationStatus.UNKNOWN
+            )
+
+    def test_recover_scan_skips_runs_that_are_not_running(self) -> None:
+        ledger = MemoryRunLedger()
+
+        async def scenario():
+            await ledger.create_run("idle")
+            runtime = build_memory_runtime(
+                inference_client=ScriptedInferenceClient([]),
+                inference_config=InferenceConfig(),
+                ledger=ledger,
+            )
+            return await runtime.recover_crashed_runs()
+
+        self.assertEqual(anyio.run(scenario), [])
+
+
+class DebugSinkTests(unittest.TestCase):
+    def test_sink_appends_one_jsonl_line_per_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sink = DebugEventSink(temp_dir)
+            event = emit_transient_runtime_event(
+                "run-1",
+                ModelReasoningDeltaDraft(delta="thinking out loud"),
+                event_id="evt-1",
+                created_at="2026-06-11T00:00:00Z",
+            )
+            anyio.run(sink.handle_event, event)
+            anyio.run(sink.handle_event, event)
+
+            lines = Path(temp_dir, "run-1.jsonl").read_text().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("thinking out loud", lines[0])
+
+    def test_build_sqlite_runtime_wires_debug_sink_per_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = build_sqlite_runtime(
+                inference_client=ScriptedInferenceClient(
+                    [InferenceMessage(role=InferenceRole.ASSISTANT, content="hi")]
+                ),
+                inference_config=InferenceConfig(),
+                db_path=Path(temp_dir, "k.db"),
+                debug_sink_dir=Path(temp_dir, "debug"),
+            )
+            result = anyio.run(runtime.run_once, "hello")
+            content = Path(
+                temp_dir, "debug", f"{result.run_id}.jsonl"
+            ).read_text()
+        # Both transient and durable events land in the sink; transient ones
+        # (reasoning, raw deltas) exist nowhere else.
+        self.assertIn("run.invocation.started", content)
+        self.assertIn("run.succeeded", content)
 
 
 class StreamingTextClient:
@@ -957,7 +1246,7 @@ class SystemPreambleTests(unittest.TestCase):
                         content="",
                         tool_calls=[
                             CoreToolCall(
-                                id="call-1",
+                                tool_call_id="call-1",
                                 name="read_file",
                                 arguments={"path": "fact.txt"},
                             )
@@ -1088,7 +1377,7 @@ class StreamingRuntimeTests(unittest.TestCase):
                             content="",
                             tool_calls=[
                                 CoreToolCall(
-                                    id="call-1",
+                                    tool_call_id="call-1",
                                     name="read_file",
                                     arguments={"path": "fact.txt"},
                                 )

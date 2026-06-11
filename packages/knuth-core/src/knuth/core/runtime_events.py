@@ -39,7 +39,6 @@ class RuntimeEventDraftBase(KnuthModel):
 class RunCreatedDraft(RuntimeEventDraftBase):
     type: Literal["run.created"] = "run.created"
     query: str
-    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class UserMessageDraft(RuntimeEventDraftBase):
@@ -127,7 +126,7 @@ class ApprovalRequestedDraft(RuntimeEventDraftBase):
     title: str
     reason: str
     risk: str
-    preview: dict[str, Any] = Field(default_factory=dict)
+    approval_preview: dict[str, Any] = Field(default_factory=dict)
 
 
 class ApprovalResolvedDraft(RuntimeEventDraftBase):
@@ -140,7 +139,6 @@ class ApprovalResolvedDraft(RuntimeEventDraftBase):
 class ToolInvocationStartedDraft(RuntimeEventDraftBase):
     type: Literal["tool.invocation_started"] = "tool.invocation_started"
     tool_call_id: str
-    idempotency_key: str
     attempt: int = 1
 
 
@@ -150,9 +148,9 @@ class ToolInvocationCompletedDraft(RuntimeEventDraftBase):
     tool_name: str
     outcome: Literal["succeeded", "failed", "denied"]
     observation: str | None = None
-    observation_ref: str | None = None
+    artifact_ref: str | None = None
     observation_preview: str | None = None
-    meta: dict[str, Any] = Field(default_factory=dict)
+    tool_status: str | None = None
 
 
 class ToolInvocationMarkedUnknownDraft(RuntimeEventDraftBase):

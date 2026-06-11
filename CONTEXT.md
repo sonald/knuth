@@ -97,7 +97,7 @@ A derived, rebuildable read model (runs, tool invocations, approvals, conversati
 _Avoid_: authoritative state, source of truth, cache that can silently drift
 
 **ToolInvocation**:
-The per-tool-call state machine projection, keyed by `tool_call_id` and carrying `args_hash`, `effect`, and `idempotency_key`. Its states are proposed, awaiting_approval, approved, denied, running, succeeded, failed, and unknown. It is the unit the agent loop schedules and the unit crash recovery reasons about; it subsumes what other designs call a pending action or execution record.
+The per-tool-call state machine projection, keyed by `tool_call_id` and carrying `args_hash` and `effect`. Its states are proposed, awaiting_approval, approved, denied, running, succeeded, failed, and unknown. It is the unit the agent loop schedules and the unit crash recovery reasons about; it subsumes what other designs call a pending action or execution record.
 _Avoid_: tool intent, pending action, execution log entry, queue item
 
 **ToolBatch**:

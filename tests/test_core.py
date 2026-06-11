@@ -43,7 +43,7 @@ class CoreModelTests(unittest.TestCase):
             content=None,
             tool_calls=[
                 ToolCall(
-                    id="call-1",
+                    tool_call_id="call-1",
                     name="read_file",
                     arguments={"path": "README.md"},
                 )
@@ -56,7 +56,7 @@ class CoreModelTests(unittest.TestCase):
         self.assertEqual(payload["tool_calls"][0]["id"], "call-1")
         self.assertIn('"README.md"', payload["tool_calls"][0]["function"]["arguments"])
 
-    def test_typed_runtime_event_allows_forward_compatible_extra_fields(self) -> None:
+    def test_typed_runtime_event_does_not_keep_extra_fields(self) -> None:
         event = RunCreated(
             id="evt-1",
             run_id="run-1",
@@ -68,7 +68,8 @@ class CoreModelTests(unittest.TestCase):
         )
 
         self.assertEqual(event.schema_version, "v0")
-        self.assertEqual(event.__pydantic_extra__["future_field"], "kept")
+        self.assertFalse(hasattr(event, "future_field"))
+        self.assertIsNone(event.__pydantic_extra__)
 
     def test_run_invocation_events_are_transient_runtime_events(self) -> None:
         started = emit_transient_runtime_event(
@@ -92,7 +93,7 @@ class CoreModelTests(unittest.TestCase):
         self.assertEqual(ended.status, "succeeded")
 
     def test_tool_call_effective_id_falls_back_to_position(self) -> None:
-        self.assertEqual(ToolCall(id="call-1", name="t").effective_id, "call-1")
+        self.assertEqual(ToolCall(tool_call_id="call-1", name="t").effective_id, "call-1")
         self.assertEqual(ToolCall(name="t", index=2).effective_id, "call_2")
 
     def test_stored_event_round_trips_to_its_own_class(self) -> None:

@@ -87,10 +87,14 @@ class RunLedgerState:
     pending_approvals: tuple[Approval, ...]
 
 
+@dataclass(frozen=True)
+class RefoldStats:
+    runs: int
+    events: int
+
+
 class RunLedger(Protocol):
-    async def create_run(
-        self, query: str, metadata: dict[str, Any] | None = None
-    ) -> AgentRun:
+    async def create_run(self, query: str) -> AgentRun:
         ...
 
     async def apply(
@@ -101,7 +105,9 @@ class RunLedger(Protocol):
     async def get_run(self, run_id: str) -> AgentRun:
         ...
 
-    async def list_runs(self, limit: int = 20) -> list[AgentRun]:
+    async def list_runs(
+        self, limit: int = 20, status: RunStatus | None = None
+    ) -> list[AgentRun]:
         ...
 
     async def list_events(
@@ -125,6 +131,9 @@ class RunLedger(Protocol):
         ...
 
     async def get_artifact_text(self, artifact_id: str) -> str:
+        ...
+
+    async def refold(self) -> RefoldStats:
         ...
 
 
@@ -215,14 +224,17 @@ def reduce_run_event(
                 status=RunStatus.CREATED,
                 created_at=now,
                 updated_at=now,
-                metadata=draft.metadata,
                 last_seq=seq,
             )
         )
 
     if view.run is None:
         raise LedgerError(f"unknown run: {run_id}")
-    reducer = _REDUCERS.get(type(draft))
+    # MRO lookup so stored events (draft subclasses) replay through the same
+    # reducers during refold.
+    reducer = next(
+        (_REDUCERS[cls] for cls in type(draft).__mro__ if cls in _REDUCERS), None
+    )
     if reducer is None:
         raise LedgerError(f"unsupported event type: {draft.type}")
     ctx = _ReduceContext(
@@ -385,7 +397,7 @@ def _reduce_tool_batch_planned(
                 args=call.args,
                 args_hash=call.args_hash,
                 status=ToolInvocationStatus.PROPOSED,
-                updated_seq=ctx.seq,
+                last_event_seq=ctx.seq,
             )
         )
     ctx.run.open_batch_id = draft.batch_id
@@ -412,10 +424,10 @@ def _reduce_tool_proposed(ctx: _ReduceContext, draft: ToolProposedDraft) -> _Mut
         "status": status_by_decision[draft.decision],
         "effect": draft.effect,
         "risk": draft.risk,
-        "updated_seq": ctx.seq,
+        "last_event_seq": ctx.seq,
     }
     if draft.decision == ToolCallDecision.DENIED:
-        updates["denial_reason"] = (
+        updates["denied_observation"] = (
             draft.error.message if draft.error else "denied by policy"
         )
     ctx.mutations.invocations.append(invocation.model_copy(update=updates))
@@ -450,13 +462,13 @@ def _reduce_approval_requested(
             title=draft.title,
             reason=draft.reason,
             risk=draft.risk,
-            preview=draft.preview,
+            approval_preview=draft.approval_preview,
             created_at=ctx.now,
         )
     )
     ctx.mutations.invocations.append(
         invocation.model_copy(
-            update={"approval_id": draft.approval_id, "updated_seq": ctx.seq}
+            update={"approval_id": draft.approval_id, "last_event_seq": ctx.seq}
         )
     )
     ctx.run.status = RunStatus.WAITING_APPROVAL
@@ -489,12 +501,12 @@ def _reduce_approval_resolved(
         invocation.status == ToolInvocationStatus.AWAITING_APPROVAL,
         f"approval target is not awaiting approval: {invocation.status}",
     )
-    updates: dict[str, Any] = {"updated_seq": ctx.seq}
+    updates: dict[str, Any] = {"last_event_seq": ctx.seq}
     if approved:
         updates["status"] = ToolInvocationStatus.APPROVED
     else:
         updates["status"] = ToolInvocationStatus.DENIED
-        updates["denial_reason"] = "denied by user"
+        updates["denied_observation"] = "denied by user"
     ctx.mutations.invocations.append(invocation.model_copy(update=updates))
     return ctx.mutations
 
@@ -513,16 +525,15 @@ def _reduce_tool_invocation_started(
         f"tool.invocation_started requires approved, got {invocation.status}",
     )
     _require(
-        draft.attempt == invocation.attempts + 1,
-        f"attempt {draft.attempt} does not follow attempts {invocation.attempts}",
+        draft.attempt == invocation.attempt + 1,
+        f"attempt {draft.attempt} does not follow attempt {invocation.attempt}",
     )
     ctx.mutations.invocations.append(
         invocation.model_copy(
             update={
                 "status": ToolInvocationStatus.RUNNING,
-                "attempts": invocation.attempts + 1,
-                "idempotency_key": draft.idempotency_key,
-                "updated_seq": ctx.seq,
+                "attempt": invocation.attempt + 1,
+                "last_event_seq": ctx.seq,
             }
         )
     )
@@ -537,8 +548,8 @@ def _reduce_tool_invocation_completed(
     if draft.outcome == "denied":
         _require(
             invocation.status == ToolInvocationStatus.DENIED
-            and not invocation.observed,
-            "denied observation backfill requires an unobserved denied invocation",
+            and not invocation.observation_recorded,
+            "denied observation backfill requires a denied invocation without observation",
         )
         new_status = ToolInvocationStatus.DENIED
     else:
@@ -557,8 +568,8 @@ def _reduce_tool_invocation_completed(
         invocation.model_copy(
             update={
                 "status": new_status,
-                "observed": True,
-                "updated_seq": ctx.seq,
+                "observation_recorded": True,
+                "last_event_seq": ctx.seq,
             }
         )
     )
@@ -576,7 +587,7 @@ def _reduce_tool_invocation_marked_unknown(
     )
     ctx.mutations.invocations.append(
         invocation.model_copy(
-            update={"status": ToolInvocationStatus.UNKNOWN, "updated_seq": ctx.seq}
+            update={"status": ToolInvocationStatus.UNKNOWN, "last_event_seq": ctx.seq}
         )
     )
     return ctx.mutations
@@ -593,7 +604,8 @@ def _reduce_tool_batch_closed(
     unobserved = [
         invocation.tool_call_id
         for invocation in ctx.view.invocations.values()
-        if invocation.batch_id == draft.batch_id and not invocation.observed
+        if invocation.batch_id == draft.batch_id
+        and not invocation.observation_recorded
     ]
     _require(
         not unobserved,
@@ -617,6 +629,32 @@ def _reduce_verification_failed(
         "verification.failed requires feedback; retrying without feedback is banned",
     )
     return ctx.mutations
+
+
+def fold_stored_events(
+    run_id: str, events: Iterable[StoredRuntimeEvent]
+) -> _AggregateView:
+    """Replay one run's durable events through the aggregate reducers.
+
+    Projections are derived caches (design rule three): this fold is the
+    canonical way to rebuild them, and doubles as a consistency check — a
+    ``LedgerError`` here means the stored stream violates its own invariants.
+    """
+    view = _AggregateView(run=None)
+    for event in events:
+        mutations = reduce_run_event(
+            view, event, run_id=run_id, seq=event.seq, now=event.created_at
+        )
+        view.run = mutations.run
+        for invocation in mutations.invocations:
+            view.invocations[invocation.tool_call_id] = invocation
+        for approval in mutations.approvals:
+            view.approvals[approval.id] = approval
+        if event.type == "model.completed":
+            view.last_model_tool_call_ids = tuple(
+                call.effective_id for call in event.tool_calls
+            )
+    return view
 
 
 def _open_batch_for(
@@ -658,17 +696,22 @@ class _LedgerMixin:
         draft = self._redact(draft)
         return await self._transact(run_id, draft)
 
-    async def create_run(
-        self, query: str, metadata: dict[str, Any] | None = None
-    ) -> AgentRun:
+    async def create_run(self, query: str) -> AgentRun:
         run_id = f"run_{uuid4().hex}"
-        await self.apply(run_id, RunCreatedDraft(query=query, metadata=metadata or {}))
+        await self.apply(run_id, RunCreatedDraft(query=query))
         return await self.get_run(run_id)
 
     def _redact(self, draft: DurableRuntimeEventDraft) -> DurableRuntimeEventDraft:
         if self._redactor is None:
             return draft
         return self._redactor.redact_event(draft)
+
+    def _redact_artifact(self, content: str) -> str:
+        """Artifacts referenced by events are semantically part of the ledger
+        (design §1.2), so they get the same pre-write redaction when the
+        redactor supports plain text."""
+        redact_text = getattr(self._redactor, "redact_text", None)
+        return redact_text(content) if redact_text is not None else content
 
     def _apply_in_txn(
         self, txn: Any, run_id: str, draft: DurableRuntimeEventDraft
@@ -765,8 +808,12 @@ class MemoryRunLedger(_LedgerMixin):
             raise KeyError(run_id)
         return run
 
-    async def list_runs(self, limit: int = 20) -> list[AgentRun]:
+    async def list_runs(
+        self, limit: int = 20, status: RunStatus | None = None
+    ) -> list[AgentRun]:
         runs = sorted(self._runs.values(), key=lambda run: run.created_at, reverse=True)
+        if status is not None:
+            runs = [run for run in runs if run.status == status]
         return runs[:limit]
 
     async def list_events(
@@ -811,6 +858,7 @@ class MemoryRunLedger(_LedgerMixin):
         raise KeyError(tool_call_id)
 
     async def put_artifact(self, run_id: str, kind: str, content: str) -> Artifact:
+        content = self._redact_artifact(content)
         artifact = Artifact(
             id=f"art_{uuid4().hex}",
             run_id=run_id,
@@ -825,6 +873,25 @@ class MemoryRunLedger(_LedgerMixin):
         if artifact_id not in self._artifacts:
             raise KeyError(artifact_id)
         return self._artifacts[artifact_id][1]
+
+    async def refold(self) -> RefoldStats:
+        async with self._lock:
+            runs: dict[str, AgentRun] = {}
+            invocations: dict[str, dict[str, ToolInvocation]] = {}
+            approvals: dict[str, Approval] = {}
+            total_events = 0
+            for run_id, events in self._events.items():
+                view = fold_stored_events(run_id, events)
+                total_events += len(events)
+                if view.run is None:
+                    continue
+                runs[run_id] = view.run
+                invocations[run_id] = dict(view.invocations)
+                approvals.update(view.approvals)
+            self._runs = runs
+            self._invocations = invocations
+            self._approvals = approvals
+            return RefoldStats(runs=len(runs), events=total_events)
 
 
 def _threaded[T, **P](fn: Callable[P, T]) -> Callable[P, Awaitable[T]]:
@@ -883,9 +950,9 @@ class SQLiteRunLedger(_LedgerMixin):
                   idx integer not null,
                   tool_name text not null,
                   status text not null,
-                  observed integer not null default 0,
+                  observation_recorded integer not null default 0,
                   data_json text not null,
-                  updated_seq integer not null
+                  last_event_seq integer not null
                 );
                 create table if not exists approvals (
                   id text primary key,
@@ -911,12 +978,17 @@ class SQLiteRunLedger(_LedgerMixin):
     def _guard_schema(self, conn) -> None:
         run_columns = {row[1] for row in conn.execute("pragma table_info(runs)")}
         event_columns = {row[1] for row in conn.execute("pragma table_info(events)")}
+        invocation_columns = {
+            row[1] for row in conn.execute("pragma table_info(tool_invocations)")
+        }
         approval_columns = {
             row[1] for row in conn.execute("pragma table_info(approvals)")
         }
         if (
             "last_seq" not in run_columns
             or "step_id" not in event_columns
+            or "observation_recorded" not in invocation_columns
+            or "last_event_seq" not in invocation_columns
             or "tool_call_id" not in approval_columns
         ):
             raise RuntimeError(
@@ -1037,11 +1109,12 @@ class SQLiteRunLedger(_LedgerMixin):
         conn.execute(
             "insert into tool_invocations"
             " (tool_call_id, run_id, batch_id, step_id, idx, tool_name, status,"
-            "  observed, data_json, updated_seq)"
+            "  observation_recorded, data_json, last_event_seq)"
             " values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             " on conflict(tool_call_id) do update set"
-            " status=excluded.status, observed=excluded.observed,"
-            " data_json=excluded.data_json, updated_seq=excluded.updated_seq",
+            " status=excluded.status,"
+            " observation_recorded=excluded.observation_recorded,"
+            " data_json=excluded.data_json, last_event_seq=excluded.last_event_seq",
             (
                 invocation.tool_call_id,
                 invocation.run_id,
@@ -1050,9 +1123,9 @@ class SQLiteRunLedger(_LedgerMixin):
                 invocation.index,
                 invocation.tool_name,
                 invocation.status.value,
-                1 if invocation.observed else 0,
+                1 if invocation.observation_recorded else 0,
                 invocation.model_dump_json(),
-                invocation.updated_seq,
+                invocation.last_event_seq,
             ),
         )
 
@@ -1084,14 +1157,18 @@ class SQLiteRunLedger(_LedgerMixin):
         return run
 
     @_threaded
-    def list_runs(self, limit: int = 20) -> list[AgentRun]:
+    def list_runs(
+        self, limit: int = 20, status: RunStatus | None = None
+    ) -> list[AgentRun]:
+        sql = "select data_json from runs"
+        params: tuple[Any, ...] = ()
+        if status is not None:
+            sql += " where status = ?"
+            params += (status.value,)
+        sql += " order by created_at desc limit ?"
+        params += (limit,)
         with self._connect() as conn:
-            return self._select(
-                conn,
-                AgentRun,
-                "select data_json from runs order by created_at desc limit ?",
-                (limit,),
-            )
+            return self._select(conn, AgentRun, sql, params)
 
     @_threaded
     def list_events(
@@ -1169,6 +1246,7 @@ class SQLiteRunLedger(_LedgerMixin):
 
     @_threaded
     def put_artifact(self, run_id: str, kind: str, content: str) -> Artifact:
+        content = self._redact_artifact(content)
         artifact = Artifact(
             id=f"art_{uuid4().hex}",
             run_id=run_id,
@@ -1200,3 +1278,38 @@ class SQLiteRunLedger(_LedgerMixin):
         if row is None:
             raise KeyError(artifact_id)
         return row[0]
+
+    @_threaded
+    def refold(self) -> RefoldStats:
+        # One transaction: a failed replay rolls back and leaves the existing
+        # projections untouched.
+        with self._connect() as conn:
+            run_ids = [
+                row[0]
+                for row in conn.execute("select distinct run_id from events")
+            ]
+            conn.execute("delete from runs")
+            conn.execute("delete from tool_invocations")
+            conn.execute("delete from approvals")
+            total_events = 0
+            for run_id in run_ids:
+                events = self._load_events(conn, run_id)
+                view = fold_stored_events(run_id, events)
+                total_events += len(events)
+                if view.run is None:
+                    continue
+                self._upsert_run(conn, view.run)
+                for invocation in view.invocations.values():
+                    self._upsert_invocation(conn, invocation)
+                for approval in view.approvals.values():
+                    self._upsert_approval(conn, approval)
+        return RefoldStats(runs=len(run_ids), events=total_events)
+
+    def _load_events(
+        self, conn: sqlite3.Connection, run_id: str
+    ) -> list[StoredRuntimeEvent]:
+        rows = conn.execute(
+            "select event_json from events where run_id = ? order by seq",
+            (run_id,),
+        ).fetchall()
+        return [parse_stored_runtime_event_json(row[0]) for row in rows]

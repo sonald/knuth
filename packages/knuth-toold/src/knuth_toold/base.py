@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from knuth.core.invocations import ToolEffect, ToolInvocation, ToolRisk
@@ -39,12 +38,6 @@ class ToolRuntimeContext:
 
     run_id: str
     tool_call_id: str
-    workspace_uri: str | None = None
-    idempotency_key: str | None = None
-
-    @property
-    def workspace_path(self) -> Path:
-        return Path(self.workspace_uri or ".").resolve()
 
 
 @runtime_checkable
