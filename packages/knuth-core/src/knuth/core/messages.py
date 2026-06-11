@@ -38,6 +38,13 @@ class ToolCall(KnuthModel):
     index: int = 0
     raw: dict[str, Any] = Field(default_factory=dict)
 
+    @property
+    def effective_id(self) -> str:
+        """Provider tool-call id, or the positional fallback when the provider
+        omitted one. Every consumer must share this fallback, or planned-batch
+        ids stop matching the model.completed tool calls."""
+        return self.id or f"call_{self.index}"
+
     def arguments_as_json(self) -> str:
         if self.arguments_json is not None:
             return self.arguments_json

@@ -91,6 +91,10 @@ class CoreModelTests(unittest.TestCase):
         self.assertEqual(ended.type, "run.invocation.ended")
         self.assertEqual(ended.status, "succeeded")
 
+    def test_tool_call_effective_id_falls_back_to_position(self) -> None:
+        self.assertEqual(ToolCall(id="call-1", name="t").effective_id, "call-1")
+        self.assertEqual(ToolCall(name="t", index=2).effective_id, "call_2")
+
     def test_stored_event_round_trips_to_its_own_class(self) -> None:
         # Regression: run.paused and run.cancelled share the same field shape;
         # without a type-discriminated union the JSON round trip used to pick

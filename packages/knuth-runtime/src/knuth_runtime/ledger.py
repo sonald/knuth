@@ -755,7 +755,7 @@ class MemoryRunLedger(_LedgerMixin):
         for event in reversed(self._events.get(run_id, [])):
             if event.type == "model.completed":
                 return tuple(
-                    call.id or f"call_{call.index}" for call in event.tool_calls
+                    call.effective_id for call in event.tool_calls
                 )
         return ()
 
@@ -1006,7 +1006,7 @@ class SQLiteRunLedger(_LedgerMixin):
         if row is None:
             return ()
         event = parse_stored_runtime_event_json(row[0])
-        return tuple(call.id or f"call_{call.index}" for call in event.tool_calls)
+        return tuple(call.effective_id for call in event.tool_calls)
 
     def _upsert_run(self, conn, run: AgentRun) -> None:
         conn.execute(

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Protocol
 
@@ -114,18 +114,15 @@ class ListenerStats:
 
 @dataclass
 class _MutableListenerStats:
+    """Mutable mirror of :class:`ListenerStats`; same fields by construction."""
+
     handled: int = 0
     dropped: int = 0
     failed: bool = False
     disabled: bool = False
 
     def snapshot(self) -> ListenerStats:
-        return ListenerStats(
-            handled=self.handled,
-            dropped=self.dropped,
-            failed=self.failed,
-            disabled=self.disabled,
-        )
+        return ListenerStats(**asdict(self))
 
 
 @dataclass

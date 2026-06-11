@@ -161,45 +161,46 @@ async def _run_step(
         config=inference_config.model_copy(update={"run_id": run_id}),
         runtime=runtime_options,
     ):
-        if isinstance(event, InferenceReasoningDelta):
-            await invocation.emit(ModelReasoningDeltaDraft(delta=event.delta))
-        elif isinstance(event, InferenceReasoningCompleted):
-            await invocation.emit(ModelReasoningCompletedDraft())
-        elif isinstance(event, InferenceContentDelta):
-            await invocation.emit(ModelContentDeltaDraft(delta=event.delta))
-        elif isinstance(event, InferenceToolCallStarted):
-            await invocation.emit(
-                ModelToolCallStartedDraft(index=event.index, tool_call_id=event.id)
-            )
-        elif isinstance(event, InferenceToolCallDelta):
-            await invocation.emit(
-                ModelToolCallDeltaDraft(
-                    index=event.index,
-                    tool_call_id=event.id,
-                    name_delta=event.name_delta,
-                    arguments_json_delta=event.arguments_json_delta,
-                    raw=event.raw,
+        match event:
+            case InferenceReasoningDelta():
+                await invocation.emit(ModelReasoningDeltaDraft(delta=event.delta))
+            case InferenceReasoningCompleted():
+                await invocation.emit(ModelReasoningCompletedDraft())
+            case InferenceContentDelta():
+                await invocation.emit(ModelContentDeltaDraft(delta=event.delta))
+            case InferenceToolCallStarted():
+                await invocation.emit(
+                    ModelToolCallStartedDraft(index=event.index, tool_call_id=event.id)
                 )
-            )
-        elif isinstance(event, InferenceToolCallCompleted):
-            await invocation.emit(
-                ModelToolCallCompletedDraft(tool_call=event.tool_call)
-            )
-        elif isinstance(event, InferenceFailed):
-            stream_error = event.error
-            break
-        elif isinstance(event, InferenceAborted):
-            await invocation.emit(
-                ModelAbortedDraft(step_id=step_id, reason=event.reason)
-            )
-            await invocation.emit(
-                RunPausedDraft(reason=f"model_aborted: {event.reason}")
-            )
-            return RunStatus.PAUSED
-        elif isinstance(event, InferenceGenerationCompleted):
-            assistant_message = event.message
-            finish_reason = event.finish_reason
-            usage = event.usage
+            case InferenceToolCallDelta():
+                await invocation.emit(
+                    ModelToolCallDeltaDraft(
+                        index=event.index,
+                        tool_call_id=event.id,
+                        name_delta=event.name_delta,
+                        arguments_json_delta=event.arguments_json_delta,
+                        raw=event.raw,
+                    )
+                )
+            case InferenceToolCallCompleted():
+                await invocation.emit(
+                    ModelToolCallCompletedDraft(tool_call=event.tool_call)
+                )
+            case InferenceFailed():
+                stream_error = event.error
+                break
+            case InferenceAborted():
+                await invocation.emit(
+                    ModelAbortedDraft(step_id=step_id, reason=event.reason)
+                )
+                await invocation.emit(
+                    RunPausedDraft(reason=f"model_aborted: {event.reason}")
+                )
+                return RunStatus.PAUSED
+            case InferenceGenerationCompleted():
+                assistant_message = event.message
+                finish_reason = event.finish_reason
+                usage = event.usage
 
     if stream_error is not None:
         await invocation.emit(ModelFailedDraft(step_id=step_id, error=stream_error))
@@ -219,7 +220,7 @@ async def _run_step(
     # ledger by construction.
     tool_calls = [
         ToolCall(
-            id=call.id or f"call_{call.index}",
+            id=call.effective_id,
             name=call.name,
             arguments=call.arguments,
             index=call.index,
@@ -243,7 +244,7 @@ async def _run_step(
                 step_id=step_id,
                 calls=[
                     PlannedToolCall(
-                        tool_call_id=call.id or f"call_{call.index}",
+                        tool_call_id=call.effective_id,
                         index=call.index,
                         name=call.name,
                         args=call.arguments,

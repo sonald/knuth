@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from contextlib import AsyncExitStack
 from typing import Self
 
 import anyio
@@ -49,8 +50,8 @@ class RunSession:
         self._run_id = run_id
         self._initial_listeners = tuple(listeners)
         self._runtime_options = runtime_options
-        self._task_group_cm = None
-        self._task_group = None
+        self._exit_stack: AsyncExitStack | None = None
+        self._task_group: anyio.abc.TaskGroup | None = None
         self._observation: LiveRuntimeObservation | None = None
         self._done = anyio.Event()
         self._entered = False
@@ -71,31 +72,41 @@ class RunSession:
         if self._entered:
             raise RuntimeError("RunSession cannot be entered more than once")
         self._entered = True
-        self._task_group_cm = anyio.create_task_group()
-        self._task_group = await self._task_group_cm.__aenter__()
-        self._observation = LiveRuntimeObservation(self._task_group)
-        for listener in self._initial_listeners:
-            await self._observation.add_listener(listener)
-        await self._prepare_run_id()
-        invocation = RuntimeInvocation(
-            run_id=self.run_id,
-            mode=self._mode,
-            services=self._services,
-            observation=self._observation,
-        )
-        await invocation.emit(RunInvocationStartedDraft(mode=self._mode))
-        await self._prepare_run(invocation)
-        self._task_group.start_soon(self._drive, invocation)
+        self._exit_stack = AsyncExitStack()
+        try:
+            self._task_group = await self._exit_stack.enter_async_context(
+                anyio.create_task_group()
+            )
+            self._observation = LiveRuntimeObservation(self._task_group)
+            for listener in self._initial_listeners:
+                await self._observation.add_listener(listener)
+            await self._prepare_run_id()
+            invocation = RuntimeInvocation(
+                run_id=self.run_id,
+                mode=self._mode,
+                services=self._services,
+                observation=self._observation,
+            )
+            await invocation.emit(RunInvocationStartedDraft(mode=self._mode))
+            await self._prepare_run(invocation)
+            self._task_group.start_soon(self._drive, invocation)
+        except BaseException:
+            # A failed enter must still unwind the task group, or its
+            # listener drain tasks would leak.
+            if self._task_group is not None:
+                self._task_group.cancel_scope.cancel()
+            await self._exit_stack.aclose()
+            raise
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        if self._task_group is None or self._task_group_cm is None:
+        if self._task_group is None or self._exit_stack is None:
             return
         if not self._done.is_set():
             self._task_group.cancel_scope.cancel()
         elif self._observation is not None:
             await self._observation.aclose()
-        await self._task_group_cm.__aexit__(exc_type, exc, tb)
+        await self._exit_stack.__aexit__(exc_type, exc, tb)
 
     async def add_listener(self, listener: RuntimeEventListener) -> ListenerHandle:
         if not self._entered or self._observation is None:

@@ -41,16 +41,11 @@ class AgentRuntime:
 
     def __init__(
         self,
-        services: RuntimeServices | None = None,
-        inference_config: InferenceConfig | None = None,
+        services: RuntimeServices,
+        inference_config: InferenceConfig,
     ) -> None:
         self._services = services
         self._inference_config = inference_config
-
-    def _require_services(self) -> RuntimeServices:
-        if self._services is None:
-            raise RuntimeError("runtime is not configured")
-        return self._services
 
     async def run_once(self, prompt: str) -> RunResult:
         async with self.start(prompt) as session:
@@ -62,12 +57,9 @@ class AgentRuntime:
         *,
         listeners: Iterable[RuntimeEventListener] = (),
     ) -> RunSession:
-        services = self._require_services()
-        if self._inference_config is None:
-            raise RuntimeError("runtime is not configured")
         return RunSession(
             mode="start",
-            services=services,
+            services=self._services,
             inference_config=self._inference_config,
             prompt=prompt,
             listeners=listeners,
@@ -80,12 +72,9 @@ class AgentRuntime:
         *,
         listeners: Iterable[RuntimeEventListener] = (),
     ) -> RunSession:
-        services = self._require_services()
-        if self._inference_config is None:
-            raise RuntimeError("runtime is not configured")
         return RunSession(
             mode="continue",
-            services=services,
+            services=self._services,
             inference_config=self._inference_config,
             run_id=run_id,
             prompt=prompt,
@@ -98,34 +87,30 @@ class AgentRuntime:
         *,
         listeners: Iterable[RuntimeEventListener] = (),
     ) -> RunSession:
-        services = self._require_services()
-        if self._inference_config is None:
-            raise RuntimeError("runtime is not configured")
         return RunSession(
             mode="resume",
-            services=services,
+            services=self._services,
             inference_config=self._inference_config,
             run_id=run_id,
             listeners=listeners,
         )
 
     async def approve(self, approval_id: str) -> Approval:
-        services = self._require_services()
-        approval = await services.ledger.get_approval(approval_id)
-        await services.ledger.apply(
-            approval.run_id,
-            ApprovalResolvedDraft(approval_id=approval_id, resolution="approved"),
-        )
-        return await services.ledger.get_approval(approval_id)
+        return await self._resolve_approval(approval_id, "approved")
 
     async def deny(self, approval_id: str) -> Approval:
-        services = self._require_services()
-        approval = await services.ledger.get_approval(approval_id)
-        await services.ledger.apply(
+        return await self._resolve_approval(approval_id, "denied")
+
+    async def _resolve_approval(
+        self, approval_id: str, resolution: Literal["approved", "denied"]
+    ) -> Approval:
+        ledger = self._services.ledger
+        approval = await ledger.get_approval(approval_id)
+        await ledger.apply(
             approval.run_id,
-            ApprovalResolvedDraft(approval_id=approval_id, resolution="denied"),
+            ApprovalResolvedDraft(approval_id=approval_id, resolution=resolution),
         )
-        return await services.ledger.get_approval(approval_id)
+        return await ledger.get_approval(approval_id)
 
     async def resolve_unknown(
         self,
@@ -137,13 +122,13 @@ class AgentRuntime:
 
         Appends the human-confirmed completion; the batch can close afterwards.
         """
-        services = self._require_services()
-        invocation = await services.ledger.get_invocation(tool_call_id)
+        ledger = self._services.ledger
+        invocation = await ledger.get_invocation(tool_call_id)
         observation = (
             f"Outcome confirmed by user: the tool call {outcome}."
             + (f" Note: {note}" if note else "")
         )
-        await services.ledger.apply(
+        await ledger.apply(
             invocation.run_id,
             ToolInvocationCompletedDraft(
                 tool_call_id=tool_call_id,
@@ -153,11 +138,10 @@ class AgentRuntime:
                 meta={"resolved_by": "user"},
             ),
         )
-        return await services.ledger.get_invocation(tool_call_id)
+        return await ledger.get_invocation(tool_call_id)
 
     async def status(self, run_id: str) -> RunStatus:
-        services = self._require_services()
-        return (await services.ledger.get_run(run_id)).status
+        return (await self._services.ledger.get_run(run_id)).status
 
     async def pause(self, run_id: str) -> RunStatus:
         """Mark an in-flight run as paused so it can be resumed later.
@@ -165,26 +149,24 @@ class AgentRuntime:
         Only transitions runs that are actively progressing; waiting or
         terminal statuses are left untouched.
         """
-        services = self._require_services()
-        run = await services.ledger.get_run(run_id)
+        ledger = self._services.ledger
+        run = await ledger.get_run(run_id)
         if run.status in {RunStatus.CREATED, RunStatus.RUNNING}:
-            await services.ledger.apply(
-                run_id, RunPausedDraft(reason="paused by user")
-            )
-            run = await services.ledger.get_run(run_id)
+            await ledger.apply(run_id, RunPausedDraft(reason="paused by user"))
+            run = await ledger.get_run(run_id)
         return run.status
 
     async def runs(self, limit: int = 20) -> list[AgentRun]:
-        return await self._require_services().ledger.list_runs(limit)
+        return await self._services.ledger.list_runs(limit)
 
     async def events(self, run_id: str) -> list[RuntimeEvent]:
-        return await self._require_services().ledger.list_events(run_id)
+        return await self._services.ledger.list_events(run_id)
 
     async def tools(self) -> list[dict]:
-        return await self._require_services().tool_broker.list_visible_tools("cli")
+        return await self._services.tool_broker.list_visible_tools("cli")
 
     async def pending_approvals(self, run_id: str | None = None) -> list[Approval]:
-        return await self._require_services().ledger.pending_approvals(run_id)
+        return await self._services.ledger.pending_approvals(run_id)
 
 
 class _DemoInferenceClient:
