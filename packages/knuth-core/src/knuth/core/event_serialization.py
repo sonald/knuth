@@ -1,79 +1,40 @@
 from __future__ import annotations
 
-from pydantic import TypeAdapter
+from typing import Annotated, get_args
+
+from pydantic import Field, TypeAdapter
 
 from knuth.core.runtime_events import (
-    ApprovalRequested,
-    ApprovalResolved,
     DurableRuntimeEventDraft,
-    ModelAborted,
-    ModelCompleted,
-    ModelContentDelta,
-    ModelFailed,
-    ModelReasoningCompleted,
-    ModelReasoningDelta,
-    ModelToolCallCompleted,
-    ModelToolCallDelta,
-    ModelToolCallStarted,
-    RunCancelled,
-    RunCreated,
-    RunFailed,
-    RunInvocationEnded,
-    RunInvocationStarted,
-    RunPaused,
-    RunResumed,
-    RunSucceeded,
-    StepStarted,
     StoredRuntimeEvent,
     StoredRuntimeEventBase,
-    ToolBatchClosed,
-    ToolBatchPlanned,
-    ToolInvocationCompleted,
-    ToolInvocationMarkedUnknown,
-    ToolInvocationStarted,
-    ToolProposed,
     TransientRuntimeEvent,
     TransientRuntimeEventBase,
     TransientRuntimeEventDraft,
-    UserMessage,
-    VerificationFailed,
 )
 
-_STORED_EVENT_BY_TYPE: dict[str, type[StoredRuntimeEventBase]] = {
-    "run.created": RunCreated,
-    "user.message": UserMessage,
-    "run.resumed": RunResumed,
-    "run.paused": RunPaused,
-    "run.cancelled": RunCancelled,
-    "run.failed": RunFailed,
-    "run.succeeded": RunSucceeded,
-    "step.started": StepStarted,
-    "model.completed": ModelCompleted,
-    "model.failed": ModelFailed,
-    "model.aborted": ModelAborted,
-    "tool.batch_planned": ToolBatchPlanned,
-    "tool.proposed": ToolProposed,
-    "approval.requested": ApprovalRequested,
-    "approval.resolved": ApprovalResolved,
-    "tool.invocation_started": ToolInvocationStarted,
-    "tool.invocation_completed": ToolInvocationCompleted,
-    "tool.invocation_marked_unknown": ToolInvocationMarkedUnknown,
-    "tool.batch_closed": ToolBatchClosed,
-    "verification.failed": VerificationFailed,
-}
 
-_TRANSIENT_EVENT_BY_TYPE: dict[str, type[TransientRuntimeEventBase]] = {
-    "model.reasoning.delta": ModelReasoningDelta,
-    "model.reasoning.completed": ModelReasoningCompleted,
-    "model.content.delta": ModelContentDelta,
-    "model.tool_call.started": ModelToolCallStarted,
-    "model.tool_call.delta": ModelToolCallDelta,
-    "model.tool_call.completed": ModelToolCallCompleted,
-    "run.invocation.started": RunInvocationStarted,
-    "run.invocation.ended": RunInvocationEnded,
-}
+def _registry_by_type(union: object) -> dict[str, type]:
+    """Derive the type-tag -> event-class registry from a union.
 
-_STORED_RUNTIME_EVENT_ADAPTER = TypeAdapter(StoredRuntimeEvent)
+    Every member declares ``type: Literal[...] = "..."``; the default is the
+    tag. Keeping this derived (not hand-written) means adding an event class
+    to the union is the only registration step.
+    """
+    return {cls.model_fields["type"].default: cls for cls in get_args(union)}
+
+
+_STORED_EVENT_BY_TYPE: dict[str, type[StoredRuntimeEventBase]] = _registry_by_type(
+    StoredRuntimeEvent
+)
+
+_TRANSIENT_EVENT_BY_TYPE: dict[str, type[TransientRuntimeEventBase]] = (
+    _registry_by_type(TransientRuntimeEvent)
+)
+
+_STORED_RUNTIME_EVENT_ADAPTER: TypeAdapter[StoredRuntimeEvent] = TypeAdapter(
+    Annotated[StoredRuntimeEvent, Field(discriminator="type")]
+)
 
 
 def store_runtime_event(

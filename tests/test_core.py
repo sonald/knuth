@@ -1,12 +1,19 @@
 import unittest
+from typing import get_args
 
 from knuth.core.events import (
+    RunCancelled,
     RunCreated,
     RunInvocationEndedDraft,
     RunInvocationStartedDraft,
     ModelToolCallStartedDraft,
+    StoredRuntimeEvent,
+    TransientRuntimeEvent,
     emit_transient_runtime_event,
+    parse_stored_runtime_event_json,
+    store_runtime_event,
 )
+from knuth.core.runtime_events import RunCancelledDraft
 from knuth.core.messages import InferenceMessage, InferenceRole, ToolCall
 from knuth.core.types import EventDurability
 
@@ -83,6 +90,29 @@ class CoreModelTests(unittest.TestCase):
         self.assertFalse(hasattr(started, "seq"))
         self.assertEqual(ended.type, "run.invocation.ended")
         self.assertEqual(ended.status, "succeeded")
+
+    def test_stored_event_round_trips_to_its_own_class(self) -> None:
+        # Regression: run.paused and run.cancelled share the same field shape;
+        # without a type-discriminated union the JSON round trip used to pick
+        # the structurally-first class (RunPaused) for a run.cancelled event.
+        stored = store_runtime_event(
+            "run-1",
+            3,
+            RunCancelledDraft(reason="user hit ctrl-c"),
+            event_id="evt-cancel",
+            created_at="2026-06-11T00:00:00Z",
+        )
+
+        parsed = parse_stored_runtime_event_json(stored.model_dump_json())
+
+        self.assertIsInstance(parsed, RunCancelled)
+        self.assertEqual(parsed, stored)
+
+    def test_every_union_member_declares_a_unique_type_tag(self) -> None:
+        for union in (StoredRuntimeEvent, TransientRuntimeEvent):
+            tags = [cls.model_fields["type"].default for cls in get_args(union)]
+            self.assertNotIn(None, tags)
+            self.assertEqual(len(tags), len(set(tags)))
 
     def test_model_tool_call_started_keeps_event_id_and_tool_call_id_separate(self) -> None:
         event = emit_transient_runtime_event(

@@ -277,54 +277,123 @@ class TransientRuntimeEventBase(KnuthModel):
     created_at: str
 
 
-def _stored(name: str, draft: type[RuntimeEventDraftBase]):
-    return type(name, (StoredRuntimeEventBase, draft), {})
+# Stored events are draft + storage envelope. The draft comes first so its
+# ``type: Literal[...]`` wins field resolution: that literal tag is what makes
+# the discriminated unions below parse each event back to its own class.
 
 
-RunCreated = _stored("RunCreated", RunCreatedDraft)
-UserMessage = _stored("UserMessage", UserMessageDraft)
-RunResumed = _stored("RunResumed", RunResumedDraft)
-RunPaused = _stored("RunPaused", RunPausedDraft)
-RunCancelled = _stored("RunCancelled", RunCancelledDraft)
-RunFailed = _stored("RunFailed", RunFailedDraft)
-RunSucceeded = _stored("RunSucceeded", RunSucceededDraft)
-StepStarted = _stored("StepStarted", StepStartedDraft)
-ModelCompleted = _stored("ModelCompleted", ModelCompletedDraft)
-ModelFailed = _stored("ModelFailed", ModelFailedDraft)
-ModelAborted = _stored("ModelAborted", ModelAbortedDraft)
-ToolBatchPlanned = _stored("ToolBatchPlanned", ToolBatchPlannedDraft)
-ToolProposed = _stored("ToolProposed", ToolProposedDraft)
-ApprovalRequested = _stored("ApprovalRequested", ApprovalRequestedDraft)
-ApprovalResolved = _stored("ApprovalResolved", ApprovalResolvedDraft)
-ToolInvocationStarted = _stored("ToolInvocationStarted", ToolInvocationStartedDraft)
-ToolInvocationCompleted = _stored(
-    "ToolInvocationCompleted", ToolInvocationCompletedDraft
-)
-ToolInvocationMarkedUnknown = _stored(
-    "ToolInvocationMarkedUnknown", ToolInvocationMarkedUnknownDraft
-)
-ToolBatchClosed = _stored("ToolBatchClosed", ToolBatchClosedDraft)
-VerificationFailed = _stored("VerificationFailed", VerificationFailedDraft)
+class RunCreated(RunCreatedDraft, StoredRuntimeEventBase):
+    pass
 
 
-def _transient(name: str, draft: type[TransientRuntimeEventDraftBase]):
-    return type(name, (TransientRuntimeEventBase, draft), {})
+class UserMessage(UserMessageDraft, StoredRuntimeEventBase):
+    pass
 
 
-ModelReasoningDelta = _transient("ModelReasoningDelta", ModelReasoningDeltaDraft)
-ModelReasoningCompleted = _transient(
-    "ModelReasoningCompleted", ModelReasoningCompletedDraft
-)
-ModelContentDelta = _transient("ModelContentDelta", ModelContentDeltaDraft)
-ModelToolCallStarted = _transient("ModelToolCallStarted", ModelToolCallStartedDraft)
-ModelToolCallDelta = _transient("ModelToolCallDelta", ModelToolCallDeltaDraft)
-ModelToolCallCompleted = _transient(
-    "ModelToolCallCompleted", ModelToolCallCompletedDraft
-)
-RunInvocationStarted = _transient(
-    "RunInvocationStarted", RunInvocationStartedDraft
-)
-RunInvocationEnded = _transient("RunInvocationEnded", RunInvocationEndedDraft)
+class RunResumed(RunResumedDraft, StoredRuntimeEventBase):
+    pass
+
+
+class RunPaused(RunPausedDraft, StoredRuntimeEventBase):
+    pass
+
+
+class RunCancelled(RunCancelledDraft, StoredRuntimeEventBase):
+    pass
+
+
+class RunFailed(RunFailedDraft, StoredRuntimeEventBase):
+    pass
+
+
+class RunSucceeded(RunSucceededDraft, StoredRuntimeEventBase):
+    pass
+
+
+class StepStarted(StepStartedDraft, StoredRuntimeEventBase):
+    pass
+
+
+class ModelCompleted(ModelCompletedDraft, StoredRuntimeEventBase):
+    pass
+
+
+class ModelFailed(ModelFailedDraft, StoredRuntimeEventBase):
+    pass
+
+
+class ModelAborted(ModelAbortedDraft, StoredRuntimeEventBase):
+    pass
+
+
+class ToolBatchPlanned(ToolBatchPlannedDraft, StoredRuntimeEventBase):
+    pass
+
+
+class ToolProposed(ToolProposedDraft, StoredRuntimeEventBase):
+    pass
+
+
+class ApprovalRequested(ApprovalRequestedDraft, StoredRuntimeEventBase):
+    pass
+
+
+class ApprovalResolved(ApprovalResolvedDraft, StoredRuntimeEventBase):
+    pass
+
+
+class ToolInvocationStarted(ToolInvocationStartedDraft, StoredRuntimeEventBase):
+    pass
+
+
+class ToolInvocationCompleted(ToolInvocationCompletedDraft, StoredRuntimeEventBase):
+    pass
+
+
+class ToolInvocationMarkedUnknown(
+    ToolInvocationMarkedUnknownDraft, StoredRuntimeEventBase
+):
+    pass
+
+
+class ToolBatchClosed(ToolBatchClosedDraft, StoredRuntimeEventBase):
+    pass
+
+
+class VerificationFailed(VerificationFailedDraft, StoredRuntimeEventBase):
+    pass
+
+
+class ModelReasoningDelta(ModelReasoningDeltaDraft, TransientRuntimeEventBase):
+    pass
+
+
+class ModelReasoningCompleted(ModelReasoningCompletedDraft, TransientRuntimeEventBase):
+    pass
+
+
+class ModelContentDelta(ModelContentDeltaDraft, TransientRuntimeEventBase):
+    pass
+
+
+class ModelToolCallStarted(ModelToolCallStartedDraft, TransientRuntimeEventBase):
+    pass
+
+
+class ModelToolCallDelta(ModelToolCallDeltaDraft, TransientRuntimeEventBase):
+    pass
+
+
+class ModelToolCallCompleted(ModelToolCallCompletedDraft, TransientRuntimeEventBase):
+    pass
+
+
+class RunInvocationStarted(RunInvocationStartedDraft, TransientRuntimeEventBase):
+    pass
+
+
+class RunInvocationEnded(RunInvocationEndedDraft, TransientRuntimeEventBase):
+    pass
 
 
 StoredRuntimeEvent = (
