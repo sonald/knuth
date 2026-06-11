@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import functools
 import hashlib
+import sqlite3
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -8,6 +11,7 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 import anyio
+from pydantic import BaseModel
 
 from knuth.core.events import (
     DurableRuntimeEventDraft,
@@ -513,18 +517,44 @@ def reduce_run_event(
     raise LedgerError(f"unsupported event type: {draft.type}")
 
 
+def _open_batch_for(
+    run: AgentRun, invocations: Iterable[ToolInvocation]
+) -> OpenToolBatch | None:
+    """Project the open ToolBatch from a run and its invocations."""
+    if run.open_batch_id is None:
+        return None
+    batch_invocations = tuple(
+        sorted(
+            (inv for inv in invocations if inv.batch_id == run.open_batch_id),
+            key=lambda inv: inv.index,
+        )
+    )
+    return OpenToolBatch(
+        batch_id=run.open_batch_id,
+        step_id=batch_invocations[0].step_id if batch_invocations else "",
+        invocations=batch_invocations,
+    )
+
+
 class _LedgerMixin:
-    """Shared redaction and create_run for :class:`RunLedger` implementations."""
+    """Template for :class:`RunLedger` implementations.
+
+    Owns the apply orchestration — redact, load the aggregate view, reduce,
+    persist — so the event-sourcing flow exists exactly once. Subclasses
+    supply storage and concurrency through ``_transact``, ``_load_view`` and
+    ``_persist``.
+    """
 
     _redactor: EventRedactor | None
 
     def __init__(self, redactor: EventRedactor | None = None) -> None:
         self._redactor = redactor
 
-    def _redact(self, draft: DurableRuntimeEventDraft) -> DurableRuntimeEventDraft:
-        if self._redactor is None:
-            return draft
-        return self._redactor.redact_event(draft)
+    async def apply(
+        self, run_id: str, draft: DurableRuntimeEventDraft
+    ) -> StoredRuntimeEvent:
+        draft = self._redact(draft)
+        return await self._transact(run_id, draft)
 
     async def create_run(
         self, query: str, metadata: dict[str, Any] | None = None
@@ -532,6 +562,48 @@ class _LedgerMixin:
         run_id = f"run_{uuid4().hex}"
         await self.apply(run_id, RunCreatedDraft(query=query, metadata=metadata or {}))
         return await self.get_run(run_id)
+
+    def _redact(self, draft: DurableRuntimeEventDraft) -> DurableRuntimeEventDraft:
+        if self._redactor is None:
+            return draft
+        return self._redactor.redact_event(draft)
+
+    def _apply_in_txn(
+        self, txn: Any, run_id: str, draft: DurableRuntimeEventDraft
+    ) -> StoredRuntimeEvent:
+        view = self._load_view(
+            txn,
+            run_id,
+            # The reducer only consults the latest model tool-call ids when
+            # validating a planned batch; skip the load otherwise.
+            with_last_tool_call_ids=isinstance(draft, ToolBatchPlannedDraft),
+        )
+        seq = (view.run.last_seq if view.run else 0) + 1
+        now = utc_now()
+        mutations = reduce_run_event(view, draft, run_id=run_id, seq=seq, now=now)
+        event = store_runtime_event(
+            run_id, seq, draft, event_id=f"evt_{uuid4().hex}", created_at=now
+        )
+        self._persist(txn, run_id, event, mutations)
+        return event
+
+    async def _transact(
+        self, run_id: str, draft: DurableRuntimeEventDraft
+    ) -> StoredRuntimeEvent:
+        raise NotImplementedError
+
+    def _load_view(
+        self, txn: Any, run_id: str, *, with_last_tool_call_ids: bool
+    ) -> _AggregateView:
+        raise NotImplementedError
+
+    def _persist(
+        self, txn: Any, run_id: str, event: StoredRuntimeEvent, mutations: _Mutations
+    ) -> None:
+        raise NotImplementedError
+
+    async def get_run(self, run_id: str) -> AgentRun:
+        raise NotImplementedError
 
 
 class MemoryRunLedger(_LedgerMixin):
@@ -544,41 +616,38 @@ class MemoryRunLedger(_LedgerMixin):
         self._approvals: dict[str, Approval] = {}
         self._artifacts: dict[str, tuple[Artifact, str]] = {}
 
-    async def apply(
+    async def _transact(
         self, run_id: str, draft: DurableRuntimeEventDraft
     ) -> StoredRuntimeEvent:
-        draft = self._redact(draft)
         async with self._lock:
-            run = self._runs.get(run_id)
-            seq = (run.last_seq if run else 0) + 1
-            view = _AggregateView(
-                run=run,
-                invocations=dict(self._invocations.get(run_id, {})),
-                approvals={
-                    approval_id: approval
-                    for approval_id, approval in self._approvals.items()
-                    if approval.run_id == run_id
-                },
-                last_model_tool_call_ids=self._last_model_tool_call_ids(run_id),
-            )
-            now = utc_now()
-            mutations = reduce_run_event(view, draft, run_id=run_id, seq=seq, now=now)
-            event = store_runtime_event(
-                run_id,
-                seq,
-                draft,
-                event_id=f"evt_{uuid4().hex}",
-                created_at=now,
-            )
-            self._events.setdefault(run_id, []).append(event)
-            self._runs[run_id] = mutations.run
-            for invocation in mutations.invocations:
-                self._invocations.setdefault(run_id, {})[
-                    invocation.tool_call_id
-                ] = invocation
-            for approval in mutations.approvals:
-                self._approvals[approval.id] = approval
-            return event
+            return self._apply_in_txn(None, run_id, draft)
+
+    def _load_view(
+        self, txn: Any, run_id: str, *, with_last_tool_call_ids: bool
+    ) -> _AggregateView:
+        return _AggregateView(
+            run=self._runs.get(run_id),
+            invocations=dict(self._invocations.get(run_id, {})),
+            approvals={
+                approval_id: approval
+                for approval_id, approval in self._approvals.items()
+                if approval.run_id == run_id
+            },
+            last_model_tool_call_ids=self._last_model_tool_call_ids(run_id)
+            if with_last_tool_call_ids
+            else (),
+        )
+
+    def _persist(
+        self, txn: Any, run_id: str, event: StoredRuntimeEvent, mutations: _Mutations
+    ) -> None:
+        self._events.setdefault(run_id, []).append(event)
+        self._runs[run_id] = mutations.run
+        run_invocations = self._invocations.setdefault(run_id, {})
+        for invocation in mutations.invocations:
+            run_invocations[invocation.tool_call_id] = invocation
+        for approval in mutations.approvals:
+            self._approvals[approval.id] = approval
 
     def _last_model_tool_call_ids(self, run_id: str) -> tuple[str, ...]:
         for event in reversed(self._events.get(run_id, [])):
@@ -608,30 +677,16 @@ class MemoryRunLedger(_LedgerMixin):
 
     async def run_state(self, run_id: str) -> RunLedgerState:
         run = await self.get_run(run_id)
-        open_batch = None
-        if run.open_batch_id is not None:
-            invocations = tuple(
-                sorted(
-                    (
-                        invocation
-                        for invocation in self._invocations.get(run_id, {}).values()
-                        if invocation.batch_id == run.open_batch_id
-                    ),
-                    key=lambda invocation: invocation.index,
-                )
-            )
-            step_id = invocations[0].step_id if invocations else ""
-            open_batch = OpenToolBatch(
-                batch_id=run.open_batch_id,
-                step_id=step_id,
-                invocations=invocations,
-            )
         pending = tuple(
             approval
             for approval in self._approvals.values()
             if approval.run_id == run_id and approval.status == ApprovalStatus.PENDING
         )
-        return RunLedgerState(run=run, open_batch=open_batch, pending_approvals=pending)
+        return RunLedgerState(
+            run=run,
+            open_batch=_open_batch_for(run, self._invocations.get(run_id, {}).values()),
+            pending_approvals=pending,
+        )
 
     async def pending_approvals(self, run_id: str | None = None) -> list[Approval]:
         return [
@@ -670,6 +725,16 @@ class MemoryRunLedger(_LedgerMixin):
         return self._artifacts[artifact_id][1]
 
 
+def _threaded[T, **P](fn: Callable[P, T]) -> Callable[P, Awaitable[T]]:
+    """Lift a blocking method onto a worker thread, keeping the async API."""
+
+    @functools.wraps(fn)
+    async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+        return await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
+
+    return wrapper
+
+
 class SQLiteRunLedger(_LedgerMixin):
     def __init__(
         self, db_path: Path | str, redactor: EventRedactor | None = None
@@ -679,9 +744,7 @@ class SQLiteRunLedger(_LedgerMixin):
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    def _connect(self):
-        import sqlite3
-
+    def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.db_path)
 
     def _init_db(self) -> None:
@@ -758,78 +821,79 @@ class SQLiteRunLedger(_LedgerMixin):
                 "breaking ledger schema: remove the legacy database or use a new one"
             )
 
-    async def apply(
-        self, run_id: str, draft: DurableRuntimeEventDraft
-    ) -> StoredRuntimeEvent:
-        draft = self._redact(draft)
-        return await anyio.to_thread.run_sync(self._apply, run_id, draft)
-
-    def _apply(
+    @_threaded
+    def _transact(
         self, run_id: str, draft: DurableRuntimeEventDraft
     ) -> StoredRuntimeEvent:
         with self._connect() as conn:
-            run = self._load_run(conn, run_id)
-            seq = (run.last_seq if run else 0) + 1
-            view = _AggregateView(
-                run=run,
-                invocations=self._load_invocations(conn, run_id),
-                approvals=self._load_approvals(conn, run_id),
-                last_model_tool_call_ids=self._load_last_model_tool_call_ids(
-                    conn, run_id
-                )
-                if isinstance(draft, ToolBatchPlannedDraft)
-                else (),
-            )
-            now = utc_now()
-            mutations = reduce_run_event(view, draft, run_id=run_id, seq=seq, now=now)
-            event = store_runtime_event(
-                run_id,
-                seq,
-                draft,
-                event_id=f"evt_{uuid4().hex}",
-                created_at=now,
-            )
-            conn.execute(
-                "insert into events (id, run_id, seq, type, step_id, event_json, created_at)"
-                " values (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    event.id,
-                    run_id,
-                    seq,
-                    event.type,
-                    getattr(event, "step_id", None),
-                    event.model_dump_json(),
-                    now,
-                ),
-            )
-            self._upsert_run(conn, mutations.run)
-            for invocation in mutations.invocations:
-                self._upsert_invocation(conn, invocation)
-            for approval in mutations.approvals:
-                self._upsert_approval(conn, approval)
-            return event
+            return self._apply_in_txn(conn, run_id, draft)
 
-    def _load_run(self, conn, run_id: str) -> AgentRun | None:
+    def _load_view(
+        self, txn: sqlite3.Connection, run_id: str, *, with_last_tool_call_ids: bool
+    ) -> _AggregateView:
+        invocations = self._select(
+            txn,
+            ToolInvocation,
+            "select data_json from tool_invocations where run_id = ?",
+            (run_id,),
+        )
+        approvals = self._select(
+            txn,
+            Approval,
+            "select data_json from approvals where run_id = ?",
+            (run_id,),
+        )
+        return _AggregateView(
+            run=self._load_run(txn, run_id),
+            invocations={inv.tool_call_id: inv for inv in invocations},
+            approvals={approval.id: approval for approval in approvals},
+            last_model_tool_call_ids=self._load_last_model_tool_call_ids(txn, run_id)
+            if with_last_tool_call_ids
+            else (),
+        )
+
+    def _persist(
+        self,
+        txn: sqlite3.Connection,
+        run_id: str,
+        event: StoredRuntimeEvent,
+        mutations: _Mutations,
+    ) -> None:
+        txn.execute(
+            "insert into events (id, run_id, seq, type, step_id, event_json, created_at)"
+            " values (?, ?, ?, ?, ?, ?, ?)",
+            (
+                event.id,
+                run_id,
+                event.seq,
+                event.type,
+                getattr(event, "step_id", None),
+                event.model_dump_json(),
+                event.created_at,
+            ),
+        )
+        self._upsert_run(txn, mutations.run)
+        for invocation in mutations.invocations:
+            self._upsert_invocation(txn, invocation)
+        for approval in mutations.approvals:
+            self._upsert_approval(txn, approval)
+
+    @staticmethod
+    def _select[M: BaseModel](
+        conn: sqlite3.Connection,
+        model_cls: type[M],
+        sql: str,
+        params: tuple[Any, ...] = (),
+    ) -> list[M]:
+        return [
+            model_cls.model_validate_json(row[0]) for row in conn.execute(sql, params)
+        ]
+
+    def _load_run(self, conn: sqlite3.Connection, run_id: str) -> AgentRun | None:
         row = conn.execute(
             "select data_json from runs where id = ?", (run_id,)
         ).fetchone()
-        if row is None:
-            return None
-        return AgentRun.model_validate_json(row[0])
-
-    def _load_invocations(self, conn, run_id: str) -> dict[str, ToolInvocation]:
-        rows = conn.execute(
-            "select data_json from tool_invocations where run_id = ?", (run_id,)
-        ).fetchall()
-        invocations = [ToolInvocation.model_validate_json(row[0]) for row in rows]
-        return {invocation.tool_call_id: invocation for invocation in invocations}
-
-    def _load_approvals(self, conn, run_id: str) -> dict[str, Approval]:
-        rows = conn.execute(
-            "select data_json from approvals where run_id = ?", (run_id,)
-        ).fetchall()
-        approvals = [Approval.model_validate_json(row[0]) for row in rows]
-        return {approval.id: approval for approval in approvals}
+        return AgentRun.model_validate_json(row[0]) if row else None
 
     def _load_last_model_tool_call_ids(self, conn, run_id: str) -> tuple[str, ...]:
         row = conn.execute(
@@ -909,122 +973,100 @@ class SQLiteRunLedger(_LedgerMixin):
             ),
         )
 
-    async def get_run(self, run_id: str) -> AgentRun:
-        run = await anyio.to_thread.run_sync(self._get_run, run_id)
+    @_threaded
+    def get_run(self, run_id: str) -> AgentRun:
+        with self._connect() as conn:
+            run = self._load_run(conn, run_id)
         if run is None:
             raise KeyError(run_id)
         return run
 
-    def _get_run(self, run_id: str) -> AgentRun | None:
+    @_threaded
+    def list_runs(self, limit: int = 20) -> list[AgentRun]:
         with self._connect() as conn:
-            return self._load_run(conn, run_id)
-
-    async def list_runs(self, limit: int = 20) -> list[AgentRun]:
-        return await anyio.to_thread.run_sync(self._list_runs, limit)
-
-    def _list_runs(self, limit: int) -> list[AgentRun]:
-        with self._connect() as conn:
-            rows = conn.execute(
+            return self._select(
+                conn,
+                AgentRun,
                 "select data_json from runs order by created_at desc limit ?",
                 (limit,),
-            ).fetchall()
-        return [AgentRun.model_validate_json(row[0]) for row in rows]
+            )
 
-    async def list_events(
-        self, run_id: str, after_seq: int | None = None
-    ) -> list[StoredRuntimeEvent]:
-        return await anyio.to_thread.run_sync(self._list_events, run_id, after_seq)
-
-    def _list_events(
+    @_threaded
+    def list_events(
         self, run_id: str, after_seq: int | None = None
     ) -> list[StoredRuntimeEvent]:
         sql = "select event_json from events where run_id = ?"
         params: tuple[Any, ...] = (run_id,)
         if after_seq is not None:
             sql += " and seq > ?"
-            params = (run_id, after_seq)
+            params += (after_seq,)
         sql += " order by seq"
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [parse_stored_runtime_event_json(row[0]) for row in rows]
 
-    async def run_state(self, run_id: str) -> RunLedgerState:
-        return await anyio.to_thread.run_sync(self._run_state, run_id)
-
-    def _run_state(self, run_id: str) -> RunLedgerState:
+    @_threaded
+    def run_state(self, run_id: str) -> RunLedgerState:
         with self._connect() as conn:
             run = self._load_run(conn, run_id)
             if run is None:
                 raise KeyError(run_id)
-            open_batch = None
+            invocations: list[ToolInvocation] = []
             if run.open_batch_id is not None:
-                rows = conn.execute(
+                invocations = self._select(
+                    conn,
+                    ToolInvocation,
                     "select data_json from tool_invocations"
-                    " where run_id = ? and batch_id = ? order by idx",
+                    " where run_id = ? and batch_id = ?",
                     (run_id, run.open_batch_id),
-                ).fetchall()
-                invocations = tuple(
-                    ToolInvocation.model_validate_json(row[0]) for row in rows
                 )
-                step_id = invocations[0].step_id if invocations else ""
-                open_batch = OpenToolBatch(
-                    batch_id=run.open_batch_id,
-                    step_id=step_id,
-                    invocations=invocations,
-                )
-            pending_rows = conn.execute(
-                "select data_json from approvals where run_id = ? and status = ?",
-                (run_id, ApprovalStatus.PENDING.value),
-            ).fetchall()
             pending = tuple(
-                Approval.model_validate_json(row[0]) for row in pending_rows
+                self._select(
+                    conn,
+                    Approval,
+                    "select data_json from approvals where run_id = ? and status = ?",
+                    (run_id, ApprovalStatus.PENDING.value),
+                )
             )
-        return RunLedgerState(run=run, open_batch=open_batch, pending_approvals=pending)
+        return RunLedgerState(
+            run=run,
+            open_batch=_open_batch_for(run, invocations),
+            pending_approvals=pending,
+        )
 
-    async def pending_approvals(self, run_id: str | None = None) -> list[Approval]:
-        return await anyio.to_thread.run_sync(self._pending_approvals, run_id)
-
-    def _pending_approvals(self, run_id: str | None) -> list[Approval]:
+    @_threaded
+    def pending_approvals(self, run_id: str | None = None) -> list[Approval]:
         sql = "select data_json from approvals where status = ?"
         params: tuple[Any, ...] = (ApprovalStatus.PENDING.value,)
         if run_id is not None:
             sql += " and run_id = ?"
-            params = (ApprovalStatus.PENDING.value, run_id)
+            params += (run_id,)
         with self._connect() as conn:
-            rows = conn.execute(sql, params).fetchall()
-        return [Approval.model_validate_json(row[0]) for row in rows]
+            return self._select(conn, Approval, sql, params)
 
-    async def get_approval(self, approval_id: str) -> Approval:
-        approval = await anyio.to_thread.run_sync(self._get_approval, approval_id)
-        if approval is None:
-            raise KeyError(approval_id)
-        return approval
-
-    def _get_approval(self, approval_id: str) -> Approval | None:
+    @_threaded
+    def get_approval(self, approval_id: str) -> Approval:
         with self._connect() as conn:
             row = conn.execute(
                 "select data_json from approvals where id = ?", (approval_id,)
             ).fetchone()
-        return Approval.model_validate_json(row[0]) if row else None
+        if row is None:
+            raise KeyError(approval_id)
+        return Approval.model_validate_json(row[0])
 
-    async def get_invocation(self, tool_call_id: str) -> ToolInvocation:
-        invocation = await anyio.to_thread.run_sync(self._get_invocation, tool_call_id)
-        if invocation is None:
-            raise KeyError(tool_call_id)
-        return invocation
-
-    def _get_invocation(self, tool_call_id: str) -> ToolInvocation | None:
+    @_threaded
+    def get_invocation(self, tool_call_id: str) -> ToolInvocation:
         with self._connect() as conn:
             row = conn.execute(
                 "select data_json from tool_invocations where tool_call_id = ?",
                 (tool_call_id,),
             ).fetchone()
-        return ToolInvocation.model_validate_json(row[0]) if row else None
+        if row is None:
+            raise KeyError(tool_call_id)
+        return ToolInvocation.model_validate_json(row[0])
 
-    async def put_artifact(self, run_id: str, kind: str, content: str) -> Artifact:
-        return await anyio.to_thread.run_sync(self._put_artifact, run_id, kind, content)
-
-    def _put_artifact(self, run_id: str, kind: str, content: str) -> Artifact:
+    @_threaded
+    def put_artifact(self, run_id: str, kind: str, content: str) -> Artifact:
         artifact = Artifact(
             id=f"art_{uuid4().hex}",
             run_id=run_id,
@@ -1047,15 +1089,12 @@ class SQLiteRunLedger(_LedgerMixin):
             )
         return artifact
 
-    async def get_artifact_text(self, artifact_id: str) -> str:
-        content = await anyio.to_thread.run_sync(self._get_artifact_text, artifact_id)
-        if content is None:
-            raise KeyError(artifact_id)
-        return content
-
-    def _get_artifact_text(self, artifact_id: str) -> str | None:
+    @_threaded
+    def get_artifact_text(self, artifact_id: str) -> str:
         with self._connect() as conn:
             row = conn.execute(
                 "select content from artifacts where id = ?", (artifact_id,)
             ).fetchone()
-        return row[0] if row else None
+        if row is None:
+            raise KeyError(artifact_id)
+        return row[0]

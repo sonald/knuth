@@ -100,6 +100,57 @@ class RunLedgerTests(unittest.TestCase):
         self.assertEqual(state.run.last_seq, 2)
         self.assertIsNone(state.open_batch)
 
+    def test_memory_and_sqlite_ledgers_project_the_same_state(self) -> None:
+        # Both implementations share the apply orchestration in _LedgerMixin;
+        # the same event sequence must yield the same projections.
+        def drive(ledger):
+            async def scenario():
+                run = await ledger.create_run("hello")
+                await ledger.apply(
+                    run.id,
+                    StepStartedDraft(step_id="step-1", index=1, snapshot=_snapshot()),
+                )
+                call = CoreToolCall(id="call-1", name="read_file", arguments={"path": "x"})
+                await ledger.apply(
+                    run.id,
+                    ModelCompletedDraft(step_id="step-1", tool_calls=[call]),
+                )
+                await ledger.apply(
+                    run.id,
+                    ToolBatchPlannedDraft(
+                        batch_id="batch-1",
+                        step_id="step-1",
+                        calls=[
+                            PlannedToolCall(
+                                tool_call_id="call-1",
+                                name="read_file",
+                                args={"path": "x"},
+                                args_hash=args_hash_for({"path": "x"}),
+                            )
+                        ],
+                    ),
+                )
+                events = await ledger.list_events(run.id)
+                state = await ledger.run_state(run.id)
+                return [event.type for event in events], state
+
+            return anyio.run(scenario)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            event_types_mem, state_mem = drive(MemoryRunLedger())
+            event_types_sql, state_sql = drive(SQLiteRunLedger(Path(temp_dir, "k.db")))
+
+        self.assertEqual(event_types_mem, event_types_sql)
+        for state in (state_mem, state_sql):
+            self.assertEqual(state.run.status, RunStatus.RUNNING)
+            self.assertEqual(state.run.open_batch_id, "batch-1")
+            self.assertEqual(state.open_batch.step_id, "step-1")
+            self.assertEqual(
+                [inv.tool_call_id for inv in state.open_batch.invocations],
+                ["call-1"],
+            )
+        self.assertEqual(state_mem.run.last_seq, state_sql.run.last_seq)
+
     def test_sqlite_ledger_rejects_legacy_schema(self) -> None:
         import sqlite3
 
