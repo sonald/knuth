@@ -262,6 +262,11 @@ async def _resolve_approvals(
         pending = await runtime.pending_approvals(run_id)
         if not pending:
             break
+        tool_names = {
+            approval.tool_call_id: tool
+            for approval in pending
+            if (tool := str(approval.approval_preview.get("tool") or ""))
+        }
         for approval in pending:
             tool = str(approval.approval_preview.get("tool") or "")
             if tool and tool in allowed_tools:
@@ -289,6 +294,7 @@ async def _resolve_approvals(
                 await runtime.deny(approval.id)
                 console.print(Text(f"  ✘ denied {label}", style="dim"))
         renderer = EventRenderer(console)
+        renderer.remember_tool_names(tool_names)
         async with runtime.resume(run_id, listeners=[renderer]) as session:
             result = await session.result()
         renderer.finish()

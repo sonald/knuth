@@ -19,7 +19,7 @@ from knuth.core.runtime_events import (
 )
 from knuth.core.types import RunStatus
 from knuth_llmd import InferenceConfig
-from knuth_toold import ToolBroker, create_default_registry
+from knuth_toold import Tool, ToolBroker, ToolProvider, create_default_registry
 
 from knuth_runtime.context import (
     ContextBuilder,
@@ -262,6 +262,8 @@ def build_sqlite_runtime(
     inference_config: InferenceConfig,
     db_path: Path | str | None = None,
     section_providers: list[SystemSectionProvider] | None = None,
+    tools: Iterable[Tool] = (),
+    tool_providers: Iterable[ToolProvider] = (),
     redactor: EventRedactor | None = None,
     enable_plugins: bool = False,
     debug_sink_dir: Path | str | None = None,
@@ -274,6 +276,10 @@ def build_sqlite_runtime(
     registry = create_default_registry(
         enable_entry_point_discovery=enable_plugins
     )
+    for tool in tools:
+        registry.register(tool)
+    for provider in tool_providers:
+        registry.add_provider(provider)
     broker = ToolBroker(registry, policy_engine=PolicyEngine())
     services = RuntimeServices(
         inference_client=inference_client,
@@ -311,11 +317,18 @@ def build_memory_runtime(
     ledger: RunLedger | None = None,
     tool_broker: ToolBroker | None = None,
     section_providers: list[SystemSectionProvider] | None = None,
+    tools: Iterable[Tool] = (),
+    tool_providers: Iterable[ToolProvider] = (),
 ) -> AgentRuntime:
     ledger = ledger or MemoryRunLedger()
     if tool_broker is None:
+        registry = create_default_registry()
+        for tool in tools:
+            registry.register(tool)
+        for provider in tool_providers:
+            registry.add_provider(provider)
         tool_broker = ToolBroker(
-            create_default_registry(), policy_engine=PolicyEngine()
+            registry, policy_engine=PolicyEngine()
         )
     services = RuntimeServices(
         inference_client=inference_client,

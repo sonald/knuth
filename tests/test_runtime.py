@@ -44,6 +44,7 @@ from knuth.core.runtime_events import (
     UserMessageDraft,
     VerificationFailedDraft,
 )
+from knuth.core.tools import ToolResult
 from knuth.core.types import RunStatus
 from knuth_llmd import InferenceConfig
 from knuth_runtime import (
@@ -65,6 +66,7 @@ from knuth_runtime.loop import EMPTY_ANSWER_FEEDBACK, OBSERVATION_INLINE_LIMIT
 from knuth_runtime.observation import RuntimeEventInterest, RuntimeObservationError
 from knuth_runtime.policy import PolicyEngine
 from knuth_toold import ToolBroker, create_default_registry
+from knuth_toold.base import ToolManifest, ToolRuntimeContext
 
 
 def _snapshot() -> ContextSnapshot:
@@ -345,6 +347,40 @@ class RunLedgerTests(unittest.TestCase):
 
         before, after = anyio.run(scenario)
         self.assertEqual(len(before), len(after))
+
+
+class RuntimeBuilderToolTests(unittest.TestCase):
+    def test_memory_runtime_accepts_host_tools_after_default_tools(self) -> None:
+        class HostReadFileTool:
+            @property
+            def manifest(self) -> ToolManifest:
+                return ToolManifest(
+                    name="read_file",
+                    description="host read_file override",
+                    parameters={
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                )
+
+            async def invoke(self, invocation, ctx: ToolRuntimeContext) -> ToolResult:
+                return ToolResult.success(content="host")
+
+        runtime = build_memory_runtime(
+            inference_client=None,
+            inference_config=InferenceConfig(),
+            tools=[HostReadFileTool()],
+        )
+
+        tools = anyio.run(runtime.tools)
+        by_name = {
+            item["function"]["name"]: item["function"]["description"]
+            for item in tools
+        }
+
+        self.assertEqual(by_name["read_file"], "host read_file override")
+        self.assertIn("write_file", by_name)
 
 
 class _SecretRedactor:

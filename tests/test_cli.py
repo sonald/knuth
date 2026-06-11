@@ -15,12 +15,14 @@ from knuth.core.events import (
     RunSucceeded,
     emit_transient_runtime_event,
 )
-from knuth.core.messages import InferenceMessage, InferenceRole
+from knuth.core.messages import InferenceMessage, InferenceRole, SystemSectionSource
 from knuth.core.types import RunStatus
 from knuth_cli.cli import main
 from knuth_cli.config import AgentConfig, default_config_path, load_config
+from knuth_cli.prompts import build_cli_system_sections
 from knuth_cli.runtime import build_runtime
 from knuth_runtime import RunResult
+from knuth_runtime.context import RunContext
 
 
 def _write_yaml(path: Path, values: dict[str, object]) -> None:
@@ -212,6 +214,22 @@ class AgentConfigTests(unittest.TestCase):
 
 
 class CliRuntimeFactoryTests(unittest.TestCase):
+    def test_cli_prompt_sections_keep_base_role_before_user_prompt(self) -> None:
+        async def scenario():
+            providers = build_cli_system_sections("USER PROMPT")
+            ctx = RunContext(run_id="run-1")
+            result = []
+            for provider in providers:
+                result.extend(await provider.sections(ctx))
+            return result
+
+        sections = anyio.run(scenario)
+
+        self.assertEqual(sections[0].source, SystemSectionSource.BASE)
+        self.assertIn("AI shell", sections[0].text)
+        self.assertEqual(sections[1].source, SystemSectionSource.USER)
+        self.assertEqual(sections[1].text, "USER PROMPT")
+
     def test_build_runtime_injects_user_system_prompt_as_preamble(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir, "knuth.yaml")
@@ -243,8 +261,32 @@ class CliRuntimeFactoryTests(unittest.TestCase):
         self.assertEqual(client.kwargs["model"], "test-model")
         first_turn_messages = client.captured_messages[0]
         self.assertEqual(first_turn_messages[0].role, InferenceRole.SYSTEM)
-        self.assertIn("local agent runtime", first_turn_messages[0].content or "")
+        self.assertIn("Knuth Shell", first_turn_messages[0].content or "")
         self.assertIn("USER PROMPT", first_turn_messages[0].content or "")
+
+    def test_build_runtime_registers_cli_local_tools_after_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir, "knuth.yaml")
+            db_path = Path(temp_dir, "knuth.db")
+            _write_yaml(
+                config_path,
+                {
+                    "api_key": "test-key",
+                    "base_url": "https://example.test/v1",
+                    "model": "test-model",
+                },
+            )
+
+            async def scenario():
+                runtime = await build_runtime(config_path=config_path, db_path=db_path)
+                tools = await runtime.tools()
+                return {item["function"]["name"]: item["function"] for item in tools}
+
+            by_name = anyio.run(scenario)
+
+        self.assertIn("edit_file", by_name)
+        self.assertIn("offset and line limit", by_name["read_file"]["description"])
+        self.assertIn("structured", by_name["shell"]["description"])
 
 
 class CliTests(unittest.TestCase):

@@ -21,6 +21,8 @@ from rich.markdown import Markdown
 from rich.spinner import Spinner
 from rich.text import Text
 
+from knuth_cli.tools.process_output import TaggedProcessOutput, parse_tagged_process_output
+
 _MAX_ARG_LEN = 80
 _MAX_RESULT_LEN = 400
 _MAX_REASONING_TAIL = 80
@@ -65,6 +67,11 @@ class EventRenderer:
         handler = self._dispatch.get(event.type)
         if handler is not None:
             handler(event)
+
+    def remember_tool_names(self, tool_names: dict[str, str]) -> None:
+        for tool_call_id, name in tool_names.items():
+            if tool_call_id and name:
+                self._tool_names[tool_call_id] = name
 
     def finish(self) -> None:
         """Tear down any live region left open (end of a turn)."""
@@ -223,6 +230,11 @@ class EventRenderer:
             return
         ok = event.outcome == "succeeded"
         body = event.observation or event.observation_preview or ""
+        if name == "shell":
+            parsed = parse_tagged_process_output(str(body))
+            if parsed is not None:
+                self._print_shell_completed(parsed, ok)
+                return
         mark = "✔" if ok else "✘"
         style = "green" if ok else "red"
         summary = _truncate(str(body).strip().replace("\n", " "), _MAX_RESULT_LEN)
@@ -230,6 +242,32 @@ class EventRenderer:
         if summary:
             line += f" — {summary}"
         self._console.print(Text(line, style=style))
+
+    def _print_shell_completed(self, output: TaggedProcessOutput, ok: bool) -> None:
+        mark = "✔" if ok else "✘"
+        style = "green" if ok else "red"
+        self._console.print(
+            Text(f"  {mark} shell exit {output.return_code}", style=style)
+        )
+        if output.stdout:
+            self._console.print(Text("    stdout:", style="dim"))
+            self._console.print(Text(_truncate(output.stdout.rstrip(), _MAX_RESULT_LEN)))
+        if output.stderr:
+            self._console.print(Text("    stderr:", style="dim"))
+            self._console.print(
+                Text(_truncate(output.stderr.rstrip(), _MAX_RESULT_LEN), style="yellow")
+            )
+        if output.offload.get("status") == "offloaded":
+            self._console.print(Text("    offload:", style="dim"))
+            for label in ("stdout", "stderr"):
+                payload = output.offload.get(label)
+                if isinstance(payload, dict) and payload.get("path"):
+                    self._console.print(
+                        Text(f"      {label}: {payload['path']}", style="dim")
+                    )
+            result_path = output.offload.get("result_path")
+            if result_path:
+                self._console.print(Text(f"      result: {result_path}", style="dim"))
 
 
 def _format_args(args: dict[str, Any]) -> str:

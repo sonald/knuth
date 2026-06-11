@@ -1,0 +1,112 @@
+import io
+import unittest
+from types import SimpleNamespace
+
+import anyio
+from rich.console import Console
+
+from knuth_cli.render import EventRenderer
+from knuth_cli.tools.process_output import render_tagged_process_output
+
+
+class EventRendererShellToolTests(unittest.TestCase):
+    def test_tool_started_can_use_seeded_tool_name_after_resume(self) -> None:
+        output = io.StringIO()
+        console = Console(file=output, force_terminal=False, color_system=None)
+        renderer = EventRenderer(console)
+        renderer.remember_tool_names({"call_write": "write_file"})
+
+        anyio.run(
+            renderer.handle_event,
+            SimpleNamespace(
+                type="tool.invocation_started",
+                tool_call_id="call_write",
+            ),
+        )
+
+        self.assertIn("write_file", output.getvalue())
+        self.assertNotIn("call_write", output.getvalue())
+
+    def test_shell_tool_completion_renders_structured_output(self) -> None:
+        output = io.StringIO()
+        console = Console(file=output, force_terminal=False, color_system=None)
+        renderer = EventRenderer(console)
+        observation = render_tagged_process_output(
+            stdout="hello\n",
+            stderr="warn\n",
+            return_code=0,
+            offload={"status": "inline"},
+        )
+
+        anyio.run(
+            renderer.handle_event,
+            SimpleNamespace(
+                type="tool.invocation_completed",
+                tool_name="shell",
+                outcome="succeeded",
+                observation=observation,
+                observation_preview=None,
+            ),
+        )
+
+        rendered = output.getvalue()
+        self.assertIn("✔ shell exit 0", rendered)
+        self.assertIn("stdout:", rendered)
+        self.assertIn("hello", rendered)
+        self.assertIn("stderr:", rendered)
+        self.assertIn("warn", rendered)
+
+    def test_shell_tool_completion_renders_offload_paths(self) -> None:
+        output = io.StringIO()
+        console = Console(file=output, force_terminal=False, color_system=None)
+        renderer = EventRenderer(console)
+        observation = render_tagged_process_output(
+            stdout="abcde",
+            stderr="",
+            return_code=0,
+            offload={
+                "status": "offloaded",
+                "result_path": "/tmp/result.json",
+                "stdout": {"path": "/tmp/stdout.txt"},
+                "stderr": {"path": "/tmp/stderr.txt"},
+            },
+        )
+
+        anyio.run(
+            renderer.handle_event,
+            SimpleNamespace(
+                type="tool.invocation_completed",
+                tool_name="shell",
+                outcome="succeeded",
+                observation=observation,
+                observation_preview=None,
+            ),
+        )
+
+        rendered = output.getvalue()
+        self.assertIn("offload:", rendered)
+        self.assertIn("/tmp/stdout.txt", rendered)
+        self.assertIn("/tmp/stderr.txt", rendered)
+        self.assertIn("/tmp/result.json", rendered)
+
+    def test_shell_tool_completion_falls_back_on_unparseable_observation(self) -> None:
+        output = io.StringIO()
+        console = Console(file=output, force_terminal=False, color_system=None)
+        renderer = EventRenderer(console)
+
+        anyio.run(
+            renderer.handle_event,
+            SimpleNamespace(
+                type="tool.invocation_completed",
+                tool_name="shell",
+                outcome="succeeded",
+                observation="plain output",
+                observation_preview=None,
+            ),
+        )
+
+        self.assertIn("✔ shell — plain output", output.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()
