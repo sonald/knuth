@@ -172,23 +172,6 @@ class VerificationFailedDraft(RuntimeEventDraftBase):
     feedback: str
 
 
-class ContextCompactedDraft(RuntimeEventDraftBase):
-    """Reserved: history compaction as an appended fact. Not implemented in v0."""
-
-    type: Literal["context.compacted"] = "context.compacted"
-    replaces_through_seq: int
-    summary: str | None = None
-    summary_ref: str | None = None
-
-
-class RunCheckpointDraft(RuntimeEventDraftBase):
-    """Reserved: fold anchor. Not implemented in v0."""
-
-    type: Literal["run.checkpoint"] = "run.checkpoint"
-    through_seq: int
-    state_ref: str | None = None
-
-
 DurableRuntimeEventDraft = (
     RunCreatedDraft
     | UserMessageDraft
@@ -210,8 +193,6 @@ DurableRuntimeEventDraft = (
     | ToolInvocationMarkedUnknownDraft
     | ToolBatchClosedDraft
     | VerificationFailedDraft
-    | ContextCompactedDraft
-    | RunCheckpointDraft
 )
 
 
@@ -324,8 +305,6 @@ ToolInvocationMarkedUnknown = _stored(
 )
 ToolBatchClosed = _stored("ToolBatchClosed", ToolBatchClosedDraft)
 VerificationFailed = _stored("VerificationFailed", VerificationFailedDraft)
-ContextCompacted = _stored("ContextCompacted", ContextCompactedDraft)
-RunCheckpoint = _stored("RunCheckpoint", RunCheckpointDraft)
 
 
 def _transient(name: str, draft: type[TransientRuntimeEventDraftBase]):
@@ -369,8 +348,6 @@ StoredRuntimeEvent = (
     | ToolInvocationMarkedUnknown
     | ToolBatchClosed
     | VerificationFailed
-    | ContextCompacted
-    | RunCheckpoint
 )
 
 TransientRuntimeEvent = (

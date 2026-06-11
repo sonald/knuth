@@ -5,7 +5,6 @@ from pydantic import TypeAdapter
 from knuth.core.runtime_events import (
     ApprovalRequested,
     ApprovalResolved,
-    ContextCompacted,
     DurableRuntimeEventDraft,
     ModelAborted,
     ModelCompleted,
@@ -17,7 +16,6 @@ from knuth.core.runtime_events import (
     ModelToolCallDelta,
     ModelToolCallStarted,
     RunCancelled,
-    RunCheckpoint,
     RunCreated,
     RunFailed,
     RunInvocationEnded,
@@ -62,8 +60,6 @@ _STORED_EVENT_BY_TYPE: dict[str, type[StoredRuntimeEventBase]] = {
     "tool.invocation_marked_unknown": ToolInvocationMarkedUnknown,
     "tool.batch_closed": ToolBatchClosed,
     "verification.failed": VerificationFailed,
-    "context.compacted": ContextCompacted,
-    "run.checkpoint": RunCheckpoint,
 }
 
 _TRANSIENT_EVENT_BY_TYPE: dict[str, type[TransientRuntimeEventBase]] = {

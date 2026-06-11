@@ -27,9 +27,7 @@ from knuth.core.runs import AgentRun, Artifact
 from knuth.core.runtime_events import (
     ApprovalRequestedDraft,
     ApprovalResolvedDraft,
-    ContextCompactedDraft,
     ModelCompletedDraft,
-    RunCheckpointDraft,
     RunCreatedDraft,
     RunPausedDraft,
     RunResumedDraft,
@@ -170,9 +168,6 @@ def reduce_run_event(
     Raises ``LedgerError`` on violation; the caller must not persist anything
     in that case.
     """
-    if isinstance(draft, (ContextCompactedDraft, RunCheckpointDraft)):
-        raise LedgerError(f"reserved event type not implemented in v0: {draft.type}")
-
     if isinstance(draft, RunCreatedDraft):
         _require(view.run is None, f"run already exists: {run_id}")
         run = AgentRun(
@@ -518,8 +513,10 @@ def reduce_run_event(
     raise LedgerError(f"unsupported event type: {draft.type}")
 
 
-class _BaseRunLedger:
-    """Shared apply/read shape over an implementation-specific transaction."""
+class _LedgerMixin:
+    """Shared redaction and create_run for :class:`RunLedger` implementations."""
+
+    _redactor: EventRedactor | None
 
     def __init__(self, redactor: EventRedactor | None = None) -> None:
         self._redactor = redactor
@@ -536,16 +533,8 @@ class _BaseRunLedger:
         await self.apply(run_id, RunCreatedDraft(query=query, metadata=metadata or {}))
         return await self.get_run(run_id)
 
-    async def apply(
-        self, run_id: str, draft: DurableRuntimeEventDraft
-    ) -> StoredRuntimeEvent:
-        raise NotImplementedError
 
-    async def get_run(self, run_id: str) -> AgentRun:
-        raise NotImplementedError
-
-
-class MemoryRunLedger(_BaseRunLedger):
+class MemoryRunLedger(_LedgerMixin):
     def __init__(self, redactor: EventRedactor | None = None) -> None:
         super().__init__(redactor)
         self._lock = anyio.Lock()
@@ -681,7 +670,7 @@ class MemoryRunLedger(_BaseRunLedger):
         return self._artifacts[artifact_id][1]
 
 
-class SQLiteRunLedger(_BaseRunLedger):
+class SQLiteRunLedger(_LedgerMixin):
     def __init__(
         self, db_path: Path | str, redactor: EventRedactor | None = None
     ) -> None:

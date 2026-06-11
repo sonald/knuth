@@ -29,7 +29,6 @@ from knuth.core.runtime_events import (
     ContextSnapshot,
     ModelCompletedDraft,
     PlannedToolCall,
-    RunCheckpointDraft,
     RunResumedDraft,
     StepStartedDraft,
     ToolBatchPlannedDraft,
@@ -251,24 +250,21 @@ class RunLedgerTests(unittest.TestCase):
 
         anyio.run(scenario)
 
-    def test_reserved_event_types_are_rejected(self) -> None:
-        ledger = MemoryRunLedger()
-
-        async def scenario():
-            run = await ledger.create_run("q")
-            with self.assertRaisesRegex(LedgerError, "reserved"):
-                await ledger.apply(run.id, RunCheckpointDraft(through_seq=1))
-
-        anyio.run(scenario)
-
     def test_rejected_event_persists_nothing(self) -> None:
         ledger = MemoryRunLedger()
 
         async def scenario():
             run = await ledger.create_run("q")
+            await ledger.apply(run.id, UserMessageDraft(content="q"))
+            await ledger.apply(
+                run.id, StepStartedDraft(step_id="s1", index=1, snapshot=_snapshot())
+            )
             before = await ledger.list_events(run.id)
             with self.assertRaises(LedgerError):
-                await ledger.apply(run.id, RunCheckpointDraft(through_seq=1))
+                await ledger.apply(
+                    run.id,
+                    VerificationFailedDraft(reason="empty", feedback="   "),
+                )
             after = await ledger.list_events(run.id)
             return before, after
 
