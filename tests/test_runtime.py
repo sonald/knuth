@@ -69,6 +69,20 @@ def _snapshot() -> ContextSnapshot:
 
 
 class RunLedgerTests(unittest.TestCase):
+    def test_every_durable_draft_has_a_registered_reducer(self) -> None:
+        from typing import get_args
+
+        from knuth.core.runtime_events import DurableRuntimeEventDraft
+        from knuth_runtime.ledger import _REDUCERS
+
+        unhandled = [
+            draft_cls.__name__
+            for draft_cls in get_args(DurableRuntimeEventDraft)
+            # run.created bootstraps the aggregate inside reduce_run_event.
+            if draft_cls is not RunCreatedDraft and draft_cls not in _REDUCERS
+        ]
+        self.assertEqual(unhandled, [])
+
     def test_apply_stores_typed_event_and_updates_run_projection(self) -> None:
         ledger = MemoryRunLedger()
 

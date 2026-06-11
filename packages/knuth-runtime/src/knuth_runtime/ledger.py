@@ -31,8 +31,12 @@ from knuth.core.runs import AgentRun, Artifact
 from knuth.core.runtime_events import (
     ApprovalRequestedDraft,
     ApprovalResolvedDraft,
+    ModelAbortedDraft,
     ModelCompletedDraft,
+    ModelFailedDraft,
+    RunCancelledDraft,
     RunCreatedDraft,
+    RunFailedDraft,
     RunPausedDraft,
     RunResumedDraft,
     RunSucceededDraft,
@@ -152,11 +156,41 @@ def _require(condition: bool, message: str) -> None:
         raise LedgerError(message)
 
 
-def _invocation(view: _AggregateView, tool_call_id: str) -> ToolInvocation:
-    invocation = view.invocations.get(tool_call_id)
-    _require(invocation is not None, f"unknown tool invocation: {tool_call_id}")
-    assert invocation is not None
-    return invocation
+@dataclass
+class _ReduceContext:
+    """One append being validated: the aggregate view plus the mutations the
+    reducer folds its changes into (``mutations.run`` is the run copy)."""
+
+    view: _AggregateView
+    mutations: _Mutations
+    run_id: str
+    seq: int
+    now: str
+
+    @property
+    def run(self) -> AgentRun:
+        return self.mutations.run
+
+    def invocation(self, tool_call_id: str) -> ToolInvocation:
+        invocation = self.view.invocations.get(tool_call_id)
+        if invocation is None:
+            raise LedgerError(f"unknown tool invocation: {tool_call_id}")
+        return invocation
+
+
+_Reducer = Callable[[_ReduceContext, Any], _Mutations]
+_REDUCERS: dict[type[DurableRuntimeEventDraft], _Reducer] = {}
+
+
+def _reduces(
+    *draft_classes: type[DurableRuntimeEventDraft],
+) -> Callable[[_Reducer], _Reducer]:
+    def register(fn: _Reducer) -> _Reducer:
+        for draft_cls in draft_classes:
+            _REDUCERS[draft_cls] = fn
+        return fn
+
+    return register
 
 
 def reduce_run_event(
@@ -169,352 +203,420 @@ def reduce_run_event(
 ) -> _Mutations:
     """The aggregate: validates invariants and folds the event into projections.
 
-    Raises ``LedgerError`` on violation; the caller must not persist anything
-    in that case.
+    Each event type has its own reducer registered in ``_REDUCERS``. A raised
+    ``LedgerError`` means the caller must not persist anything.
     """
     if isinstance(draft, RunCreatedDraft):
         _require(view.run is None, f"run already exists: {run_id}")
-        run = AgentRun(
-            id=run_id,
-            query=draft.query,
-            status=RunStatus.CREATED,
-            created_at=now,
-            updated_at=now,
-            metadata=draft.metadata,
-            last_seq=seq,
-        )
-        return _Mutations(run=run)
-
-    _require(view.run is not None, f"unknown run: {run_id}")
-    assert view.run is not None
-    run = view.run.model_copy(update={"updated_at": now, "last_seq": seq})
-    status = run.status
-    mutations = _Mutations(run=run)
-
-    if isinstance(draft, UserMessageDraft):
-        _require(
-            status in {RunStatus.CREATED, RunStatus.SUCCEEDED},
-            f"user.message requires a created or succeeded run, got {status}",
-        )
-        return mutations
-
-    if isinstance(draft, RunResumedDraft):
-        _require(
-            status
-            in {
-                RunStatus.RUNNING,
-                RunStatus.WAITING_APPROVAL,
-                RunStatus.PAUSED,
-                RunStatus.SUCCEEDED,
-            },
-            f"run.resumed not allowed from status {status}",
-        )
-        pending = [
-            approval
-            for approval in view.approvals.values()
-            if approval.status == ApprovalStatus.PENDING
-        ]
-        _require(
-            not pending,
-            "pending approvals must be resolved before resuming: "
-            + ", ".join(approval.id for approval in pending),
-        )
-        run.status = RunStatus.RUNNING
-        return mutations
-
-    if isinstance(draft, RunPausedDraft):
-        _require(
-            status in _ACTIVE_STATUSES,
-            f"run.paused requires an active run, got {status}",
-        )
-        run.status = RunStatus.PAUSED
-        return mutations
-
-    if draft.type == "run.cancelled":
-        _require(
-            status not in _FINISHED_STATUSES,
-            f"run.cancelled not allowed from status {status}",
-        )
-        run.status = RunStatus.CANCELLED
-        return mutations
-
-    if draft.type == "run.failed":
-        _require(
-            status not in _FINISHED_STATUSES,
-            f"run.failed not allowed from status {status}",
-        )
-        run.status = RunStatus.FAILED
-        return mutations
-
-    if isinstance(draft, RunSucceededDraft):
-        _require(
-            status == RunStatus.RUNNING,
-            f"run.succeeded requires a running run, got {status}",
-        )
-        _require(run.open_batch_id is None, "run.succeeded requires no open tool batch")
-        run.status = RunStatus.SUCCEEDED
-        return mutations
-
-    if isinstance(draft, StepStartedDraft):
-        _require(
-            status in _ACTIVE_STATUSES,
-            f"step.started requires an active run, got {status}",
-        )
-        _require(run.open_batch_id is None, "step.started requires no open tool batch")
-        _require(
-            draft.index == run.steps + 1,
-            f"step index {draft.index} does not follow step count {run.steps}",
-        )
-        run.status = RunStatus.RUNNING
-        run.steps += 1
-        run.current_step_id = draft.step_id
-        return mutations
-
-    if isinstance(draft, ModelCompletedDraft):
-        _require(status == RunStatus.RUNNING, "model.completed requires a running run")
-        _require(
-            draft.step_id == run.current_step_id,
-            f"model.completed step {draft.step_id} is not the current step",
-        )
-        return mutations
-
-    if draft.type in {"model.failed", "model.aborted"}:
-        return mutations
-
-    if isinstance(draft, ToolBatchPlannedDraft):
-        _require(status == RunStatus.RUNNING, "tool.batch_planned requires a running run")
-        _require(run.open_batch_id is None, "another tool batch is already open")
-        _require(
-            draft.step_id == run.current_step_id,
-            f"tool.batch_planned step {draft.step_id} is not the current step",
-        )
-        _require(bool(draft.calls), "tool.batch_planned requires at least one call")
-        planned_ids = {call.tool_call_id for call in draft.calls}
-        _require(
-            planned_ids == set(view.last_model_tool_call_ids),
-            "planned calls do not match the latest model.completed tool calls",
-        )
-        for call in draft.calls:
-            _require(
-                call.args_hash == args_hash_for(call.args),
-                f"args_hash mismatch for planned call {call.tool_call_id}",
-            )
-            mutations.invocations.append(
-                ToolInvocation(
-                    tool_call_id=call.tool_call_id,
-                    run_id=run_id,
-                    batch_id=draft.batch_id,
-                    step_id=draft.step_id,
-                    index=call.index,
-                    tool_name=call.name,
-                    args=call.args,
-                    args_hash=call.args_hash,
-                    status=ToolInvocationStatus.PROPOSED,
-                    updated_seq=seq,
-                )
-            )
-        run.open_batch_id = draft.batch_id
-        return mutations
-
-    if isinstance(draft, ToolProposedDraft):
-        invocation = _invocation(view, draft.tool_call_id)
-        _require(
-            invocation.batch_id == run.open_batch_id,
-            "tool.proposed must target the open batch",
-        )
-        _require(
-            invocation.status == ToolInvocationStatus.PROPOSED,
-            f"tool.proposed requires status proposed, got {invocation.status}",
-        )
-        status_by_decision = {
-            ToolCallDecision.ALLOWED: ToolInvocationStatus.APPROVED,
-            ToolCallDecision.REQUIRES_APPROVAL: ToolInvocationStatus.AWAITING_APPROVAL,
-            ToolCallDecision.DENIED: ToolInvocationStatus.DENIED,
-        }
-        updates: dict[str, Any] = {
-            "status": status_by_decision[draft.decision],
-            "effect": draft.effect,
-            "risk": draft.risk,
-            "updated_seq": seq,
-        }
-        if draft.decision == ToolCallDecision.DENIED:
-            updates["denial_reason"] = (
-                draft.error.message if draft.error else "denied by policy"
-            )
-        mutations.invocations.append(invocation.model_copy(update=updates))
-        return mutations
-
-    if isinstance(draft, ApprovalRequestedDraft):
-        invocation = _invocation(view, draft.tool_call_id)
-        _require(
-            invocation.status == ToolInvocationStatus.AWAITING_APPROVAL,
-            f"approval.requested requires awaiting_approval, got {invocation.status}",
-        )
-        _require(
-            draft.args_hash == invocation.args_hash,
-            "approval args_hash does not match the frozen invocation args",
-        )
-        existing = view.approvals.get(draft.approval_id)
-        _require(
-            existing is None or existing.status != ApprovalStatus.PENDING,
-            f"approval already pending: {draft.approval_id}",
-        )
-        mutations.approvals.append(
-            Approval(
-                id=draft.approval_id,
-                run_id=run_id,
-                tool_call_id=draft.tool_call_id,
-                args_hash=draft.args_hash,
-                status=ApprovalStatus.PENDING,
-                title=draft.title,
-                reason=draft.reason,
-                risk=draft.risk,
-                preview=draft.preview,
+        return _Mutations(
+            run=AgentRun(
+                id=run_id,
+                query=draft.query,
+                status=RunStatus.CREATED,
                 created_at=now,
+                updated_at=now,
+                metadata=draft.metadata,
+                last_seq=seq,
             )
         )
-        mutations.invocations.append(
-            invocation.model_copy(
-                update={"approval_id": draft.approval_id, "updated_seq": seq}
-            )
-        )
-        run.status = RunStatus.WAITING_APPROVAL
-        return mutations
 
-    if isinstance(draft, ApprovalResolvedDraft):
-        approval = view.approvals.get(draft.approval_id)
-        _require(approval is not None, f"unknown approval: {draft.approval_id}")
-        assert approval is not None
-        _require(
-            approval.status == ApprovalStatus.PENDING,
-            f"approval already resolved: {draft.approval_id}",
-        )
-        resolved_status = (
-            ApprovalStatus.APPROVED
-            if draft.resolution == "approved"
-            else ApprovalStatus.DENIED
-        )
-        mutations.approvals.append(
-            approval.model_copy(
-                update={
-                    "status": resolved_status,
-                    "resolved_at": now,
-                    "resolved_by": draft.resolved_by,
-                }
-            )
-        )
-        invocation = _invocation(view, approval.tool_call_id)
-        _require(
-            invocation.status == ToolInvocationStatus.AWAITING_APPROVAL,
-            f"approval target is not awaiting approval: {invocation.status}",
-        )
-        updates: dict[str, Any] = {"updated_seq": seq}
-        if draft.resolution == "approved":
-            updates["status"] = ToolInvocationStatus.APPROVED
-        else:
-            updates["status"] = ToolInvocationStatus.DENIED
-            updates["denial_reason"] = "denied by user"
-        mutations.invocations.append(invocation.model_copy(update=updates))
-        return mutations
+    if view.run is None:
+        raise LedgerError(f"unknown run: {run_id}")
+    reducer = _REDUCERS.get(type(draft))
+    if reducer is None:
+        raise LedgerError(f"unsupported event type: {draft.type}")
+    ctx = _ReduceContext(
+        view=view,
+        mutations=_Mutations(
+            run=view.run.model_copy(update={"updated_at": now, "last_seq": seq})
+        ),
+        run_id=run_id,
+        seq=seq,
+        now=now,
+    )
+    return reducer(ctx, draft)
 
-    if isinstance(draft, ToolInvocationStartedDraft):
-        _require(
-            status == RunStatus.RUNNING,
-            "tool.invocation_started requires a running run",
-        )
-        invocation = _invocation(view, draft.tool_call_id)
-        _require(
-            invocation.status == ToolInvocationStatus.APPROVED,
-            f"tool.invocation_started requires approved, got {invocation.status}",
-        )
-        _require(
-            draft.attempt == invocation.attempts + 1,
-            f"attempt {draft.attempt} does not follow attempts {invocation.attempts}",
-        )
-        mutations.invocations.append(
-            invocation.model_copy(
-                update={
-                    "status": ToolInvocationStatus.RUNNING,
-                    "attempts": invocation.attempts + 1,
-                    "idempotency_key": draft.idempotency_key,
-                    "updated_seq": seq,
-                }
-            )
-        )
-        return mutations
 
-    if isinstance(draft, ToolInvocationCompletedDraft):
-        invocation = _invocation(view, draft.tool_call_id)
-        if draft.outcome == "denied":
-            _require(
-                invocation.status == ToolInvocationStatus.DENIED
-                and not invocation.observed,
-                "denied observation backfill requires an unobserved denied invocation",
-            )
-            new_status = ToolInvocationStatus.DENIED
-        else:
-            _require(
-                invocation.status
-                in {ToolInvocationStatus.RUNNING, ToolInvocationStatus.UNKNOWN},
-                "tool.invocation_completed requires a running or unknown invocation, "
-                f"got {invocation.status}",
-            )
-            new_status = (
-                ToolInvocationStatus.SUCCEEDED
-                if draft.outcome == "succeeded"
-                else ToolInvocationStatus.FAILED
-            )
-        mutations.invocations.append(
-            invocation.model_copy(
-                update={
-                    "status": new_status,
-                    "observed": True,
-                    "updated_seq": seq,
-                }
-            )
-        )
-        return mutations
+@_reduces(UserMessageDraft)
+def _reduce_user_message(ctx: _ReduceContext, draft: UserMessageDraft) -> _Mutations:
+    _require(
+        ctx.run.status in {RunStatus.CREATED, RunStatus.SUCCEEDED},
+        f"user.message requires a created or succeeded run, got {ctx.run.status}",
+    )
+    return ctx.mutations
 
-    if isinstance(draft, ToolInvocationMarkedUnknownDraft):
-        invocation = _invocation(view, draft.tool_call_id)
+
+@_reduces(RunResumedDraft)
+def _reduce_run_resumed(ctx: _ReduceContext, draft: RunResumedDraft) -> _Mutations:
+    _require(
+        ctx.run.status
+        in {
+            RunStatus.RUNNING,
+            RunStatus.WAITING_APPROVAL,
+            RunStatus.PAUSED,
+            RunStatus.SUCCEEDED,
+        },
+        f"run.resumed not allowed from status {ctx.run.status}",
+    )
+    pending = [
+        approval
+        for approval in ctx.view.approvals.values()
+        if approval.status == ApprovalStatus.PENDING
+    ]
+    _require(
+        not pending,
+        "pending approvals must be resolved before resuming: "
+        + ", ".join(approval.id for approval in pending),
+    )
+    ctx.run.status = RunStatus.RUNNING
+    return ctx.mutations
+
+
+@_reduces(RunPausedDraft)
+def _reduce_run_paused(ctx: _ReduceContext, draft: RunPausedDraft) -> _Mutations:
+    _require(
+        ctx.run.status in _ACTIVE_STATUSES,
+        f"run.paused requires an active run, got {ctx.run.status}",
+    )
+    ctx.run.status = RunStatus.PAUSED
+    return ctx.mutations
+
+
+@_reduces(RunCancelledDraft)
+def _reduce_run_cancelled(ctx: _ReduceContext, draft: RunCancelledDraft) -> _Mutations:
+    _require(
+        ctx.run.status not in _FINISHED_STATUSES,
+        f"run.cancelled not allowed from status {ctx.run.status}",
+    )
+    ctx.run.status = RunStatus.CANCELLED
+    return ctx.mutations
+
+
+@_reduces(RunFailedDraft)
+def _reduce_run_failed(ctx: _ReduceContext, draft: RunFailedDraft) -> _Mutations:
+    _require(
+        ctx.run.status not in _FINISHED_STATUSES,
+        f"run.failed not allowed from status {ctx.run.status}",
+    )
+    ctx.run.status = RunStatus.FAILED
+    return ctx.mutations
+
+
+@_reduces(RunSucceededDraft)
+def _reduce_run_succeeded(ctx: _ReduceContext, draft: RunSucceededDraft) -> _Mutations:
+    _require(
+        ctx.run.status == RunStatus.RUNNING,
+        f"run.succeeded requires a running run, got {ctx.run.status}",
+    )
+    _require(ctx.run.open_batch_id is None, "run.succeeded requires no open tool batch")
+    ctx.run.status = RunStatus.SUCCEEDED
+    return ctx.mutations
+
+
+@_reduces(StepStartedDraft)
+def _reduce_step_started(ctx: _ReduceContext, draft: StepStartedDraft) -> _Mutations:
+    _require(
+        ctx.run.status in _ACTIVE_STATUSES,
+        f"step.started requires an active run, got {ctx.run.status}",
+    )
+    _require(ctx.run.open_batch_id is None, "step.started requires no open tool batch")
+    _require(
+        draft.index == ctx.run.steps + 1,
+        f"step index {draft.index} does not follow step count {ctx.run.steps}",
+    )
+    ctx.run.status = RunStatus.RUNNING
+    ctx.run.steps += 1
+    ctx.run.current_step_id = draft.step_id
+    return ctx.mutations
+
+
+@_reduces(ModelCompletedDraft)
+def _reduce_model_completed(
+    ctx: _ReduceContext, draft: ModelCompletedDraft
+) -> _Mutations:
+    _require(
+        ctx.run.status == RunStatus.RUNNING, "model.completed requires a running run"
+    )
+    _require(
+        draft.step_id == ctx.run.current_step_id,
+        f"model.completed step {draft.step_id} is not the current step",
+    )
+    return ctx.mutations
+
+
+@_reduces(ModelFailedDraft, ModelAbortedDraft)
+def _reduce_model_outcome_noted(
+    ctx: _ReduceContext, draft: ModelFailedDraft | ModelAbortedDraft
+) -> _Mutations:
+    return ctx.mutations
+
+@_reduces(ToolBatchPlannedDraft)
+def _reduce_tool_batch_planned(
+    ctx: _ReduceContext, draft: ToolBatchPlannedDraft
+) -> _Mutations:
+    _require(
+        ctx.run.status == RunStatus.RUNNING,
+        "tool.batch_planned requires a running run",
+    )
+    _require(ctx.run.open_batch_id is None, "another tool batch is already open")
+    _require(
+        draft.step_id == ctx.run.current_step_id,
+        f"tool.batch_planned step {draft.step_id} is not the current step",
+    )
+    _require(bool(draft.calls), "tool.batch_planned requires at least one call")
+    planned_ids = {call.tool_call_id for call in draft.calls}
+    _require(
+        planned_ids == set(ctx.view.last_model_tool_call_ids),
+        "planned calls do not match the latest model.completed tool calls",
+    )
+    for call in draft.calls:
         _require(
-            invocation.status == ToolInvocationStatus.RUNNING,
-            "only a running invocation can be marked unknown",
+            call.args_hash == args_hash_for(call.args),
+            f"args_hash mismatch for planned call {call.tool_call_id}",
         )
-        mutations.invocations.append(
-            invocation.model_copy(
-                update={"status": ToolInvocationStatus.UNKNOWN, "updated_seq": seq}
+        ctx.mutations.invocations.append(
+            ToolInvocation(
+                tool_call_id=call.tool_call_id,
+                run_id=ctx.run_id,
+                batch_id=draft.batch_id,
+                step_id=draft.step_id,
+                index=call.index,
+                tool_name=call.name,
+                args=call.args,
+                args_hash=call.args_hash,
+                status=ToolInvocationStatus.PROPOSED,
+                updated_seq=ctx.seq,
             )
         )
-        return mutations
+    ctx.run.open_batch_id = draft.batch_id
+    return ctx.mutations
 
-    if isinstance(draft, ToolBatchClosedDraft):
-        _require(
-            run.open_batch_id == draft.batch_id,
-            f"tool.batch_closed batch {draft.batch_id} is not the open batch",
-        )
-        unobserved = [
-            invocation.tool_call_id
-            for invocation in view.invocations.values()
-            if invocation.batch_id == draft.batch_id and not invocation.observed
-        ]
-        _require(
-            not unobserved,
-            "tool.batch_closed requires every call to have an observation; missing: "
-            + ", ".join(unobserved),
-        )
-        run.open_batch_id = None
-        return mutations
 
-    if isinstance(draft, VerificationFailedDraft):
-        _require(status == RunStatus.RUNNING, "verification.failed requires a running run")
-        _require(
-            bool(draft.feedback.strip()),
-            "verification.failed requires feedback; retrying without feedback is banned",
+@_reduces(ToolProposedDraft)
+def _reduce_tool_proposed(ctx: _ReduceContext, draft: ToolProposedDraft) -> _Mutations:
+    invocation = ctx.invocation(draft.tool_call_id)
+    _require(
+        invocation.batch_id == ctx.run.open_batch_id,
+        "tool.proposed must target the open batch",
+    )
+    _require(
+        invocation.status == ToolInvocationStatus.PROPOSED,
+        f"tool.proposed requires status proposed, got {invocation.status}",
+    )
+    status_by_decision = {
+        ToolCallDecision.ALLOWED: ToolInvocationStatus.APPROVED,
+        ToolCallDecision.REQUIRES_APPROVAL: ToolInvocationStatus.AWAITING_APPROVAL,
+        ToolCallDecision.DENIED: ToolInvocationStatus.DENIED,
+    }
+    updates: dict[str, Any] = {
+        "status": status_by_decision[draft.decision],
+        "effect": draft.effect,
+        "risk": draft.risk,
+        "updated_seq": ctx.seq,
+    }
+    if draft.decision == ToolCallDecision.DENIED:
+        updates["denial_reason"] = (
+            draft.error.message if draft.error else "denied by policy"
         )
-        return mutations
+    ctx.mutations.invocations.append(invocation.model_copy(update=updates))
+    return ctx.mutations
 
-    raise LedgerError(f"unsupported event type: {draft.type}")
+
+@_reduces(ApprovalRequestedDraft)
+def _reduce_approval_requested(
+    ctx: _ReduceContext, draft: ApprovalRequestedDraft
+) -> _Mutations:
+    invocation = ctx.invocation(draft.tool_call_id)
+    _require(
+        invocation.status == ToolInvocationStatus.AWAITING_APPROVAL,
+        f"approval.requested requires awaiting_approval, got {invocation.status}",
+    )
+    _require(
+        draft.args_hash == invocation.args_hash,
+        "approval args_hash does not match the frozen invocation args",
+    )
+    existing = ctx.view.approvals.get(draft.approval_id)
+    _require(
+        existing is None or existing.status != ApprovalStatus.PENDING,
+        f"approval already pending: {draft.approval_id}",
+    )
+    ctx.mutations.approvals.append(
+        Approval(
+            id=draft.approval_id,
+            run_id=ctx.run_id,
+            tool_call_id=draft.tool_call_id,
+            args_hash=draft.args_hash,
+            status=ApprovalStatus.PENDING,
+            title=draft.title,
+            reason=draft.reason,
+            risk=draft.risk,
+            preview=draft.preview,
+            created_at=ctx.now,
+        )
+    )
+    ctx.mutations.invocations.append(
+        invocation.model_copy(
+            update={"approval_id": draft.approval_id, "updated_seq": ctx.seq}
+        )
+    )
+    ctx.run.status = RunStatus.WAITING_APPROVAL
+    return ctx.mutations
+
+
+@_reduces(ApprovalResolvedDraft)
+def _reduce_approval_resolved(
+    ctx: _ReduceContext, draft: ApprovalResolvedDraft
+) -> _Mutations:
+    approval = ctx.view.approvals.get(draft.approval_id)
+    if approval is None:
+        raise LedgerError(f"unknown approval: {draft.approval_id}")
+    _require(
+        approval.status == ApprovalStatus.PENDING,
+        f"approval already resolved: {draft.approval_id}",
+    )
+    approved = draft.resolution == "approved"
+    ctx.mutations.approvals.append(
+        approval.model_copy(
+            update={
+                "status": ApprovalStatus.APPROVED if approved else ApprovalStatus.DENIED,
+                "resolved_at": ctx.now,
+                "resolved_by": draft.resolved_by,
+            }
+        )
+    )
+    invocation = ctx.invocation(approval.tool_call_id)
+    _require(
+        invocation.status == ToolInvocationStatus.AWAITING_APPROVAL,
+        f"approval target is not awaiting approval: {invocation.status}",
+    )
+    updates: dict[str, Any] = {"updated_seq": ctx.seq}
+    if approved:
+        updates["status"] = ToolInvocationStatus.APPROVED
+    else:
+        updates["status"] = ToolInvocationStatus.DENIED
+        updates["denial_reason"] = "denied by user"
+    ctx.mutations.invocations.append(invocation.model_copy(update=updates))
+    return ctx.mutations
+
+
+@_reduces(ToolInvocationStartedDraft)
+def _reduce_tool_invocation_started(
+    ctx: _ReduceContext, draft: ToolInvocationStartedDraft
+) -> _Mutations:
+    _require(
+        ctx.run.status == RunStatus.RUNNING,
+        "tool.invocation_started requires a running run",
+    )
+    invocation = ctx.invocation(draft.tool_call_id)
+    _require(
+        invocation.status == ToolInvocationStatus.APPROVED,
+        f"tool.invocation_started requires approved, got {invocation.status}",
+    )
+    _require(
+        draft.attempt == invocation.attempts + 1,
+        f"attempt {draft.attempt} does not follow attempts {invocation.attempts}",
+    )
+    ctx.mutations.invocations.append(
+        invocation.model_copy(
+            update={
+                "status": ToolInvocationStatus.RUNNING,
+                "attempts": invocation.attempts + 1,
+                "idempotency_key": draft.idempotency_key,
+                "updated_seq": ctx.seq,
+            }
+        )
+    )
+    return ctx.mutations
+
+
+@_reduces(ToolInvocationCompletedDraft)
+def _reduce_tool_invocation_completed(
+    ctx: _ReduceContext, draft: ToolInvocationCompletedDraft
+) -> _Mutations:
+    invocation = ctx.invocation(draft.tool_call_id)
+    if draft.outcome == "denied":
+        _require(
+            invocation.status == ToolInvocationStatus.DENIED
+            and not invocation.observed,
+            "denied observation backfill requires an unobserved denied invocation",
+        )
+        new_status = ToolInvocationStatus.DENIED
+    else:
+        _require(
+            invocation.status
+            in {ToolInvocationStatus.RUNNING, ToolInvocationStatus.UNKNOWN},
+            "tool.invocation_completed requires a running or unknown invocation, "
+            f"got {invocation.status}",
+        )
+        new_status = (
+            ToolInvocationStatus.SUCCEEDED
+            if draft.outcome == "succeeded"
+            else ToolInvocationStatus.FAILED
+        )
+    ctx.mutations.invocations.append(
+        invocation.model_copy(
+            update={
+                "status": new_status,
+                "observed": True,
+                "updated_seq": ctx.seq,
+            }
+        )
+    )
+    return ctx.mutations
+
+
+@_reduces(ToolInvocationMarkedUnknownDraft)
+def _reduce_tool_invocation_marked_unknown(
+    ctx: _ReduceContext, draft: ToolInvocationMarkedUnknownDraft
+) -> _Mutations:
+    invocation = ctx.invocation(draft.tool_call_id)
+    _require(
+        invocation.status == ToolInvocationStatus.RUNNING,
+        "only a running invocation can be marked unknown",
+    )
+    ctx.mutations.invocations.append(
+        invocation.model_copy(
+            update={"status": ToolInvocationStatus.UNKNOWN, "updated_seq": ctx.seq}
+        )
+    )
+    return ctx.mutations
+
+
+@_reduces(ToolBatchClosedDraft)
+def _reduce_tool_batch_closed(
+    ctx: _ReduceContext, draft: ToolBatchClosedDraft
+) -> _Mutations:
+    _require(
+        ctx.run.open_batch_id == draft.batch_id,
+        f"tool.batch_closed batch {draft.batch_id} is not the open batch",
+    )
+    unobserved = [
+        invocation.tool_call_id
+        for invocation in ctx.view.invocations.values()
+        if invocation.batch_id == draft.batch_id and not invocation.observed
+    ]
+    _require(
+        not unobserved,
+        "tool.batch_closed requires every call to have an observation; missing: "
+        + ", ".join(unobserved),
+    )
+    ctx.run.open_batch_id = None
+    return ctx.mutations
+
+
+@_reduces(VerificationFailedDraft)
+def _reduce_verification_failed(
+    ctx: _ReduceContext, draft: VerificationFailedDraft
+) -> _Mutations:
+    _require(
+        ctx.run.status == RunStatus.RUNNING,
+        "verification.failed requires a running run",
+    )
+    _require(
+        bool(draft.feedback.strip()),
+        "verification.failed requires feedback; retrying without feedback is banned",
+    )
+    return ctx.mutations
 
 
 def _open_batch_for(
