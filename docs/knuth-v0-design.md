@@ -403,7 +403,8 @@ cancellation checkpoint，普通对象）。流式输出的 shell、要写 artif
   超时 → `invocation_completed(outcome=failed, reason=timeout)`。
 - 并行维持原方案保守策略：v0 串行执行，保留 `parallelable`，将来"批内全部
   parallelable 才并行、按 index 顺序回填观测"。
-- 路径沙箱统一用 `Path.is_relative_to`（现实现已正确），禁止 `str.startswith`。
+- 内置工具不做路径圈禁，也不持有路径配置；路径语义即操作系统语义（绝对路径
+  原样使用，相对路径相对进程 cwd），访问控制归策略层（见 ADR-005）。
 
 ## 10. Hook 与观测（确认 CONTEXT.md 现状，不再扩权）
 

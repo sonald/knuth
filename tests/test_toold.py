@@ -35,14 +35,13 @@ def _invocation(name: str, args: dict, tool_call_id: str = "call-1") -> ToolInvo
 
 class DefaultToolRegistryTests(unittest.TestCase):
     def test_default_registry_exposes_required_tools(self) -> None:
-        with tempfile.TemporaryDirectory() as workspace:
-            registry = create_default_registry(Path(workspace))
-            broker = ToolBroker(registry)
+        registry = create_default_registry()
+        broker = ToolBroker(registry)
 
-            tools = anyio.run(broker.list_visible_tools, "run-1")
-            names = {tool["function"]["name"] for tool in tools}
+        tools = anyio.run(broker.list_visible_tools, "run-1")
+        names = {tool["function"]["name"] for tool in tools}
 
-            self.assertEqual(names, {"read_file", "write_file", "shell", "python"})
+        self.assertEqual(names, {"read_file", "write_file", "shell", "python"})
 
     def test_entry_point_discovery_is_off_by_default(self) -> None:
         registry = ToolRegistry()
@@ -50,106 +49,105 @@ class DefaultToolRegistryTests(unittest.TestCase):
 
     def test_file_tools_write_and_read_workspace_file(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
-            registry = create_default_registry(Path(workspace))
+            registry = create_default_registry()
             broker = ToolBroker(registry)
             anyio.run(registry.refresh)
 
+            file_path = str(Path(workspace, "notes", "hello.txt"))
             write_result = anyio.run(
                 broker.execute,
                 _invocation(
                     "write_file",
-                    {"path": "notes/hello.txt", "content": "hello knuth"},
+                    {"path": file_path, "content": "hello knuth"},
                 ),
             )
             read_result = anyio.run(
                 broker.execute,
-                _invocation("read_file", {"path": "notes/hello.txt"}),
+                _invocation("read_file", {"path": file_path}),
             )
 
             self.assertTrue(write_result.ok)
             self.assertEqual(read_result.content, "hello knuth")
 
     def test_process_tools_capture_stdout(self) -> None:
-        with tempfile.TemporaryDirectory() as workspace:
-            registry = create_default_registry(Path(workspace))
-            broker = ToolBroker(registry)
-            anyio.run(registry.refresh)
+        registry = create_default_registry()
+        broker = ToolBroker(registry)
+        anyio.run(registry.refresh)
 
-            shell_result = anyio.run(
-                broker.execute,
-                _invocation("shell", {"command": "printf shell-ok"}),
-            )
-            python_result = anyio.run(
-                broker.execute,
-                _invocation("python", {"code": "print('python-ok')"}),
-            )
+        shell_result = anyio.run(
+            broker.execute,
+            _invocation("shell", {"command": "printf shell-ok"}),
+        )
+        python_result = anyio.run(
+            broker.execute,
+            _invocation("python", {"code": "print('python-ok')"}),
+        )
 
-            self.assertTrue(shell_result.ok)
-            self.assertEqual(shell_result.content, "shell-ok")
-            self.assertTrue(python_result.ok)
-            self.assertEqual(python_result.content.strip(), "python-ok")
+        self.assertTrue(shell_result.ok)
+        self.assertEqual(shell_result.content, "shell-ok")
+        self.assertTrue(python_result.ok)
+        self.assertEqual(python_result.content.strip(), "python-ok")
 
     def test_tool_broker_uses_policy_for_approval_decisions(self) -> None:
-        with tempfile.TemporaryDirectory() as workspace:
-            registry = create_default_registry(Path(workspace))
-            broker = ToolBroker(registry, PolicyEngine())
+        registry = create_default_registry()
+        broker = ToolBroker(registry, PolicyEngine())
 
-            read = anyio.run(broker.propose, "run-1", "read_file", {"path": "x"})
-            write = anyio.run(
-                broker.propose, "run-1", "write_file", {"path": "x", "content": "y"}
-            )
+        read = anyio.run(broker.propose, "run-1", "read_file", {"path": "x"})
+        write = anyio.run(
+            broker.propose, "run-1", "write_file", {"path": "x", "content": "y"}
+        )
 
-            self.assertEqual(read.decision, ToolCallDecision.ALLOWED)
-            self.assertEqual(write.decision, ToolCallDecision.REQUIRES_APPROVAL)
-            self.assertEqual(write.effect, ToolEffect.LOCAL_WRITE)
-            self.assertTrue(write.approval_title)
+        self.assertEqual(read.decision, ToolCallDecision.ALLOWED)
+        self.assertEqual(write.decision, ToolCallDecision.REQUIRES_APPROVAL)
+        self.assertEqual(write.effect, ToolEffect.LOCAL_WRITE)
+        self.assertTrue(write.approval_title)
 
     def test_propose_is_pure_and_repeatable(self) -> None:
-        with tempfile.TemporaryDirectory() as workspace:
-            registry = create_default_registry(Path(workspace))
-            broker = ToolBroker(registry, PolicyEngine())
+        registry = create_default_registry()
+        broker = ToolBroker(registry, PolicyEngine())
 
-            first = anyio.run(
-                broker.propose, "run-1", "write_file", {"path": "x", "content": "y"}
-            )
-            second = anyio.run(
-                broker.propose, "run-1", "write_file", {"path": "x", "content": "y"}
-            )
+        first = anyio.run(
+            broker.propose, "run-1", "write_file", {"path": "x", "content": "y"}
+        )
+        second = anyio.run(
+            broker.propose, "run-1", "write_file", {"path": "x", "content": "y"}
+        )
 
-            self.assertEqual(first.decision, second.decision)
+        self.assertEqual(first.decision, second.decision)
 
     def test_tool_broker_wraps_execution_errors_as_tool_results(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
-            registry = create_default_registry(Path(workspace))
+            registry = create_default_registry()
             broker = ToolBroker(registry)
             anyio.run(registry.refresh)
 
             result = anyio.run(
-                broker.execute, _invocation("read_file", {"path": "missing.txt"})
+                broker.execute,
+                _invocation(
+                    "read_file", {"path": str(Path(workspace, "missing.txt"))}
+                ),
             )
 
             self.assertFalse(result.ok)
             self.assertEqual(result.error.code, "FileNotFoundError")
 
     def test_tool_broker_denies_invalid_arguments(self) -> None:
-        with tempfile.TemporaryDirectory() as workspace:
-            registry = create_default_registry(Path(workspace))
-            broker = ToolBroker(registry)
+        registry = create_default_registry()
+        broker = ToolBroker(registry)
 
-            proposal = anyio.run(broker.propose, "run-1", "read_file", {})
+        proposal = anyio.run(broker.propose, "run-1", "read_file", {})
 
-            self.assertEqual(proposal.decision, ToolCallDecision.DENIED)
-            self.assertEqual(proposal.error.code, "invalid_tool_arguments")
+        self.assertEqual(proposal.decision, ToolCallDecision.DENIED)
+        self.assertEqual(proposal.error.code, "invalid_tool_arguments")
 
     def test_tool_broker_denies_unknown_tool(self) -> None:
-        with tempfile.TemporaryDirectory() as workspace:
-            registry = create_default_registry(Path(workspace))
-            broker = ToolBroker(registry)
+        registry = create_default_registry()
+        broker = ToolBroker(registry)
 
-            proposal = anyio.run(broker.propose, "run-1", "nope", {})
+        proposal = anyio.run(broker.propose, "run-1", "nope", {})
 
-            self.assertEqual(proposal.decision, ToolCallDecision.DENIED)
-            self.assertEqual(proposal.error.code, "tool_not_found")
+        self.assertEqual(proposal.decision, ToolCallDecision.DENIED)
+        self.assertEqual(proposal.error.code, "tool_not_found")
 
 
 class _SleepyTool:

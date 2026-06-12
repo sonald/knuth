@@ -31,7 +31,7 @@ async def build_runtime(
         inference_config=InferenceConfig(timeout_s=config.timeout),
         db_path=db_path,
         section_providers=build_cli_system_sections(config.system_prompt),
-        tools=create_cli_tools(Path.cwd()),
+        tools=create_cli_tools(),
         enable_plugins=enable_plugins,
         debug_sink_dir=DEFAULT_DEBUG_SINK_DIR if debug else None,
     )

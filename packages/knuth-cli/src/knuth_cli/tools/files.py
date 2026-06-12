@@ -9,25 +9,16 @@ from knuth.core.tools import ToolResult
 from knuth_toold.base import ToolManifest, ToolRuntimeContext
 
 
-class _ExecutionContextTool:
-    def __init__(self, cwd: Path | str | None = None) -> None:
-        path = Path.cwd() if cwd is None else Path(cwd)
-        self._execution_dir = path.resolve()
-
-    def _base_path(self) -> Path:
-        return self._execution_dir
-
-    def _execution_path(self, raw_path: object) -> Path:
-        if not isinstance(raw_path, str) or not raw_path:
-            raise ValueError("path must be a non-empty string")
-        base = self._base_path()
-        path = (base / raw_path).resolve()
-        if not path.is_relative_to(base):
-            raise ValueError("path must stay within the execution directory")
-        return path
+# Tools take paths as given: absolute paths are used as-is, relative paths
+# resolve against the process cwd (plain OS semantics). Path access control
+# belongs to the policy layer, not here (ADR-005).
+def _require_path(raw_path: object) -> Path:
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError("path must be a non-empty string")
+    return Path(raw_path)
 
 
-class ReadFileTool(_ExecutionContextTool):
+class ReadFileTool:
     max_read_bytes = 32 * 1024
 
     @property
@@ -35,9 +26,9 @@ class ReadFileTool(_ExecutionContextTool):
         return ToolManifest(
             name="read_file",
             description=(
-                "Read a UTF-8 text file from the current execution directory "
-                "with line numbers. Path must stay within the execution "
-                "directory. Reads support 1-based offset and line limit. "
+                "Read a UTF-8 text file with line numbers. Paths may be "
+                "absolute or relative to the process working directory. "
+                "Reads support 1-based offset and line limit. "
                 "Maximum returned content per call is 32KiB (32768 bytes); "
                 "larger requests fail with no partial content returned."
             ),
@@ -69,7 +60,7 @@ class ReadFileTool(_ExecutionContextTool):
         if limit < 1:
             raise ValueError("limit must be >= 1")
 
-        path = self._execution_path(raw_path)
+        path = _require_path(raw_path)
         async with await anyio.open_file(path, encoding="utf-8") as file:
             lines = await file.readlines()
 
@@ -101,23 +92,23 @@ class ReadFileTool(_ExecutionContextTool):
                 )
             )
 
-        relative_path = path.relative_to(self._base_path())
         end_line = offset + len(selected) - 1
         header = (
-            f"File({relative_path}) - Lines {offset}-{end_line} "
+            f"File({path}) - Lines {offset}-{end_line} "
             f"of {len(lines)} total:"
         )
         return ToolResult.success(content="\n".join([header, *rendered_lines]))
 
 
-class WriteFileTool(_ExecutionContextTool):
+class WriteFileTool:
     @property
     def manifest(self) -> ToolManifest:
         return ToolManifest(
             name="write_file",
             description=(
-                "Write UTF-8 text content to a file inside the current execution "
-                "directory. Parent directories are created as needed."
+                "Write UTF-8 text content to a file. Paths may be absolute "
+                "or relative to the process working directory. Parent "
+                "directories are created as needed."
             ),
             parameters={
                 "type": "object",
@@ -136,19 +127,17 @@ class WriteFileTool(_ExecutionContextTool):
         self, invocation: ToolInvocation, ctx: ToolRuntimeContext
     ) -> ToolResult:
         _ = ctx
-        path = self._execution_path(invocation.args.get("path"))
+        path = _require_path(invocation.args.get("path"))
         content = invocation.args.get("content")
         if not isinstance(content, str):
             raise ValueError("content must be a string")
         await anyio.Path(path.parent).mkdir(parents=True, exist_ok=True)
         async with await anyio.open_file(path, "w", encoding="utf-8") as file:
             await file.write(content)
-        return ToolResult.success(
-            content=f"Wrote {path.relative_to(self._base_path())}"
-        )
+        return ToolResult.success(content=f"Wrote {path}")
 
 
-class EditFileTool(_ExecutionContextTool):
+class EditFileTool:
     _encodings = (
         "utf-8-sig",
         "utf-8",
@@ -163,8 +152,9 @@ class EditFileTool(_ExecutionContextTool):
         return ToolManifest(
             name="edit_file",
             description=(
-                "Edit a text file inside the current execution directory by exact "
-                "string replacement. old_string must be non-empty and different "
+                "Edit a text file by exact string replacement. Paths may be "
+                "absolute or relative to the process working directory. "
+                "old_string must be non-empty and different "
                 "from new_string. By default the match must be unique; set "
                 "replace_all=true to replace every match. The tool detects common "
                 "text encodings and writes the file back using the original encoding."
@@ -188,7 +178,7 @@ class EditFileTool(_ExecutionContextTool):
         self, invocation: ToolInvocation, ctx: ToolRuntimeContext
     ) -> ToolResult:
         _ = ctx
-        path = self._execution_path(invocation.args.get("path"))
+        path = _require_path(invocation.args.get("path"))
         if not path.exists() or not path.is_file():
             raise ValueError("path must point to an existing file")
 
@@ -215,10 +205,9 @@ class EditFileTool(_ExecutionContextTool):
         replacement_count = count if replace_all else 1
         edited = text.replace(old_string, new_string, -1 if replace_all else 1)
         await anyio.Path(path).write_bytes(edited.encode(encoding))
-        relative_path = path.relative_to(self._base_path())
         return ToolResult.success(
             content=(
-                f"Edited {relative_path} "
+                f"Edited {path} "
                 f"(replacements={replacement_count}, encoding={encoding})"
             )
         )

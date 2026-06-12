@@ -26,7 +26,7 @@ def _invocation(args: dict, *, run_id: str = "run-1") -> ToolInvocation:
 class CliShellToolTests(unittest.TestCase):
     def test_shell_returns_structured_output(self) -> None:
         async def scenario(tmp_path: Path, offload_root: Path):
-            registry = ToolRegistry([ShellTool(tmp_path, offload_root=offload_root)])
+            registry = ToolRegistry([ShellTool(offload_root=offload_root)])
             await registry.refresh()
             broker = ToolBroker(registry)
 
@@ -49,7 +49,6 @@ class CliShellToolTests(unittest.TestCase):
     def test_shell_offloads_large_output_with_metadata(self) -> None:
         async def scenario(tmp_path: Path, offload_root: Path):
             tool = ShellTool(
-                tmp_path,
                 offload_root=offload_root,
                 threshold_bytes=12,
                 preview_bytes=5,
@@ -94,7 +93,7 @@ class CliShellToolTests(unittest.TestCase):
 
     def test_shell_nonzero_exit_keeps_structured_output(self) -> None:
         async def scenario(tmp_path: Path, offload_root: Path):
-            registry = ToolRegistry([ShellTool(tmp_path, offload_root=offload_root)])
+            registry = ToolRegistry([ShellTool(offload_root=offload_root)])
             await registry.refresh()
             broker = ToolBroker(registry)
 

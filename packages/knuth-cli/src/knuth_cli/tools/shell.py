@@ -11,20 +11,17 @@ from knuth.core.invocations import ToolEffect, ToolInvocation, ToolRisk
 from knuth.core.tools import ToolResult, ToolResultStatus
 from knuth_toold.base import ToolManifest, ToolRuntimeContext
 
-from knuth_cli.tools.files import _ExecutionContextTool
 from knuth_cli.tools.process_output import render_tagged_process_output
 
 
-class ShellTool(_ExecutionContextTool):
+class ShellTool:
     def __init__(
         self,
-        cwd: Path | str | None = None,
         *,
         offload_root: Path | str | None = None,
         threshold_bytes: int = 4096,
         preview_bytes: int = 2048,
     ) -> None:
-        super().__init__(cwd)
         self._offload_root = (
             Path.home() / ".knuth" / "offload" / "shell"
             if offload_root is None
@@ -38,7 +35,7 @@ class ShellTool(_ExecutionContextTool):
         return ToolManifest(
             name="shell",
             description=(
-                "Run a shell command in the current execution directory and return "
+                "Run a shell command in the process working directory and return "
                 "structured stdout, stderr, return_code, and offload metadata when "
                 "output is too large."
             ),
@@ -61,7 +58,6 @@ class ShellTool(_ExecutionContextTool):
             raise ValueError("command must be a non-empty string")
         completed = await anyio.run_process(
             ["/bin/sh", "-c", command],
-            cwd=self._base_path(),
             check=False,
         )
         stdout_bytes = completed.stdout
@@ -140,7 +136,7 @@ class ShellTool(_ExecutionContextTool):
             "run_id": run_id,
             "tool_call_id": tool_call_id,
             "timestamp_utc": datetime.now(UTC).isoformat(),
-            "cwd": str(self._base_path()),
+            "cwd": str(Path.cwd()),
             "return_code": return_code,
             "command_sha256": hashlib.sha256(command.encode()).hexdigest(),
             "threshold_bytes": self._threshold_bytes,

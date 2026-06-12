@@ -27,10 +27,12 @@ class CliReadFileToolTests(unittest.TestCase):
         async def scenario(tmp_path: Path):
             file_path = tmp_path / "notes.txt"
             file_path.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
-            tool = ReadFileTool(tmp_path)
+            tool = ReadFileTool()
 
             result = await tool.invoke(
-                _invocation("read_file", {"path": "notes.txt", "offset": 2, "limit": 2}),
+                _invocation(
+                    "read_file", {"path": str(file_path), "offset": 2, "limit": 2}
+                ),
                 ToolRuntimeContext(run_id="run-1", tool_call_id="call-1"),
             )
 
@@ -40,7 +42,10 @@ class CliReadFileToolTests(unittest.TestCase):
             result = anyio.run(scenario, Path(temp_dir))
 
         self.assertTrue(result.ok)
-        self.assertIn("File(notes.txt) - Lines 2-3 of 3 total:", result.content)
+        self.assertIn(
+            f"File({Path(temp_dir) / 'notes.txt'}) - Lines 2-3 of 3 total:",
+            result.content,
+        )
         self.assertIn("   2: beta", result.content)
         self.assertIn("   3: gamma", result.content)
 
@@ -48,12 +53,14 @@ class CliReadFileToolTests(unittest.TestCase):
         async def scenario(tmp_path: Path):
             file_path = tmp_path / "big.txt"
             file_path.write_text(("a" * 20000) + "\n" + ("b" * 20000) + "\n")
-            registry = ToolRegistry([ReadFileTool(tmp_path)])
+            registry = ToolRegistry([ReadFileTool()])
             await registry.refresh()
             broker = ToolBroker(registry)
 
             return await broker.execute(
-                _invocation("read_file", {"path": "big.txt", "offset": 1, "limit": 2})
+                _invocation(
+                    "read_file", {"path": str(file_path), "offset": 1, "limit": 2}
+                )
             )
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -70,13 +77,13 @@ class CliEditFileToolTests(unittest.TestCase):
         async def scenario(tmp_path: Path):
             file_path = tmp_path / "notes.txt"
             file_path.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
-            tool = EditFileTool(tmp_path)
+            tool = EditFileTool()
 
             result = await tool.invoke(
                 _invocation(
                     "edit_file",
                     {
-                        "path": "notes.txt",
+                        "path": str(file_path),
                         "old_string": "beta",
                         "new_string": "BETA",
                     },
@@ -91,7 +98,7 @@ class CliEditFileToolTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertEqual(content, "alpha\nBETA\ngamma\n")
-        self.assertIn("Edited notes.txt", result.content)
+        self.assertIn(f"Edited {Path(temp_dir) / 'notes.txt'}", result.content)
         self.assertIn("replacements=1", result.content)
         self.assertIn("encoding=utf-8", result.content)
 
@@ -99,7 +106,7 @@ class CliEditFileToolTests(unittest.TestCase):
         async def scenario(tmp_path: Path):
             file_path = tmp_path / "notes.txt"
             file_path.write_text("beta\nbeta\n", encoding="utf-8")
-            registry = ToolRegistry([EditFileTool(tmp_path)])
+            registry = ToolRegistry([EditFileTool()])
             await registry.refresh()
             broker = ToolBroker(registry)
 
@@ -107,7 +114,7 @@ class CliEditFileToolTests(unittest.TestCase):
                 _invocation(
                     "edit_file",
                     {
-                        "path": "notes.txt",
+                        "path": str(file_path),
                         "old_string": "beta",
                         "new_string": "BETA",
                     },
@@ -117,7 +124,7 @@ class CliEditFileToolTests(unittest.TestCase):
                 _invocation(
                     "edit_file",
                     {
-                        "path": "notes.txt",
+                        "path": str(file_path),
                         "old_string": "beta",
                         "new_string": "BETA",
                         "replace_all": True,
@@ -139,13 +146,13 @@ class CliEditFileToolTests(unittest.TestCase):
         async def scenario(tmp_path: Path):
             file_path = tmp_path / "notes.txt"
             file_path.write_text("alpha\nbeta\n", encoding="utf-16")
-            tool = EditFileTool(tmp_path)
+            tool = EditFileTool()
 
             result = await tool.invoke(
                 _invocation(
                     "edit_file",
                     {
-                        "path": "notes.txt",
+                        "path": str(file_path),
                         "old_string": "beta",
                         "new_string": "BETA",
                     },

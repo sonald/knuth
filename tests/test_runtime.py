@@ -686,8 +686,8 @@ class CapturingScriptedClient(ScriptedInferenceClient):
             yield event
 
 
-def _build_runtime(workspace: str, client, section_providers=None):
-    registry = create_default_registry(Path(workspace))
+def _build_runtime(client, section_providers=None):
+    registry = create_default_registry()
     broker = ToolBroker(registry, PolicyEngine())
     return build_memory_runtime(
         inference_client=client,
@@ -701,9 +701,9 @@ def _build_runtime(workspace: str, client, section_providers=None):
 class EventDrivenRuntimeTests(unittest.TestCase):
     def test_runtime_executes_tool_then_succeeds(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
-            Path(workspace, "fact.txt").write_text("Knuth works", encoding="utf-8")
+            fact_path = Path(workspace, "fact.txt")
+            fact_path.write_text("Knuth works", encoding="utf-8")
             runtime = _build_runtime(
-                workspace,
                 ScriptedInferenceClient(
                     [
                         InferenceMessage(
@@ -713,7 +713,7 @@ class EventDrivenRuntimeTests(unittest.TestCase):
                                 CoreToolCall(
                                     tool_call_id="call-1",
                                     name="read_file",
-                                    arguments={"path": "fact.txt"},
+                                    arguments={"path": str(fact_path)},
                                 )
                             ],
                         ),
@@ -749,15 +749,13 @@ class EventDrivenRuntimeTests(unittest.TestCase):
             self.assertEqual(reconstructed[-1].content, "Final answer: Knuth works")
 
     def test_step_started_carries_context_snapshot(self) -> None:
-        with tempfile.TemporaryDirectory() as workspace:
-            runtime = _build_runtime(
-                workspace,
-                ScriptedInferenceClient(
-                    [InferenceMessage(role=InferenceRole.ASSISTANT, content="hi")]
-                ),
-            )
-            turn = anyio.run(runtime.run_once, "hello")
-            events = anyio.run(runtime.events, turn.run_id)
+        runtime = _build_runtime(
+            ScriptedInferenceClient(
+                [InferenceMessage(role=InferenceRole.ASSISTANT, content="hi")]
+            ),
+        )
+        turn = anyio.run(runtime.run_once, "hello")
+        events = anyio.run(runtime.events, turn.run_id)
 
         step_events = [event for event in events if event.type == "step.started"]
         self.assertEqual(len(step_events), 1)
@@ -768,8 +766,8 @@ class EventDrivenRuntimeTests(unittest.TestCase):
 
     def test_approval_resume_executes_frozen_tool_call(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
+            target = str(Path(workspace, "x.txt"))
             runtime = _build_runtime(
-                workspace,
                 ScriptedInferenceClient(
                     [
                         InferenceMessage(
@@ -778,7 +776,7 @@ class EventDrivenRuntimeTests(unittest.TestCase):
                                 CoreToolCall(
                                     tool_call_id="call-write",
                                     name="write_file",
-                                    arguments={"path": "x.txt", "content": "hello"},
+                                    arguments={"path": target, "content": "hello"},
                                 )
                             ],
                         ),
@@ -793,7 +791,7 @@ class EventDrivenRuntimeTests(unittest.TestCase):
             # Approval is bound to the exact frozen arguments.
             self.assertEqual(
                 pending[0].args_hash,
-                args_hash_for({"path": "x.txt", "content": "hello"}),
+                args_hash_for({"path": target, "content": "hello"}),
             )
             anyio.run(runtime.approve, pending[0].id)
 
@@ -810,99 +808,95 @@ class EventDrivenRuntimeTests(unittest.TestCase):
             )
 
     def test_resume_without_resolving_approval_fails_loudly(self) -> None:
-        with tempfile.TemporaryDirectory() as workspace:
-            runtime = _build_runtime(
-                workspace,
-                ScriptedInferenceClient(
-                    [
-                        InferenceMessage(
-                            role=InferenceRole.ASSISTANT,
-                            tool_calls=[
-                                CoreToolCall(
-                                    tool_call_id="call-write",
-                                    name="write_file",
-                                    arguments={"path": "x.txt", "content": "hello"},
-                                )
-                            ],
-                        ),
-                    ]
-                ),
-            )
-            first = anyio.run(runtime.run_once, "write x")
-            self.assertEqual(first.status, RunStatus.WAITING_APPROVAL)
-
-            async def resume():
-                async with runtime.resume(first.run_id) as session:
-                    return await session.result()
-
-            with self.assertRaisesRegex(LedgerError, "pending approvals"):
-                anyio.run(resume)
-
-    def test_denied_approval_resumes_and_informs_model(self) -> None:
-        """A denied tool call must not deadlock the run: on resume the model
-        receives a denied tool result and the run can complete."""
-        with tempfile.TemporaryDirectory() as workspace:
-            client = CapturingScriptedClient(
+        runtime = _build_runtime(
+            ScriptedInferenceClient(
                 [
                     InferenceMessage(
                         role=InferenceRole.ASSISTANT,
                         tool_calls=[
                             CoreToolCall(
-                                tool_call_id="call-shell",
-                                name="shell",
-                                arguments={"command": "date"},
+                                tool_call_id="call-write",
+                                name="write_file",
+                                arguments={"path": "x.txt", "content": "hello"},
                             )
                         ],
                     ),
-                    InferenceMessage(
-                        role=InferenceRole.ASSISTANT,
-                        content="Understood, I will not run that command.",
-                    ),
                 ]
-            )
-            runtime = _build_runtime(workspace, client)
+            ),
+        )
+        first = anyio.run(runtime.run_once, "write x")
+        self.assertEqual(first.status, RunStatus.WAITING_APPROVAL)
 
-            first = anyio.run(runtime.run_once, "run date")
-            self.assertEqual(first.status, RunStatus.WAITING_APPROVAL)
-            pending = anyio.run(runtime.pending_approvals, first.run_id)
-            self.assertEqual(len(pending), 1)
-            anyio.run(runtime.deny, pending[0].id)
+        async def resume():
+            async with runtime.resume(first.run_id) as session:
+                return await session.result()
 
-            async def resume():
-                async with runtime.resume(first.run_id) as session:
-                    return await session.result()
+        with self.assertRaisesRegex(LedgerError, "pending approvals"):
+            anyio.run(resume)
 
-            resumed = anyio.run(resume)
-
-            self.assertEqual(resumed.status, RunStatus.SUCCEEDED)
-            final_turn_messages = client.captured_messages[-1]
-            tool_results = [
-                message
-                for message in final_turn_messages
-                if message.role == InferenceRole.TOOL_RESULT
+    def test_denied_approval_resumes_and_informs_model(self) -> None:
+        """A denied tool call must not deadlock the run: on resume the model
+        receives a denied tool result and the run can complete."""
+        client = CapturingScriptedClient(
+            [
+                InferenceMessage(
+                    role=InferenceRole.ASSISTANT,
+                    tool_calls=[
+                        CoreToolCall(
+                            tool_call_id="call-shell",
+                            name="shell",
+                            arguments={"command": "date"},
+                        )
+                    ],
+                ),
+                InferenceMessage(
+                    role=InferenceRole.ASSISTANT,
+                    content="Understood, I will not run that command.",
+                ),
             ]
-            self.assertTrue(tool_results)
-            self.assertIn("denied", (tool_results[-1].content or "").lower())
-            self.assertEqual(anyio.run(runtime.pending_approvals, first.run_id), [])
-            events = anyio.run(runtime.events, first.run_id)
-            denied = [
-                event
-                for event in events
-                if event.type == "tool.invocation_completed"
-                and event.outcome == "denied"
-            ]
-            self.assertTrue(denied)
+        )
+        runtime = _build_runtime(client)
+
+        first = anyio.run(runtime.run_once, "run date")
+        self.assertEqual(first.status, RunStatus.WAITING_APPROVAL)
+        pending = anyio.run(runtime.pending_approvals, first.run_id)
+        self.assertEqual(len(pending), 1)
+        anyio.run(runtime.deny, pending[0].id)
+
+        async def resume():
+            async with runtime.resume(first.run_id) as session:
+                return await session.result()
+
+        resumed = anyio.run(resume)
+
+        self.assertEqual(resumed.status, RunStatus.SUCCEEDED)
+        final_turn_messages = client.captured_messages[-1]
+        tool_results = [
+            message
+            for message in final_turn_messages
+            if message.role == InferenceRole.TOOL_RESULT
+        ]
+        self.assertTrue(tool_results)
+        self.assertIn("denied", (tool_results[-1].content or "").lower())
+        self.assertEqual(anyio.run(runtime.pending_approvals, first.run_id), [])
+        events = anyio.run(runtime.events, first.run_id)
+        denied = [
+            event
+            for event in events
+            if event.type == "tool.invocation_completed"
+            and event.outcome == "denied"
+        ]
+        self.assertTrue(denied)
 
     def test_verification_failure_feeds_back_to_model(self) -> None:
-        with tempfile.TemporaryDirectory() as workspace:
-            client = CapturingScriptedClient(
-                [
-                    InferenceMessage(role=InferenceRole.ASSISTANT, content="   "),
-                    InferenceMessage(role=InferenceRole.ASSISTANT, content="Real answer"),
-                ]
-            )
-            runtime = _build_runtime(workspace, client)
-            turn = anyio.run(runtime.run_once, "answer me")
+        client = CapturingScriptedClient(
+            [
+                InferenceMessage(role=InferenceRole.ASSISTANT, content="   "),
+                InferenceMessage(role=InferenceRole.ASSISTANT, content="Real answer"),
+            ]
+        )
+        runtime = _build_runtime(client)
+        turn = anyio.run(runtime.run_once, "answer me")
 
         self.assertEqual(turn.status, RunStatus.SUCCEEDED)
         self.assertEqual(turn.answer, "Real answer")
@@ -915,7 +909,8 @@ class EventDrivenRuntimeTests(unittest.TestCase):
     def test_large_observation_is_offloaded_to_artifact(self) -> None:
         big = "x" * (OBSERVATION_INLINE_LIMIT + 100)
         with tempfile.TemporaryDirectory() as workspace:
-            Path(workspace, "big.txt").write_text(big, encoding="utf-8")
+            big_path = Path(workspace, "big.txt")
+            big_path.write_text(big, encoding="utf-8")
             client = CapturingScriptedClient(
                 [
                     InferenceMessage(
@@ -924,14 +919,14 @@ class EventDrivenRuntimeTests(unittest.TestCase):
                             CoreToolCall(
                                 tool_call_id="call-1",
                                 name="read_file",
-                                arguments={"path": "big.txt"},
+                                arguments={"path": str(big_path)},
                             )
                         ],
                     ),
                     InferenceMessage(role=InferenceRole.ASSISTANT, content="done"),
                 ]
             )
-            runtime = _build_runtime(workspace, client)
+            runtime = _build_runtime(client)
             turn = anyio.run(runtime.run_once, "read big")
             events = anyio.run(runtime.events, turn.run_id)
 
@@ -959,8 +954,8 @@ class CrashRecoveryTests(unittest.TestCase):
 
         return anyio.run(scenario)
 
-    def _runtime_with_ledger(self, workspace: str, client, ledger):
-        registry = create_default_registry(Path(workspace))
+    def _runtime_with_ledger(self, client, ledger):
+        registry = create_default_registry()
         broker = ToolBroker(registry, PolicyEngine())
         return build_memory_runtime(
             inference_client=client,
@@ -993,16 +988,14 @@ class CrashRecoveryTests(unittest.TestCase):
     def test_crashed_retryable_tool_fails_and_model_recovers(self) -> None:
         ledger = MemoryRunLedger()
         run_id = self._simulate_crash_mid_execution(ledger, effect=ToolEffect.READ)
-        with tempfile.TemporaryDirectory() as workspace:
-            runtime = self._runtime_with_ledger(
-                workspace,
-                ScriptedInferenceClient(
-                    [InferenceMessage(role=InferenceRole.ASSISTANT, content="recovered")]
-                ),
-                ledger,
-            )
-            result = self._resume(runtime, run_id)
-            events = anyio.run(runtime.events, run_id)
+        runtime = self._runtime_with_ledger(
+            ScriptedInferenceClient(
+                [InferenceMessage(role=InferenceRole.ASSISTANT, content="recovered")]
+            ),
+            ledger,
+        )
+        result = self._resume(runtime, run_id)
+        events = anyio.run(runtime.events, run_id)
 
         self.assertEqual(result.status, RunStatus.SUCCEEDED)
         completed = [
@@ -1018,79 +1011,72 @@ class CrashRecoveryTests(unittest.TestCase):
         run_id = self._simulate_crash_mid_execution(
             ledger, effect=ToolEffect.EXTERNAL_WRITE
         )
-        with tempfile.TemporaryDirectory() as workspace:
-            runtime = self._runtime_with_ledger(
-                workspace,
-                ScriptedInferenceClient(
-                    [InferenceMessage(role=InferenceRole.ASSISTANT, content="after")]
-                ),
-                ledger,
-            )
-            result = self._resume(runtime, run_id)
-            self.assertEqual(result.status, RunStatus.PAUSED)
+        runtime = self._runtime_with_ledger(
+            ScriptedInferenceClient(
+                [InferenceMessage(role=InferenceRole.ASSISTANT, content="after")]
+            ),
+            ledger,
+        )
+        result = self._resume(runtime, run_id)
+        self.assertEqual(result.status, RunStatus.PAUSED)
 
-            async def invocation_status():
-                return (await ledger.get_invocation("c1")).status
+        async def invocation_status():
+            return (await ledger.get_invocation("c1")).status
 
-            self.assertEqual(
-                anyio.run(invocation_status), ToolInvocationStatus.UNKNOWN
-            )
+        self.assertEqual(
+            anyio.run(invocation_status), ToolInvocationStatus.UNKNOWN
+        )
 
-            # Human resolves the unknown outcome, then the run can resume.
-            resolved = anyio.run(
-                runtime.resolve_unknown, "c1", "succeeded", "saw it on the server"
-            )
-            self.assertEqual(resolved.status, ToolInvocationStatus.SUCCEEDED)
-            final = self._resume(runtime, run_id)
-            self.assertEqual(final.status, RunStatus.SUCCEEDED)
+        # Human resolves the unknown outcome, then the run can resume.
+        resolved = anyio.run(
+            runtime.resolve_unknown, "c1", "succeeded", "saw it on the server"
+        )
+        self.assertEqual(resolved.status, ToolInvocationStatus.SUCCEEDED)
+        final = self._resume(runtime, run_id)
+        self.assertEqual(final.status, RunStatus.SUCCEEDED)
 
     def test_recover_scan_settles_retryable_work_and_pauses_run(self) -> None:
         ledger = MemoryRunLedger()
         run_id = self._simulate_crash_mid_execution(ledger, effect=ToolEffect.READ)
-        with tempfile.TemporaryDirectory() as workspace:
-            runtime = self._runtime_with_ledger(
-                workspace,
-                ScriptedInferenceClient(
-                    [InferenceMessage(role=InferenceRole.ASSISTANT, content="done")]
-                ),
-                ledger,
-            )
-            reports = anyio.run(runtime.recover_crashed_runs)
-            self.assertEqual(
-                reports, [CrashRecoveryReport(run_id=run_id, failed=1, unknown=0)]
-            )
-            self.assertEqual(anyio.run(runtime.status, run_id), RunStatus.PAUSED)
+        runtime = self._runtime_with_ledger(
+            ScriptedInferenceClient(
+                [InferenceMessage(role=InferenceRole.ASSISTANT, content="done")]
+            ),
+            ledger,
+        )
+        reports = anyio.run(runtime.recover_crashed_runs)
+        self.assertEqual(
+            reports, [CrashRecoveryReport(run_id=run_id, failed=1, unknown=0)]
+        )
+        self.assertEqual(anyio.run(runtime.status, run_id), RunStatus.PAUSED)
 
-            async def invocation_status():
-                return (await ledger.get_invocation("c1")).status
+        async def invocation_status():
+            return (await ledger.get_invocation("c1")).status
 
-            self.assertEqual(anyio.run(invocation_status), ToolInvocationStatus.FAILED)
+        self.assertEqual(anyio.run(invocation_status), ToolInvocationStatus.FAILED)
 
-            # A recovered run resumes normally: the loop closes the settled
-            # batch and the model sees the crash observation.
-            result = self._resume(runtime, run_id)
-            self.assertEqual(result.status, RunStatus.SUCCEEDED)
+        # A recovered run resumes normally: the loop closes the settled
+        # batch and the model sees the crash observation.
+        result = self._resume(runtime, run_id)
+        self.assertEqual(result.status, RunStatus.SUCCEEDED)
 
     def test_recover_scan_marks_external_write_unknown(self) -> None:
         ledger = MemoryRunLedger()
         run_id = self._simulate_crash_mid_execution(
             ledger, effect=ToolEffect.EXTERNAL_WRITE
         )
-        with tempfile.TemporaryDirectory() as workspace:
-            runtime = self._runtime_with_ledger(
-                workspace, ScriptedInferenceClient([]), ledger
-            )
-            reports = anyio.run(runtime.recover_crashed_runs)
-            self.assertEqual(
-                reports, [CrashRecoveryReport(run_id=run_id, failed=0, unknown=1)]
-            )
+        runtime = self._runtime_with_ledger(ScriptedInferenceClient([]), ledger)
+        reports = anyio.run(runtime.recover_crashed_runs)
+        self.assertEqual(
+            reports, [CrashRecoveryReport(run_id=run_id, failed=0, unknown=1)]
+        )
 
-            async def invocation_status():
-                return (await ledger.get_invocation("c1")).status
+        async def invocation_status():
+            return (await ledger.get_invocation("c1")).status
 
-            self.assertEqual(
-                anyio.run(invocation_status), ToolInvocationStatus.UNKNOWN
-            )
+        self.assertEqual(
+            anyio.run(invocation_status), ToolInvocationStatus.UNKNOWN
+        )
 
     def test_recover_scan_skips_runs_that_are_not_running(self) -> None:
         ledger = MemoryRunLedger()
@@ -1223,31 +1209,27 @@ class CapturingInferenceClient:
 
 class SystemPreambleTests(unittest.TestCase):
     def test_base_identity_delivered_as_leading_system_message(self) -> None:
-        with tempfile.TemporaryDirectory() as workspace:
-            client = CapturingInferenceClient(["Hello"])
-            runtime = _build_runtime(
-                workspace,
-                client,
-                [StaticSectionProvider(SystemSectionSource.BASE, "BASE")],
-            )
-            anyio.run(runtime.run_once, "hi")
+        client = CapturingInferenceClient(["Hello"])
+        runtime = _build_runtime(
+            client,
+            [StaticSectionProvider(SystemSectionSource.BASE, "BASE")],
+        )
+        anyio.run(runtime.run_once, "hi")
 
         first_turn_messages = client.captured_messages[0]
         self.assertEqual(first_turn_messages[0].role, InferenceRole.SYSTEM)
         self.assertEqual(first_turn_messages[0].content, "BASE")
 
     def test_sections_composed_in_provider_injection_order(self) -> None:
-        with tempfile.TemporaryDirectory() as workspace:
-            client = CapturingInferenceClient(["Hello"])
-            runtime = _build_runtime(
-                workspace,
-                client,
-                [
-                    StaticSectionProvider(SystemSectionSource.BASE, "BASE"),
-                    StaticSectionProvider(SystemSectionSource.USER, "USER"),
-                ],
-            )
-            anyio.run(runtime.run_once, "hi")
+        client = CapturingInferenceClient(["Hello"])
+        runtime = _build_runtime(
+            client,
+            [
+                StaticSectionProvider(SystemSectionSource.BASE, "BASE"),
+                StaticSectionProvider(SystemSectionSource.USER, "USER"),
+            ],
+        )
+        anyio.run(runtime.run_once, "hi")
 
         first_turn_messages = client.captured_messages[0]
         self.assertEqual(first_turn_messages[0].role, InferenceRole.SYSTEM)
@@ -1258,14 +1240,12 @@ class SystemPreambleTests(unittest.TestCase):
         self.assertEqual(len(system_messages), 1)
 
     def test_no_system_message_when_all_sections_empty(self) -> None:
-        with tempfile.TemporaryDirectory() as workspace:
-            client = CapturingInferenceClient(["Hello"])
-            runtime = _build_runtime(
-                workspace,
-                client,
-                [StaticSectionProvider(SystemSectionSource.USER, None)],
-            )
-            anyio.run(runtime.run_once, "hi")
+        client = CapturingInferenceClient(["Hello"])
+        runtime = _build_runtime(
+            client,
+            [StaticSectionProvider(SystemSectionSource.USER, None)],
+        )
+        anyio.run(runtime.run_once, "hi")
 
         first_turn_messages = client.captured_messages[0]
         self.assertTrue(
@@ -1274,7 +1254,8 @@ class SystemPreambleTests(unittest.TestCase):
 
     def test_preamble_present_on_every_turn(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
-            Path(workspace, "fact.txt").write_text("ok", encoding="utf-8")
+            fact_path = Path(workspace, "fact.txt")
+            fact_path.write_text("ok", encoding="utf-8")
             client = CapturingScriptedClient(
                 [
                     InferenceMessage(
@@ -1284,7 +1265,7 @@ class SystemPreambleTests(unittest.TestCase):
                             CoreToolCall(
                                 tool_call_id="call-1",
                                 name="read_file",
-                                arguments={"path": "fact.txt"},
+                                arguments={"path": str(fact_path)},
                             )
                         ],
                     ),
@@ -1292,7 +1273,6 @@ class SystemPreambleTests(unittest.TestCase):
                 ]
             )
             runtime = _build_runtime(
-                workspace,
                 client,
                 [StaticSectionProvider(SystemSectionSource.BASE, "BASE")],
             )
@@ -1345,10 +1325,9 @@ class StreamingRuntimeTests(unittest.TestCase):
     def test_run_session_forwards_runtime_event_projection(self) -> None:
         async def scenario():
             collector = _Collector()
-            with tempfile.TemporaryDirectory() as workspace:
-                runtime = _build_runtime(workspace, StreamingTextClient(["Hello there"]))
-                async with runtime.start("hi", listeners=[collector]) as session:
-                    result = await session.result()
+            runtime = _build_runtime(StreamingTextClient(["Hello there"]))
+            async with runtime.start("hi", listeners=[collector]) as session:
+                result = await session.result()
             return result, collector.events
 
         result, collected = anyio.run(scenario)
@@ -1366,14 +1345,13 @@ class StreamingRuntimeTests(unittest.TestCase):
 
     def test_required_listener_failure_raises_observation_error_with_result(self) -> None:
         async def scenario():
-            with tempfile.TemporaryDirectory() as workspace:
-                runtime = _build_runtime(workspace, StreamingTextClient(["Hello there"]))
-                async with runtime.start(
-                    "hi", listeners=[_RequiredFailingListener()]
-                ) as session:
-                    with self.assertRaises(RuntimeObservationError) as raised:
-                        await session.result()
-                    return raised.exception
+            runtime = _build_runtime(StreamingTextClient(["Hello there"]))
+            async with runtime.start(
+                "hi", listeners=[_RequiredFailingListener()]
+            ) as session:
+                with self.assertRaises(RuntimeObservationError) as raised:
+                    await session.result()
+                return raised.exception
 
         error = anyio.run(scenario)
 
@@ -1384,10 +1362,9 @@ class StreamingRuntimeTests(unittest.TestCase):
     def test_run_session_projects_streamed_tool_call_start_without_id_collision(self) -> None:
         async def scenario():
             collector = _Collector()
-            with tempfile.TemporaryDirectory() as workspace:
-                runtime = _build_runtime(workspace, StreamingToolCallProjectionClient())
-                async with runtime.start("use a tool", listeners=[collector]) as session:
-                    result = await session.result()
+            runtime = _build_runtime(StreamingToolCallProjectionClient())
+            async with runtime.start("use a tool", listeners=[collector]) as session:
+                result = await session.result()
             return result, collector.events
 
         result, collected = anyio.run(scenario)
@@ -1405,7 +1382,8 @@ class StreamingRuntimeTests(unittest.TestCase):
         async def scenario():
             collector = _Collector()
             with tempfile.TemporaryDirectory() as workspace:
-                Path(workspace, "fact.txt").write_text("ok", encoding="utf-8")
+                fact_path = Path(workspace, "fact.txt")
+                fact_path.write_text("ok", encoding="utf-8")
                 client = ScriptedInferenceClient(
                     [
                         InferenceMessage(
@@ -1415,7 +1393,7 @@ class StreamingRuntimeTests(unittest.TestCase):
                                 CoreToolCall(
                                     tool_call_id="call-1",
                                     name="read_file",
-                                    arguments={"path": "fact.txt"},
+                                    arguments={"path": str(fact_path)},
                                 )
                             ],
                         ),
@@ -1424,7 +1402,7 @@ class StreamingRuntimeTests(unittest.TestCase):
                         ),
                     ]
                 )
-                runtime = _build_runtime(workspace, client)
+                runtime = _build_runtime(client)
                 async with runtime.start("read it", listeners=[collector]) as session:
                     result = await session.result()
             return result, collector.events
@@ -1439,22 +1417,21 @@ class StreamingRuntimeTests(unittest.TestCase):
 
     def test_run_session_keeps_multi_turn_memory(self) -> None:
         async def scenario():
-            with tempfile.TemporaryDirectory() as workspace:
-                runtime = _build_runtime(
-                    workspace, StreamingTextClient(["first answer", "second answer"])
-                )
-                collector = _Collector()
-                async with runtime.start("question one", listeners=[collector]) as session:
-                    first = await session.result()
-                async with runtime.continue_run(
-                    first.run_id, "question two", listeners=[collector]
-                ) as session:
-                    second = await session.result()
-                events = await runtime.events(first.run_id)
-                ledger = runtime._services.ledger
-                messages = await reconstruct_messages_from_events(
-                    events, ledger.get_artifact_text
-                )
+            runtime = _build_runtime(
+                StreamingTextClient(["first answer", "second answer"])
+            )
+            collector = _Collector()
+            async with runtime.start("question one", listeners=[collector]) as session:
+                first = await session.result()
+            async with runtime.continue_run(
+                first.run_id, "question two", listeners=[collector]
+            ) as session:
+                second = await session.result()
+            events = await runtime.events(first.run_id)
+            ledger = runtime._services.ledger
+            messages = await reconstruct_messages_from_events(
+                events, ledger.get_artifact_text
+            )
             return first, second, messages
 
         first, second, messages = anyio.run(scenario)

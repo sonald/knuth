@@ -13,32 +13,24 @@ from knuth_toold.base import ToolManifest, ToolRuntimeContext
 from knuth_toold.registry import ToolRegistry
 
 
-class _ExecutionContextTool:
-    """Base for builtin tools that resolve paths inside an execution directory."""
-
-    def __init__(self, cwd: Path | str | None = None) -> None:
-        path = Path.cwd() if cwd is None else Path(cwd)
-        self._execution_dir = path.resolve()
-
-    def _base_path(self) -> Path:
-        return self._execution_dir
-
-    def _execution_path(self, raw_path: object) -> Path:
-        if not isinstance(raw_path, str) or not raw_path:
-            raise ValueError("path must be a non-empty string")
-        base = self._base_path()
-        path = (base / raw_path).resolve()
-        if not path.is_relative_to(base):
-            raise ValueError("path must stay within the execution directory")
-        return path
+# Tools take paths as given: absolute paths are used as-is, relative paths
+# resolve against the process cwd (plain OS semantics). Path access control
+# belongs to the policy layer, not here (ADR-005).
+def _require_path(raw_path: object) -> Path:
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError("path must be a non-empty string")
+    return Path(raw_path)
 
 
-class ReadFileTool(_ExecutionContextTool):
+class ReadFileTool:
     @property
     def manifest(self) -> ToolManifest:
         return ToolManifest(
             name="read_file",
-            description="Read a UTF-8 text file from the current execution directory.",
+            description=(
+                "Read a UTF-8 text file. Paths may be absolute or relative "
+                "to the process working directory."
+            ),
             parameters={
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
@@ -54,18 +46,22 @@ class ReadFileTool(_ExecutionContextTool):
     async def invoke(
         self, invocation: ToolInvocation, ctx: ToolRuntimeContext
     ) -> ToolResult:
-        path = self._execution_path(invocation.args.get("path"))
+        path = _require_path(invocation.args.get("path"))
         async with await anyio.open_file(path, encoding="utf-8") as file:
             content = await file.read()
         return ToolResult.success(content=content, data={"path": str(path)})
 
 
-class WriteFileTool(_ExecutionContextTool):
+class WriteFileTool:
     @property
     def manifest(self) -> ToolManifest:
         return ToolManifest(
             name="write_file",
-            description="Write UTF-8 text content to the current execution directory.",
+            description=(
+                "Write UTF-8 text content to a file. Paths may be absolute "
+                "or relative to the process working directory. Parent "
+                "directories are created as needed."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -82,24 +78,22 @@ class WriteFileTool(_ExecutionContextTool):
     async def invoke(
         self, invocation: ToolInvocation, ctx: ToolRuntimeContext
     ) -> ToolResult:
-        path = self._execution_path(invocation.args.get("path"))
+        path = _require_path(invocation.args.get("path"))
         content = invocation.args.get("content")
         if not isinstance(content, str):
             raise ValueError("content must be a string")
         await anyio.Path(path.parent).mkdir(parents=True, exist_ok=True)
         async with await anyio.open_file(path, "w", encoding="utf-8") as file:
             await file.write(content)
-        base = self._base_path()
-        return ToolResult.success(content=f"Wrote {path.relative_to(base)}")
+        return ToolResult.success(content=f"Wrote {path}")
 
 
-class _SubprocessTool(_ExecutionContextTool):
+class _SubprocessTool:
     async def _run(self, command: list[str], timeout_s: float) -> ToolResult:
         with anyio.fail_after(timeout_s):
             completed = await anyio.run_process(
                 command,
                 stdin=None,
-                cwd=self._base_path(),
                 check=False,
             )
         stdout = completed.stdout.decode()
@@ -120,7 +114,7 @@ class ShellTool(_SubprocessTool):
     def manifest(self) -> ToolManifest:
         return ToolManifest(
             name="shell",
-            description="Run a shell command in the current execution directory.",
+            description="Run a shell command in the process working directory.",
             parameters={
                 "type": "object",
                 "properties": {"command": {"type": "string"}},
@@ -146,7 +140,7 @@ class PythonTool(_SubprocessTool):
     def manifest(self) -> ToolManifest:
         return ToolManifest(
             name="python",
-            description="Run a Python snippet in the current execution directory.",
+            description="Run a Python snippet in the process working directory.",
             parameters={
                 "type": "object",
                 "properties": {"code": {"type": "string"}},
@@ -168,16 +162,15 @@ class PythonTool(_SubprocessTool):
 
 
 def create_default_registry(
-    cwd: Path | str | None = None,
     *,
     enable_entry_point_discovery: bool = False,
 ) -> ToolRegistry:
     return ToolRegistry(
         [
-            ReadFileTool(cwd),
-            WriteFileTool(cwd),
-            ShellTool(cwd),
-            PythonTool(cwd),
+            ReadFileTool(),
+            WriteFileTool(),
+            ShellTool(),
+            PythonTool(),
         ],
         enable_entry_point_discovery=enable_entry_point_discovery,
     )
