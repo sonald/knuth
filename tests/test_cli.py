@@ -285,7 +285,11 @@ class CliRuntimeFactoryTests(unittest.TestCase):
             by_name = anyio.run(scenario)
 
         self.assertIn("edit_file", by_name)
+        self.assertIn("glob", by_name)
+        self.assertIn("grep", by_name)
         self.assertIn("offset and line limit", by_name["read_file"]["description"])
+        self.assertIn("glob pattern", by_name["glob"]["description"])
+        self.assertIn("ripgrep regex syntax", by_name["grep"]["description"])
         self.assertIn("structured", by_name["shell"]["description"])
 
 

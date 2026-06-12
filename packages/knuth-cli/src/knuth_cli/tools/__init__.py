@@ -1,6 +1,7 @@
 from knuth.core.invocations import ToolInvocation
 from knuth.core.tools import ToolResult
 from knuth_cli.tools.files import EditFileTool, ReadFileTool, WriteFileTool
+from knuth_cli.tools.search import GlobTool, GrepTool
 from knuth_cli.tools.shell import ShellTool
 from knuth_toold.base import Tool, ToolManifest, ToolRuntimeContext
 from knuth_toold.builtins import PythonTool
@@ -14,6 +15,8 @@ class CliToolProvider:
             ReadFileTool(),
             WriteFileTool(),
             EditFileTool(),
+            GlobTool(),
+            GrepTool(),
             ShellTool(),
             PythonTool(),
         )
@@ -37,6 +40,8 @@ def create_cli_tool_provider() -> CliToolProvider:
 __all__ = [
     "CliToolProvider",
     "EditFileTool",
+    "GlobTool",
+    "GrepTool",
     "ReadFileTool",
     "ShellTool",
     "WriteFileTool",
