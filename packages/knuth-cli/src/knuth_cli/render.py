@@ -26,6 +26,7 @@ from knuth_cli.tools.process_output import TaggedProcessOutput, parse_tagged_pro
 _MAX_ARG_LEN = 80
 _MAX_RESULT_LEN = 400
 _MAX_REASONING_TAIL = 80
+_MAX_TOOL_PREVIEW_LINES = 6
 
 
 class EventRenderer:
@@ -237,11 +238,13 @@ class EventRenderer:
                 return
         mark = "✔" if ok else "✘"
         style = "green" if ok else "red"
-        summary = _truncate(str(body).strip().replace("\n", " "), _MAX_RESULT_LEN)
+        preview = _format_tool_preview(str(body))
         line = f"  {mark} {name}"
-        if summary:
-            line += f" — {summary}"
+        if preview.inline:
+            line += f" — {preview.inline}"
         self._console.print(Text(line, style=style))
+        for preview_line in preview.lines:
+            self._console.print(Text(f"    {preview_line}", style="dim"))
 
     def _print_shell_completed(self, output: TaggedProcessOutput, ok: bool) -> None:
         mark = "✔" if ok else "✘"
@@ -282,3 +285,25 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 1] + "…"
+
+
+class _ToolPreview:
+    def __init__(self, *, inline: str = "", lines: list[str] | None = None) -> None:
+        self.inline = inline
+        self.lines = lines or []
+
+
+def _format_tool_preview(body: str) -> _ToolPreview:
+    text = body.strip()
+    if not text:
+        return _ToolPreview()
+    lines = text.splitlines()
+    if len(lines) <= 1:
+        return _ToolPreview(inline=_truncate(text.replace("\n", " "), _MAX_RESULT_LEN))
+
+    visible = lines[:_MAX_TOOL_PREVIEW_LINES]
+    rendered = [_truncate(line, _MAX_RESULT_LEN) for line in visible]
+    hidden = len(lines) - len(visible)
+    if hidden > 0:
+        rendered.append(f"… {hidden} more lines")
+    return _ToolPreview(lines=rendered)

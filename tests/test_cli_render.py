@@ -107,6 +107,43 @@ class EventRendererShellToolTests(unittest.TestCase):
 
         self.assertIn("✔ shell — plain output", output.getvalue())
 
+    def test_non_shell_tool_completion_renders_first_observation_lines(self) -> None:
+        output = io.StringIO()
+        console = Console(file=output, force_terminal=False, color_system=None)
+        renderer = EventRenderer(console)
+
+        anyio.run(
+            renderer.handle_event,
+            SimpleNamespace(
+                type="tool.invocation_completed",
+                tool_name="read_file",
+                outcome="succeeded",
+                observation="\n".join(
+                    [
+                        "File(notes.txt) - Lines 1-8 of 8 total:",
+                        "   1: alpha",
+                        "   2: beta",
+                        "   3: gamma",
+                        "   4: delta",
+                        "   5: epsilon",
+                        "   6: zeta",
+                        "   7: eta",
+                        "   8: theta",
+                    ]
+                ),
+                observation_preview=None,
+            ),
+        )
+
+        rendered = output.getvalue()
+        self.assertIn("✔ read_file", rendered)
+        self.assertIn("File(notes.txt)", rendered)
+        self.assertIn("1: alpha", rendered)
+        self.assertIn("5: epsilon", rendered)
+        self.assertIn("… 3 more lines", rendered)
+        self.assertNotIn("6: zeta", rendered)
+        self.assertNotIn("8: theta", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()
