@@ -1,14 +1,44 @@
+from knuth.core.invocations import ToolInvocation
+from knuth.core.tools import ToolResult
 from knuth_cli.tools.files import EditFileTool, ReadFileTool, WriteFileTool
 from knuth_cli.tools.shell import ShellTool
+from knuth_toold.base import Tool, ToolManifest, ToolRuntimeContext
+from knuth_toold.builtins import PythonTool
 
 
-def create_cli_tools():
-    return [
-        ReadFileTool(),
-        WriteFileTool(),
-        EditFileTool(),
-        ShellTool(),
-    ]
+class CliToolProvider:
+    name = "knuth-cli"
+
+    def __init__(self) -> None:
+        tools = (
+            ReadFileTool(),
+            WriteFileTool(),
+            EditFileTool(),
+            ShellTool(),
+            PythonTool(),
+        )
+        self._tools: dict[str, Tool] = {tool.manifest.name: tool for tool in tools}
+
+    async def list_tools(self) -> list[ToolManifest]:
+        return [tool.manifest for tool in self._tools.values()]
+
+    async def call_tool(
+        self,
+        invocation: ToolInvocation,
+        ctx: ToolRuntimeContext,
+    ) -> ToolResult:
+        return await self._tools[invocation.tool_name].invoke(invocation, ctx)
 
 
-__all__ = ["EditFileTool", "ReadFileTool", "ShellTool", "WriteFileTool", "create_cli_tools"]
+def create_cli_tool_provider() -> CliToolProvider:
+    return CliToolProvider()
+
+
+__all__ = [
+    "CliToolProvider",
+    "EditFileTool",
+    "ReadFileTool",
+    "ShellTool",
+    "WriteFileTool",
+    "create_cli_tool_provider",
+]

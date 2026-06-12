@@ -15,6 +15,7 @@ from knuth_toold.broker import (
     ToolProposal,
 )
 from knuth_toold.builtins import (
+    BuiltinToolProvider,
     PythonTool,
     ReadFileTool,
     ShellTool,
@@ -22,7 +23,7 @@ from knuth_toold.builtins import (
     create_default_registry,
 )
 from knuth_toold.providers import ToolProvider
-from knuth_toold.registry import BuiltinToolProvider, ToolRegistry
+from knuth_toold.registry import ToolRegistry
 
 __all__ = [
     "AllowAllPolicy",

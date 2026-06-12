@@ -19,7 +19,7 @@ from knuth.core.runtime_events import (
 )
 from knuth.core.types import RunStatus
 from knuth_llmd import InferenceConfig
-from knuth_toold import Tool, ToolBroker, ToolProvider, create_default_registry
+from knuth_toold import ToolBroker, ToolProvider, ToolRegistry, create_default_registry
 
 from knuth_runtime.context import (
     ContextBuilder,
@@ -256,14 +256,24 @@ class _DemoInferenceClient:
         )
 
 
+def _build_tool_registry(
+    *,
+    include_default_tools: bool,
+    enable_plugins: bool,
+) -> ToolRegistry:
+    if include_default_tools:
+        return create_default_registry(enable_entry_point_discovery=enable_plugins)
+    return ToolRegistry(enable_entry_point_discovery=enable_plugins)
+
+
 def build_sqlite_runtime(
     *,
     inference_client,
     inference_config: InferenceConfig,
     db_path: Path | str | None = None,
     section_providers: list[SystemSectionProvider] | None = None,
-    tools: Iterable[Tool] = (),
     tool_providers: Iterable[ToolProvider] = (),
+    include_default_tools: bool = True,
     redactor: EventRedactor | None = None,
     enable_plugins: bool = False,
     debug_sink_dir: Path | str | None = None,
@@ -273,11 +283,10 @@ def build_sqlite_runtime(
     # redactor to change what counts as a secret.
     redactor = redactor or RegexSecretRedactor()
     ledger = SQLiteRunLedger(db_path or Path("~/.knuth/knuth.db"), redactor=redactor)
-    registry = create_default_registry(
-        enable_entry_point_discovery=enable_plugins
+    registry = _build_tool_registry(
+        include_default_tools=include_default_tools,
+        enable_plugins=enable_plugins,
     )
-    for tool in tools:
-        registry.register(tool)
     for provider in tool_providers:
         registry.add_provider(provider)
     broker = ToolBroker(registry, policy_engine=PolicyEngine())
@@ -317,14 +326,15 @@ def build_memory_runtime(
     ledger: RunLedger | None = None,
     tool_broker: ToolBroker | None = None,
     section_providers: list[SystemSectionProvider] | None = None,
-    tools: Iterable[Tool] = (),
     tool_providers: Iterable[ToolProvider] = (),
+    include_default_tools: bool = True,
 ) -> AgentRuntime:
     ledger = ledger or MemoryRunLedger()
     if tool_broker is None:
-        registry = create_default_registry()
-        for tool in tools:
-            registry.register(tool)
+        registry = _build_tool_registry(
+            include_default_tools=include_default_tools,
+            enable_plugins=False,
+        )
         for provider in tool_providers:
             registry.add_provider(provider)
         tool_broker = ToolBroker(

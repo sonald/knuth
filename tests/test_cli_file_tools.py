@@ -5,9 +5,10 @@ from pathlib import Path
 import anyio
 
 from knuth.core.invocations import ToolInvocation, args_hash_for
+from knuth.core.tools import ToolResult
 from knuth_cli.tools.files import EditFileTool, ReadFileTool
 from knuth_toold import ToolBroker, ToolRegistry
-from knuth_toold.base import ToolRuntimeContext
+from knuth_toold.base import ToolManifest, ToolRuntimeContext
 
 
 def _invocation(name: str, args: dict) -> ToolInvocation:
@@ -20,6 +21,21 @@ def _invocation(name: str, args: dict) -> ToolInvocation:
         args=args,
         args_hash=args_hash_for(args),
     )
+
+
+class _ToolSetProvider:
+    name = "test"
+
+    def __init__(self, *tools) -> None:
+        self._tools = {tool.manifest.name: tool for tool in tools}
+
+    async def list_tools(self) -> list[ToolManifest]:
+        return [tool.manifest for tool in self._tools.values()]
+
+    async def call_tool(
+        self, invocation: ToolInvocation, ctx: ToolRuntimeContext
+    ) -> ToolResult:
+        return await self._tools[invocation.tool_name].invoke(invocation, ctx)
 
 
 class CliReadFileToolTests(unittest.TestCase):
@@ -53,7 +69,8 @@ class CliReadFileToolTests(unittest.TestCase):
         async def scenario(tmp_path: Path):
             file_path = tmp_path / "big.txt"
             file_path.write_text(("a" * 20000) + "\n" + ("b" * 20000) + "\n")
-            registry = ToolRegistry([ReadFileTool()])
+            registry = ToolRegistry()
+            registry.add_provider(_ToolSetProvider(ReadFileTool()))
             await registry.refresh()
             broker = ToolBroker(registry)
 
@@ -106,7 +123,8 @@ class CliEditFileToolTests(unittest.TestCase):
         async def scenario(tmp_path: Path):
             file_path = tmp_path / "notes.txt"
             file_path.write_text("beta\nbeta\n", encoding="utf-8")
-            registry = ToolRegistry([EditFileTool()])
+            registry = ToolRegistry()
+            registry.add_provider(_ToolSetProvider(EditFileTool()))
             await registry.refresh()
             broker = ToolBroker(registry)
 

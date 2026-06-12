@@ -396,6 +396,12 @@ Pydantic）+ 能力句柄（put_artifact、emit_progress、
 cancellation checkpoint，普通对象）。流式输出的 shell、要写 artifact 的工具
 由此有了落点。
 
+`ToolProvider` 是工具集 ownership seam：provider 自己拥有一组 tool，并负责
+`list_tools` 与 `call_tool`。`ToolRegistry` 只注册 provider、索引 manifest、
+按工具名找到 provider；它不接受 standalone tool 注册，也不把外部工具塞进
+某个 provider 的内部集合。单个 registry 内工具名是 LLM-facing 全局名字；
+多个 provider 暴露同名工具必须 fail fast，不能靠注册顺序覆盖。
+
 ### 9.2 执行边界
 
 - `broker.execute` 包 `anyio.move_on_after(manifest.timeout_s)`，cancel scope
@@ -430,6 +436,7 @@ cancellation checkpoint，普通对象）。流式输出的 shell、要写 artif
 | 安全红线未提 | redact-before-append 等五条为 v0 地基 |
 | entry points 默认开 | 默认关，`--enable-plugins` |
 | ToolBase(BaseModel) 数据执行混合 | ToolManifest（数据）/ Tool Protocol（执行）分离 |
+| registry 可直接注入 tool 并覆盖 provider 内容 | ToolProvider 拥有工具集，registry 只注册 provider，同名工具冲突即失败 |
 | RuntimeEvent 三字段 namespace/name/type | 单一 `type`（实现已是） |
 
 ## 12. 实施顺序

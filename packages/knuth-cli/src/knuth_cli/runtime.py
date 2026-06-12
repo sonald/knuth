@@ -9,7 +9,7 @@ from knuth_runtime.debug import DEFAULT_DEBUG_SINK_DIR
 
 from knuth_cli.config import load_config
 from knuth_cli.prompts import build_cli_system_sections
-from knuth_cli.tools import create_cli_tools
+from knuth_cli.tools import create_cli_tool_provider
 
 
 async def build_runtime(
@@ -31,7 +31,8 @@ async def build_runtime(
         inference_config=InferenceConfig(timeout_s=config.timeout),
         db_path=db_path,
         section_providers=build_cli_system_sections(config.system_prompt),
-        tools=create_cli_tools(),
+        tool_providers=[create_cli_tool_provider()],
+        include_default_tools=False,
         enable_plugins=enable_plugins,
         debug_sink_dir=DEFAULT_DEBUG_SINK_DIR if debug else None,
     )

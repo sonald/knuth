@@ -1,60 +1,27 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
 from importlib.metadata import entry_points
 
-from knuth.core.invocations import ToolInvocation
-from knuth.core.tools import ToolResult
-
-from knuth_toold.base import Tool, ToolManifest, ToolRuntimeContext
+from knuth_toold.base import ToolManifest
 from knuth_toold.providers import ToolProvider
-
-
-class BuiltinToolProvider:
-    name = "builtin"
-
-    def __init__(self, tools: Iterable[Tool] = ()) -> None:
-        self._tools: dict[str, Tool] = {}
-        for tool in tools:
-            self.register(tool)
-
-    def register(self, tool: Tool) -> None:
-        self._tools[tool.manifest.name] = tool
-
-    async def list_tools(self) -> list[ToolManifest]:
-        return [tool.manifest for tool in self._tools.values()]
-
-    async def call_tool(
-        self,
-        invocation: ToolInvocation,
-        ctx: ToolRuntimeContext,
-    ) -> ToolResult:
-        return await self._tools[invocation.tool_name].invoke(invocation, ctx)
 
 
 class ToolRegistry:
     def __init__(
         self,
-        tools: Iterable[Tool] = (),
         *,
         enable_entry_point_discovery: bool = False,
     ) -> None:
         self._providers: dict[str, ToolProvider] = {}
         self._manifest_index: dict[str, tuple[ToolManifest, str]] = {}
-        self._builtin = BuiltinToolProvider()
         # Entry-point plugins execute third-party code in-process; they stay
         # off unless the host explicitly opted in (--enable-plugins).
         self._enable_entry_point_discovery = enable_entry_point_discovery
         self._entry_points_discovered = False
-        self.add_provider(self._builtin)
-        for tool in tools:
-            self.register(tool)
-
-    def register(self, tool: Tool) -> None:
-        self._builtin.register(tool)
-        self._manifest_index.clear()
 
     def add_provider(self, provider: ToolProvider) -> None:
+        if provider.name in self._providers:
+            raise ValueError(f"Tool provider already registered: {provider.name}")
         self._providers[provider.name] = provider
         self._manifest_index.clear()
 
@@ -64,6 +31,13 @@ class ToolRegistry:
         self._manifest_index.clear()
         for provider_name, provider in self._providers.items():
             for manifest in await provider.list_tools():
+                if manifest.name in self._manifest_index:
+                    _, existing_provider = self._manifest_index[manifest.name]
+                    raise ValueError(
+                        "Tool name conflict: "
+                        f"{manifest.name} from provider {provider_name} "
+                        f"conflicts with provider {existing_provider}"
+                    )
                 self._manifest_index[manifest.name] = (
                     manifest.model_copy(update={"provider": provider_name}),
                     provider_name,

@@ -350,7 +350,7 @@ class RunLedgerTests(unittest.TestCase):
 
 
 class RuntimeBuilderToolTests(unittest.TestCase):
-    def test_memory_runtime_accepts_host_tools_after_default_tools(self) -> None:
+    def test_memory_runtime_accepts_host_provider_without_default_tools(self) -> None:
         class HostReadFileTool:
             @property
             def manifest(self) -> ToolManifest:
@@ -367,10 +367,25 @@ class RuntimeBuilderToolTests(unittest.TestCase):
             async def invoke(self, invocation, ctx: ToolRuntimeContext) -> ToolResult:
                 return ToolResult.success(content="host")
 
+        class HostToolProvider:
+            name = "host"
+
+            def __init__(self) -> None:
+                self._tool = HostReadFileTool()
+
+            async def list_tools(self) -> list[ToolManifest]:
+                return [self._tool.manifest]
+
+            async def call_tool(
+                self, invocation, ctx: ToolRuntimeContext
+            ) -> ToolResult:
+                return await self._tool.invoke(invocation, ctx)
+
         runtime = build_memory_runtime(
             inference_client=None,
             inference_config=InferenceConfig(),
-            tools=[HostReadFileTool()],
+            tool_providers=[HostToolProvider()],
+            include_default_tools=False,
         )
 
         tools = anyio.run(runtime.tools)
@@ -380,7 +395,7 @@ class RuntimeBuilderToolTests(unittest.TestCase):
         }
 
         self.assertEqual(by_name["read_file"], "host read_file override")
-        self.assertIn("write_file", by_name)
+        self.assertNotIn("write_file", by_name)
 
 
 class _SecretRedactor:

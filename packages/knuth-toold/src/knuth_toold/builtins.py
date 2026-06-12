@@ -161,16 +161,35 @@ class PythonTool(_SubprocessTool):
         return await self._run([sys.executable, "-c", code], timeout_s=30)
 
 
-def create_default_registry(
-    *,
-    enable_entry_point_discovery: bool = False,
-) -> ToolRegistry:
-    return ToolRegistry(
-        [
+class BuiltinToolProvider:
+    name = "builtin"
+
+    def __init__(self) -> None:
+        tools = (
             ReadFileTool(),
             WriteFileTool(),
             ShellTool(),
             PythonTool(),
-        ],
+        )
+        self._tools = {tool.manifest.name: tool for tool in tools}
+
+    async def list_tools(self) -> list[ToolManifest]:
+        return [tool.manifest for tool in self._tools.values()]
+
+    async def call_tool(
+        self,
+        invocation: ToolInvocation,
+        ctx: ToolRuntimeContext,
+    ) -> ToolResult:
+        return await self._tools[invocation.tool_name].invoke(invocation, ctx)
+
+
+def create_default_registry(
+    *,
+    enable_entry_point_discovery: bool = False,
+) -> ToolRegistry:
+    registry = ToolRegistry(
         enable_entry_point_discovery=enable_entry_point_discovery,
     )
+    registry.add_provider(BuiltinToolProvider())
+    return registry

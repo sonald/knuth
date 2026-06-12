@@ -72,6 +72,10 @@ _Avoid_: CLI loop, REPL loop, inference stream, tool execution loop
 The runtime-facing gateway for tool workflow. The agent loop submits tool intents to it and receives proposals or execution records; tool registry, provider selection, policy checks, and approval requirements remain behind this gateway.
 _Avoid_: tool registry, policy engine, provider, direct tool call
 
+**ToolProvider**:
+The owned source of a named tool set. A provider lists the manifests it owns and executes invocations for those tools; `ToolRegistry` registers providers and indexes their manifests, but it does not mutate a provider's tool set or accept standalone tool injection. Tool names are global in one registry and conflicts must fail fast.
+_Avoid_: mutable tool bucket, registry-owned tool list, override order, external tool injector
+
 **SystemPreamble**:
 The single leading system message the runtime assembles each turn and places before the conversation. It is a computed projection of current context, not a durable fact: it is recomputed at build time from the available `SystemSection` values and never reconstructed from the event log. A run that resumes sees a freshly assembled preamble, not a snapshot of the one it started with.
 _Avoid_: durable event, persisted system prompt, static config string, message from history

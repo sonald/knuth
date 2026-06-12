@@ -16,6 +16,7 @@ from knuth_runtime.policy import PolicyEngine
 from knuth_toold import (
     ToolBroker,
     ToolManifest,
+    ToolRuntimeContext,
     ToolRegistry,
     create_default_registry,
 )
@@ -33,6 +34,21 @@ def _invocation(name: str, args: dict, tool_call_id: str = "call-1") -> ToolInvo
     )
 
 
+class _ToolSetProvider:
+    name = "test"
+
+    def __init__(self, *tools) -> None:
+        self._tools = {tool.manifest.name: tool for tool in tools}
+
+    async def list_tools(self) -> list[ToolManifest]:
+        return [tool.manifest for tool in self._tools.values()]
+
+    async def call_tool(
+        self, invocation: ToolInvocation, ctx: ToolRuntimeContext
+    ) -> ToolResult:
+        return await self._tools[invocation.tool_name].invoke(invocation, ctx)
+
+
 class DefaultToolRegistryTests(unittest.TestCase):
     def test_default_registry_exposes_required_tools(self) -> None:
         registry = create_default_registry()
@@ -46,6 +62,13 @@ class DefaultToolRegistryTests(unittest.TestCase):
     def test_entry_point_discovery_is_off_by_default(self) -> None:
         registry = ToolRegistry()
         self.assertFalse(registry._enable_entry_point_discovery)
+
+    def test_tool_name_conflicts_are_rejected(self) -> None:
+        registry = create_default_registry()
+        registry.add_provider(_ToolSetProvider(_SleepyTool(name="read_file")))
+
+        with self.assertRaisesRegex(ValueError, "Tool name conflict: read_file"):
+            anyio.run(registry.refresh)
 
     def test_file_tools_write_and_read_workspace_file(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
@@ -151,10 +174,13 @@ class DefaultToolRegistryTests(unittest.TestCase):
 
 
 class _SleepyTool:
+    def __init__(self, name: str = "sleepy") -> None:
+        self._name = name
+
     @property
     def manifest(self) -> ToolManifest:
         return ToolManifest(
-            name="sleepy",
+            name=self._name,
             description="Sleeps longer than its timeout.",
             parameters={"type": "object", "properties": {}},
             timeout_s=0.05,
@@ -167,7 +193,8 @@ class _SleepyTool:
 
 class TimeoutTests(unittest.TestCase):
     def test_execute_enforces_manifest_timeout(self) -> None:
-        registry = ToolRegistry([_SleepyTool()])
+        registry = ToolRegistry()
+        registry.add_provider(_ToolSetProvider(_SleepyTool()))
         broker = ToolBroker(registry)
         anyio.run(registry.refresh)
 
