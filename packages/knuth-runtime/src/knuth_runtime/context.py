@@ -16,7 +16,7 @@ from knuth.core.messages import (
 )
 from knuth.core.runtime_events import ContextSnapshot
 from knuth.core.types import KnuthModel
-from knuth_toold import ToolBroker
+from knuth_toold import ToolBroker, ToolProvider
 
 from knuth_runtime.ledger import RunLedger
 
@@ -123,13 +123,17 @@ class ContextBuilder:
         self.redactor = redactor
 
     async def build(
-        self, ctx: RunContext, *, model_config_fingerprint: str = ""
+        self,
+        ctx: RunContext,
+        *,
+        model_config_fingerprint: str = "",
+        tool_providers: tuple[ToolProvider, ...] = (),
     ) -> ContextView:
         view = await self._assemble(ctx)
         if self.redactor is not None:
             view = await self.redactor.redact(ctx, view)
         view = await self._compact(ctx, view)
-        view = await self._tool_filter(ctx, view)
+        view = await self._tool_filter(ctx, view, tool_providers=tool_providers)
         return self._freeze(view, model_config_fingerprint)
 
     async def _assemble(self, ctx: RunContext) -> ContextView:
@@ -156,8 +160,16 @@ class ContextBuilder:
             view = await middleware.process(ctx, view)
         return view
 
-    async def _tool_filter(self, ctx: RunContext, view: ContextView) -> ContextView:
-        tools = await self.tool_broker.list_visible_tools(ctx.run_id)
+    async def _tool_filter(
+        self,
+        ctx: RunContext,
+        view: ContextView,
+        *,
+        tool_providers: tuple[ToolProvider, ...] = (),
+    ) -> ContextView:
+        tools = await self.tool_broker.list_visible_tools(
+            ctx.run_id, overlay_providers=tool_providers
+        )
         return view.model_copy(update={"tools": tools})
 
     def _freeze(self, view: ContextView, model_config_fingerprint: str) -> ContextView:

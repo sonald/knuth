@@ -1,6 +1,7 @@
 from knuth_toold.base import (
     Tool,
     ToolEffect,
+    ToolExecutionMode,
     ToolManifest,
     ToolResult,
     ToolResultStatus,
@@ -36,6 +37,7 @@ __all__ = [
     "Tool",
     "ToolBroker",
     "ToolEffect",
+    "ToolExecutionMode",
     "ToolManifest",
     "ToolProposal",
     "ToolProvider",

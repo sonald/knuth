@@ -25,6 +25,7 @@ from knuth_runtime.context import (
     ContextBuilder,
     ContextRedactor,
     SystemSectionProvider,
+    reconstruct_messages_from_events,
 )
 from knuth_runtime.ledger import (
     EventRedactor,
@@ -76,14 +77,18 @@ class AgentRuntime:
         self,
         prompt: str,
         *,
+        run_id: str | None = None,
         listeners: Iterable[RuntimeEventListener] = (),
+        tool_providers: Iterable[ToolProvider] = (),
     ) -> RunSession:
         return RunSession(
             mode="start",
             services=self._services,
             inference_config=self._inference_config,
             prompt=prompt,
+            run_id=run_id,
             listeners=(*self._default_listeners, *listeners),
+            tool_providers=tool_providers,
         )
 
     def continue_run(
@@ -92,6 +97,7 @@ class AgentRuntime:
         prompt: str,
         *,
         listeners: Iterable[RuntimeEventListener] = (),
+        tool_providers: Iterable[ToolProvider] = (),
     ) -> RunSession:
         return RunSession(
             mode="continue",
@@ -100,6 +106,7 @@ class AgentRuntime:
             run_id=run_id,
             prompt=prompt,
             listeners=(*self._default_listeners, *listeners),
+            tool_providers=tool_providers,
         )
 
     def resume(
@@ -107,6 +114,7 @@ class AgentRuntime:
         run_id: str,
         *,
         listeners: Iterable[RuntimeEventListener] = (),
+        tool_providers: Iterable[ToolProvider] = (),
     ) -> RunSession:
         return RunSession(
             mode="resume",
@@ -114,6 +122,7 @@ class AgentRuntime:
             inference_config=self._inference_config,
             run_id=run_id,
             listeners=(*self._default_listeners, *listeners),
+            tool_providers=tool_providers,
         )
 
     async def approve(self, approval_id: str) -> Approval:
@@ -161,6 +170,38 @@ class AgentRuntime:
         )
         return await ledger.get_invocation(tool_call_id)
 
+    async def submit_tool_result(
+        self,
+        run_id: str,
+        tool_call_id: str,
+        outcome: Literal["succeeded", "failed"],
+        observation: str,
+        *,
+        tool_status: str = "client_tool_result",
+    ) -> ToolInvocation:
+        """Record a result supplied by an external/client tool executor.
+
+        This only appends the observation. The caller must resume the run
+        explicitly so transport adapters do not hide control-flow ownership.
+        """
+        ledger = self._services.ledger
+        invocation = await ledger.get_invocation(tool_call_id)
+        if invocation.run_id != run_id:
+            raise KeyError(
+                f"tool invocation {tool_call_id} does not belong to run {run_id}"
+            )
+        await ledger.apply(
+            run_id,
+            ToolInvocationCompletedDraft(
+                tool_call_id=tool_call_id,
+                tool_name=invocation.tool_name,
+                outcome=outcome,
+                observation=observation,
+                tool_status=tool_status,
+            ),
+        )
+        return await ledger.get_invocation(tool_call_id)
+
     async def status(self, run_id: str) -> RunStatus:
         return (await self._services.ledger.get_run(run_id)).status
 
@@ -182,6 +223,12 @@ class AgentRuntime:
 
     async def events(self, run_id: str) -> list[RuntimeEvent]:
         return await self._services.ledger.list_events(run_id)
+
+    async def messages(self, run_id: str) -> list[InferenceMessage]:
+        events = await self._services.ledger.list_events(run_id)
+        return await reconstruct_messages_from_events(
+            events, self._services.ledger.get_artifact_text
+        )
 
     async def tools(self) -> list[dict]:
         return await self._services.tool_broker.list_visible_tools("cli")

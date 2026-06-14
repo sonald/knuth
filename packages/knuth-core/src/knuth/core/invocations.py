@@ -36,9 +36,15 @@ class ToolCallDecision(StrEnum):
     DENIED = "denied"
 
 
+class ToolExecutionMode(StrEnum):
+    RUNTIME = "runtime"
+    EXTERNAL = "external"
+
+
 class ToolInvocationStatus(StrEnum):
     PROPOSED = "proposed"
     AWAITING_APPROVAL = "awaiting_approval"
+    WAITING_TOOL_RESULT = "waiting_tool_result"
     APPROVED = "approved"
     DENIED = "denied"
     RUNNING = "running"
@@ -61,6 +67,7 @@ class ToolInvocation(KnuthModel):
     status: ToolInvocationStatus = ToolInvocationStatus.PROPOSED
     effect: ToolEffect = ToolEffect.READ
     risk: ToolRisk = ToolRisk.LOW
+    execution_mode: ToolExecutionMode = ToolExecutionMode.RUNTIME
     approval_id: str | None = None
     attempt: int = 0
     observation_recorded: bool = False

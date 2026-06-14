@@ -110,6 +110,18 @@ class RunLedgerTests(unittest.TestCase):
         self.assertEqual(events[0].seq, 1)
         self.assertEqual(events[0].query, "hello")
 
+    def test_create_run_accepts_caller_supplied_id(self) -> None:
+        ledger = MemoryRunLedger()
+
+        async def scenario():
+            run = await ledger.create_run("hello", run_id="run_manual")
+            fetched = await ledger.get_run("run_manual")
+            return run, fetched
+
+        run, fetched = anyio.run(scenario)
+        self.assertEqual(run.id, "run_manual")
+        self.assertEqual(fetched.query, "hello")
+
     def test_sqlite_ledger_round_trips_events_and_projections(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             ledger = SQLiteRunLedger(Path(temp_dir, "knuth.db"))
@@ -1357,6 +1369,18 @@ class StreamingRuntimeTests(unittest.TestCase):
         self.assertTrue(all(not event.type.startswith("inference.") for event in collected))
         deltas = [event.delta for event in collected if event.type == "model.content.delta"]
         self.assertEqual(deltas, ["Hello there"])
+
+    def test_start_accepts_caller_supplied_run_id(self) -> None:
+        async def scenario():
+            runtime = _build_runtime(StreamingTextClient(["Hello there"]))
+            async with runtime.start("hi", run_id="run_manual") as session:
+                result = await session.result()
+            messages = await runtime.messages("run_manual")
+            return result, messages
+
+        result, messages = anyio.run(scenario)
+        self.assertEqual(result.run_id, "run_manual")
+        self.assertEqual([message.content for message in messages], ["hi", "Hello there"])
 
     def test_required_listener_failure_raises_observation_error_with_result(self) -> None:
         async def scenario():

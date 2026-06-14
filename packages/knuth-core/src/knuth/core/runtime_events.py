@@ -5,7 +5,12 @@ from typing import Any, Literal
 from pydantic import Field
 
 from knuth.core.inference_events import UsageInfo
-from knuth.core.invocations import ToolCallDecision, ToolEffect, ToolRisk
+from knuth.core.invocations import (
+    ToolCallDecision,
+    ToolEffect,
+    ToolExecutionMode,
+    ToolRisk,
+)
 from knuth.core.messages import ToolCall
 from knuth.core.types import ErrorInfo, EventDurability, KnuthModel, RunStatus
 
@@ -115,6 +120,7 @@ class ToolProposedDraft(RuntimeEventDraftBase):
     decision: ToolCallDecision
     effect: ToolEffect = ToolEffect.READ
     risk: ToolRisk = ToolRisk.LOW
+    execution_mode: ToolExecutionMode = ToolExecutionMode.RUNTIME
     error: ErrorInfo | None = None
 
 
@@ -140,6 +146,15 @@ class ToolInvocationStartedDraft(RuntimeEventDraftBase):
     type: Literal["tool.invocation_started"] = "tool.invocation_started"
     tool_call_id: str
     attempt: int = 1
+
+
+class ToolInvocationAwaitingExternalResultDraft(RuntimeEventDraftBase):
+    type: Literal["tool.invocation_awaiting_external_result"] = (
+        "tool.invocation_awaiting_external_result"
+    )
+    tool_call_id: str
+    tool_name: str
+    args: dict[str, Any] = Field(default_factory=dict)
 
 
 class ToolInvocationCompletedDraft(RuntimeEventDraftBase):
@@ -187,6 +202,7 @@ DurableRuntimeEventDraft = (
     | ApprovalRequestedDraft
     | ApprovalResolvedDraft
     | ToolInvocationStartedDraft
+    | ToolInvocationAwaitingExternalResultDraft
     | ToolInvocationCompletedDraft
     | ToolInvocationMarkedUnknownDraft
     | ToolBatchClosedDraft
@@ -344,6 +360,12 @@ class ToolInvocationStarted(ToolInvocationStartedDraft, StoredRuntimeEventBase):
     pass
 
 
+class ToolInvocationAwaitingExternalResult(
+    ToolInvocationAwaitingExternalResultDraft, StoredRuntimeEventBase
+):
+    pass
+
+
 class ToolInvocationCompleted(ToolInvocationCompletedDraft, StoredRuntimeEventBase):
     pass
 
@@ -411,6 +433,7 @@ StoredRuntimeEvent = (
     | ApprovalRequested
     | ApprovalResolved
     | ToolInvocationStarted
+    | ToolInvocationAwaitingExternalResult
     | ToolInvocationCompleted
     | ToolInvocationMarkedUnknown
     | ToolBatchClosed

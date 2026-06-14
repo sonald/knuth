@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
-from knuth.core.invocations import ToolEffect, ToolInvocation, ToolRisk
+from knuth.core.invocations import (
+    ToolEffect,
+    ToolExecutionMode,
+    ToolInvocation,
+    ToolRisk,
+)
 from knuth.core.tools import ToolResult, ToolResultStatus
 from knuth.core.types import KnuthModel
 
@@ -18,6 +23,7 @@ class ToolManifest(KnuthModel):
     cacheable: bool = False
     risk: ToolRisk = ToolRisk.LOW
     effect: ToolEffect = ToolEffect.READ
+    execution_mode: ToolExecutionMode = ToolExecutionMode.RUNTIME
     timeout_s: float | None = None
     provider: str = "builtin"
 
@@ -57,6 +63,7 @@ class Tool(Protocol):
 __all__ = [
     "Tool",
     "ToolEffect",
+    "ToolExecutionMode",
     "ToolManifest",
     "ToolResult",
     "ToolResultStatus",

@@ -101,8 +101,12 @@ A derived, rebuildable read model (runs, tool invocations, approvals, conversati
 _Avoid_: authoritative state, source of truth, cache that can silently drift
 
 **ToolInvocation**:
-The per-tool-call state machine projection, keyed by `tool_call_id` and carrying `args_hash` and `effect`. Its states are proposed, awaiting_approval, approved, denied, running, succeeded, failed, and unknown. It is the unit the agent loop schedules and the unit crash recovery reasons about; it subsumes what other designs call a pending action or execution record.
+The per-tool-call state machine projection, keyed by `tool_call_id` and carrying `args_hash`, `effect`, and `execution_mode`. Its states are proposed, awaiting_approval, approved, waiting_tool_result, denied, running, succeeded, failed, and unknown. It is the unit the agent loop schedules and the unit crash recovery reasons about; it subsumes what other designs call a pending action or execution record.
 _Avoid_: tool intent, pending action, execution log entry, queue item
+
+**WaitingToolResult**:
+The resumable invocation state for an external/client-executed tool that has been approved by policy but is intentionally waiting for an out-of-process result to be submitted. It is normal control flow and resumes by appending a tool completion event, unlike `UnknownOutcome`, which is crash recovery for an indeterminate side effect.
+_Avoid_: unknown outcome, failed tool, pending approval, background execution
 
 **ToolBatch**:
 The set of tool calls produced by one assistant turn, opened by `tool.batch_planned` and closed by `tool.batch_closed` only when every invocation in it has a model-visible observation. At most one batch is open per run; an open batch is the run's resume point after approval, pause, or crash.
@@ -115,3 +119,7 @@ _Avoid_: full prompt dump, persisted system prompt, message history
 **UnknownOutcome**:
 The terminal-pending invocation state for an external-write tool that was started but whose completion was never recorded, typically a crash mid-flight. The side effect may or may not have happened, so it must be resolved by a human decision and never auto-retried; resolution appends the human-confirmed completion event.
 _Avoid_: failed, retryable error, timeout, denial
+
+**AGUITransport**:
+The boundary that adapts an already-constructed `AgentRuntime` to a Web (AG-UI / CopilotKit) frontend, as knuth-cli adapts one to a terminal. It is entered only as `create_app(runtime)`: it never builds a runtime and never decides prompt, tool providers, or policy — those are agent policy and belong to the knuth-im host/runtime factory. It observes runtime events and translates them to the AG-UI event vocabulary, routes control intent to `RuntimeControl` (`start`/`continue_run`/`resume`/`approve`/`pause`/`submit_tool_result`), and answers read-only ledger queries. It owns no agent policy, holds no run state of its own, and leaks no HTTP/AG-UI concept back into the runtime; the runtime may grow only additive, audience-neutral seams to serve it. Its concrete adapters and protocol mapping live in the knuth-agui package and ADR-006, not in this glossary.
+_Avoid_: runtime extension, agent policy owner, runtime factory, control authority, CopilotKit/HTTP concept inside runtime, Node CopilotRuntime

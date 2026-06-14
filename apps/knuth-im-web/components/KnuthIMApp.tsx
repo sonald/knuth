@@ -1,0 +1,1671 @@
+"use client";
+
+import {
+  AlertTriangle,
+  ArrowUp,
+  Brain,
+  Check,
+  ChevronRight,
+  CircleStop,
+  FilePen,
+  FilePlus,
+  FileText,
+  FolderSearch,
+  Loader2,
+  Play,
+  Plus,
+  RefreshCw,
+  Search,
+  Settings2,
+  ShieldAlert,
+  Sparkles,
+  Square,
+  Terminal,
+  User,
+  X,
+} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import {
+  FormEvent,
+  ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
+  AGUIEvent,
+  ClientToolSpec,
+  DEFAULT_AGENT_URL,
+  ThreadSummary,
+  WireMessage,
+  fetchHistory,
+  fetchThreads,
+  pauseRun,
+  resolveApproval,
+  streamAgent,
+  submitToolResult,
+} from "../lib/agui";
+
+type TimelineKind =
+  | "run"
+  | "user"
+  | "assistant"
+  | "thinking"
+  | "tool"
+  | "approval"
+  | "error"
+  | "context";
+
+type TimelineStatus =
+  | "queued"
+  | "running"
+  | "done"
+  | "waiting"
+  | "failed"
+  | "approved"
+  | "denied"
+  | "info";
+
+type TimelineItem = {
+  id: string;
+  kind: TimelineKind;
+  title: string;
+  label: string;
+  body?: string;
+  timestamp?: string;
+  status: TimelineStatus;
+  toolCallId?: string;
+  approvalId?: string;
+  args?: string;
+  result?: string;
+  raw?: unknown;
+};
+
+type ApprovalView = {
+  approvalId: string;
+  toolCallId: string;
+  title: string;
+  reason: string;
+  risk: string;
+  preview: string;
+};
+
+type ClientToolRequest = {
+  runId: string;
+  threadId: string;
+  toolCallId: string;
+  toolName: string;
+  args: unknown;
+};
+
+type ThreadGroup = {
+  label: string;
+  threads: ThreadSummary[];
+};
+
+const EXAMPLE_PROMPTS = [
+  "What files are in this project?",
+  "Summarize the runtime architecture.",
+  "Find every TODO in the codebase.",
+];
+
+const CLIENT_TOOLS: ClientToolSpec[] = [
+  {
+    name: "browser_context",
+    description:
+      "Return the current browser page context, locale, timezone, viewport, and client clock.",
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+];
+
+function clientToolKey(request: Pick<ClientToolRequest, "runId" | "toolCallId">) {
+  return `${request.runId}:${request.toolCallId}`;
+}
+
+async function executeClientTool(
+  name: string,
+  _args: unknown,
+): Promise<unknown> {
+  if (name !== "browser_context") {
+    throw new Error(`Unknown client tool: ${name}`);
+  }
+  return {
+    href: window.location.href,
+    title: document.title,
+    locale: navigator.language,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    now: new Date().toISOString(),
+    viewport: {
+      width: window.innerWidth,
+      height: window.innerHeight,
+    },
+  };
+}
+
+function renderContent(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value == null) {
+    return "";
+  }
+  if (Array.isArray(value)) {
+    return value.map(renderContent).filter(Boolean).join("\n");
+  }
+  if (typeof value === "object") {
+    return JSON.stringify(value, null, 2);
+  }
+  return String(value);
+}
+
+function formatJsonish(value: unknown): string {
+  const rendered = renderContent(value);
+  const trimmed = rendered.trim();
+  if (!trimmed || (!trimmed.startsWith("{") && !trimmed.startsWith("["))) {
+    return rendered;
+  }
+  try {
+    return JSON.stringify(JSON.parse(trimmed), null, 2);
+  } catch {
+    return rendered;
+  }
+}
+
+function compactId(value: string | undefined): string {
+  if (!value) {
+    return "";
+  }
+  if (value.length <= 18) {
+    return value;
+  }
+  return `${value.slice(0, 10)}…${value.slice(-5)}`;
+}
+
+function shortStatus(status: string): string {
+  return status.replaceAll("_", " ");
+}
+
+function statusTone(status: string): TimelineStatus | "info" {
+  if (["succeeded", "done", "approved"].includes(status)) {
+    return "done";
+  }
+  if (["running", "queued"].includes(status)) {
+    return "running";
+  }
+  if (["waiting", "waiting_approval", "waiting_tool_result", "paused"].includes(status)) {
+    return "waiting";
+  }
+  if (["failed", "denied"].includes(status)) {
+    return "failed";
+  }
+  return "info";
+}
+
+function nowTime(): string {
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date());
+}
+
+function formatThreadTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function formatThreadDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "Earlier";
+  }
+  const today = new Date();
+  const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const startOfDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const days = Math.round(
+    (startOfToday.getTime() - startOfDate.getTime()) / 86_400_000,
+  );
+  if (days === 0) {
+    return "Today";
+  }
+  if (days === 1) {
+    return "Yesterday";
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    year: date.getFullYear() === today.getFullYear() ? undefined : "numeric",
+  }).format(date);
+}
+
+// -- markdown rendering (react-markdown + GFM, XSS-safe by default) ------
+
+function MarkdownView({ text }: { text: string }) {
+  return (
+    <div className="prose">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ node: _node, ...props }) => (
+            <a {...props} target="_blank" rel="noreferrer noopener" />
+          ),
+        }}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+function historyToTimeline(messages: WireMessage[]): TimelineItem[] {
+  const items: TimelineItem[] = [];
+  const toolIndexById = new Map<string, number>();
+
+  messages.forEach((message, index) => {
+    const id = message.id ?? `history_${index}`;
+    const content = renderContent(message.content).trim();
+
+    if (message.role === "user") {
+      items.push({ id, kind: "user", title: "You", label: "Input", body: content, status: "done" });
+      return;
+    }
+
+    if (message.role === "assistant") {
+      if (content) {
+        items.push({
+          id,
+          kind: "assistant",
+          title: "Knuth",
+          label: "Output",
+          body: content,
+          status: "done",
+        });
+      }
+      for (const call of message.toolCalls ?? []) {
+        const toolId = `tool_${call.id}`;
+        toolIndexById.set(call.id, items.length);
+        items.push({
+          id: toolId,
+          kind: "tool",
+          title: call.function?.name ?? "tool",
+          label: "Done",
+          status: "done",
+          toolCallId: call.id,
+          args: formatJsonish(call.function?.arguments ?? ""),
+        });
+      }
+      return;
+    }
+
+    if (message.role === "tool") {
+      // Attach the result to the planned call so one card shows name+args+result.
+      const existing = message.toolCallId
+        ? toolIndexById.get(message.toolCallId)
+        : undefined;
+      if (existing !== undefined) {
+        items[existing] = { ...items[existing], result: content, status: "done" };
+        return;
+      }
+      items.push({
+        id: `tool_${message.toolCallId ?? id}_result`,
+        kind: "tool",
+        title: "tool result",
+        label: "Result",
+        result: content,
+        status: "done",
+        toolCallId: message.toolCallId,
+      });
+      return;
+    }
+
+    if (content) {
+      items.push({
+        id,
+        kind: "context",
+        title: `${message.role} note`,
+        label: "Context",
+        body: content,
+        status: "info",
+      });
+    }
+  });
+
+  return items;
+}
+
+function groupThreads(threads: ThreadSummary[]): ThreadGroup[] {
+  const groups = new Map<string, ThreadSummary[]>();
+  for (const thread of threads) {
+    const label = formatThreadDate(thread.updatedAt || thread.createdAt);
+    groups.set(label, [...(groups.get(label) ?? []), thread]);
+  }
+  return Array.from(groups, ([label, groupedThreads]) => ({
+    label,
+    threads: groupedThreads,
+  }));
+}
+
+function upsertItem(items: TimelineItem[], next: TimelineItem): TimelineItem[] {
+  const index = items.findIndex((item) => item.id === next.id);
+  if (index === -1) {
+    return [...items, next];
+  }
+  const copy = [...items];
+  copy[index] = { ...copy[index], ...next };
+  return copy;
+}
+
+function appendItemText(
+  items: TimelineItem[],
+  id: string,
+  delta: string,
+  fallback: TimelineItem,
+): TimelineItem[] {
+  const index = items.findIndex((item) => item.id === id);
+  if (index === -1) {
+    return [...items, { ...fallback, body: delta }];
+  }
+  const copy = [...items];
+  copy[index] = { ...copy[index], body: `${copy[index].body ?? ""}${delta}` };
+  return copy;
+}
+
+function appendItemArgs(
+  items: TimelineItem[],
+  id: string,
+  delta: string,
+  fallback: TimelineItem,
+): TimelineItem[] {
+  const index = items.findIndex((item) => item.id === id);
+  if (index === -1) {
+    return [...items, { ...fallback, args: delta }];
+  }
+  const copy = [...items];
+  copy[index] = { ...copy[index], args: `${copy[index].args ?? ""}${delta}` };
+  return copy;
+}
+
+function threadTitle(thread: ThreadSummary | undefined): string {
+  if (!thread) {
+    return "New conversation";
+  }
+  return thread.query?.trim() || compactId(thread.threadId);
+}
+
+export function KnuthIMApp() {
+  const [baseUrl, setBaseUrl] = useState(DEFAULT_AGENT_URL);
+  const [threads, setThreads] = useState<ThreadSummary[]>([]);
+  const [activeThreadId, setActiveThreadId] = useState<string>();
+  const [timelineItems, setTimelineItems] = useState<TimelineItem[]>([]);
+  const [approvals, setApprovals] = useState<ApprovalView[]>([]);
+  const [clientToolQueue, setClientToolQueue] = useState<ClientToolRequest[]>([]);
+  const [draft, setDraft] = useState("");
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState<string>();
+  const [connected, setConnected] = useState(true);
+  const [showEndpoint, setShowEndpoint] = useState(false);
+  const [autoApprove, setAutoApprove] = useState(false);
+
+  const abortRef = useRef<AbortController | null>(null);
+  const thinkingIdRef = useRef<string | null>(null);
+  const submittedClientToolsRef = useRef<Set<string>>(new Set());
+  const processingClientToolsRef = useRef(false);
+  const processingApprovalRef = useRef(false);
+  const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const atBottomRef = useRef(true);
+
+  const activeThread = useMemo(
+    () => threads.find((thread) => thread.threadId === activeThreadId),
+    [activeThreadId, threads],
+  );
+
+  const groupedThreads = useMemo(() => groupThreads(threads), [threads]);
+
+  const canResume =
+    activeThread?.status === "waiting_approval" ||
+    activeThread?.status === "waiting_tool_result" ||
+    activeThread?.status === "paused";
+
+  const statusLabel = useMemo(() => {
+    if (running) {
+      return "Working…";
+    }
+    if (activeThread) {
+      return `${shortStatus(activeThread.status)} · ${activeThread.steps} steps`;
+    }
+    return "Ready";
+  }, [activeThread, running]);
+
+  const refresh = useCallback(async () => {
+    try {
+      const nextThreads = await fetchThreads(baseUrl);
+      setThreads(nextThreads);
+      setConnected(true);
+    } catch {
+      setConnected(false);
+      setError("AG-UI backend unavailable");
+    }
+  }, [baseUrl]);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  useEffect(() => {
+    const node = transcriptRef.current;
+    if (node && atBottomRef.current) {
+      node.scrollTop = node.scrollHeight;
+    }
+  }, [timelineItems]);
+
+  const onTranscriptScroll = useCallback(() => {
+    const node = transcriptRef.current;
+    if (!node) {
+      return;
+    }
+    atBottomRef.current =
+      node.scrollHeight - node.scrollTop - node.clientHeight < 80;
+  }, []);
+
+  const applyEvent = useCallback(
+    (event: AGUIEvent) => {
+      switch (event.type) {
+        case "RUN_STARTED": {
+          const threadId = String(event.threadId ?? "");
+          const runId = String(event.runId ?? threadId);
+          if (threadId) {
+            setActiveThreadId(threadId);
+          }
+          setRunning(true);
+          setError(undefined);
+          setTimelineItems((current) =>
+            upsertItem(current, {
+              id: `run_${runId}`,
+              kind: "run",
+              title: "Run started",
+              label: "Run",
+              timestamp: nowTime(),
+              status: "running",
+            }),
+          );
+          break;
+        }
+        case "MESSAGES_SNAPSHOT": {
+          const messages = Array.isArray(event.messages)
+            ? (event.messages as WireMessage[])
+            : [];
+          setTimelineItems(historyToTimeline(messages));
+          break;
+        }
+        case "THINKING_START":
+        case "THINKING_TEXT_MESSAGE_START": {
+          if (!thinkingIdRef.current) {
+            thinkingIdRef.current = `thinking_${Date.now()}`;
+          }
+          const itemId = thinkingIdRef.current;
+          setTimelineItems((current) =>
+            upsertItem(current, {
+              id: itemId,
+              kind: "thinking",
+              title: "Reasoning",
+              label: "Thinking",
+              timestamp: nowTime(),
+              status: "running",
+            }),
+          );
+          break;
+        }
+        case "THINKING_TEXT_MESSAGE_CONTENT": {
+          if (!thinkingIdRef.current) {
+            thinkingIdRef.current = `thinking_${Date.now()}`;
+          }
+          const itemId = thinkingIdRef.current;
+          const delta = String(event.delta ?? "");
+          setTimelineItems((current) =>
+            appendItemText(current, itemId, delta, {
+              id: itemId,
+              kind: "thinking",
+              title: "Reasoning",
+              label: "Thinking",
+              timestamp: nowTime(),
+              status: "running",
+            }),
+          );
+          break;
+        }
+        case "THINKING_TEXT_MESSAGE_END":
+        case "THINKING_END": {
+          const itemId = thinkingIdRef.current;
+          if (itemId) {
+            setTimelineItems((current) =>
+              current.map((item) =>
+                item.id === itemId ? { ...item, status: "done" as const } : item,
+              ),
+            );
+          }
+          if (event.type === "THINKING_END") {
+            thinkingIdRef.current = null;
+          }
+          break;
+        }
+        case "TEXT_MESSAGE_START": {
+          const id = String(event.messageId);
+          setTimelineItems((current) =>
+            upsertItem(current, {
+              id,
+              kind: "assistant",
+              title: "Knuth",
+              label: "Output",
+              timestamp: nowTime(),
+              status: "running",
+            }),
+          );
+          break;
+        }
+        case "TEXT_MESSAGE_CONTENT": {
+          const id = String(event.messageId);
+          const delta = String(event.delta ?? "");
+          setTimelineItems((current) =>
+            appendItemText(current, id, delta, {
+              id,
+              kind: "assistant",
+              title: "Knuth",
+              label: "Output",
+              timestamp: nowTime(),
+              status: "running",
+            }),
+          );
+          break;
+        }
+        case "TEXT_MESSAGE_END": {
+          const id = String(event.messageId);
+          setTimelineItems((current) =>
+            current.map((item) =>
+              item.id === id ? { ...item, status: "done" as const } : item,
+            ),
+          );
+          break;
+        }
+        case "TOOL_CALL_START": {
+          const toolCallId = String(event.toolCallId);
+          setTimelineItems((current) =>
+            upsertItem(current, {
+              id: `tool_${toolCallId}`,
+              kind: "tool",
+              title: String(event.toolCallName ?? "tool"),
+              label: "Started",
+              body: String(event.toolCallName ?? "tool"),
+              timestamp: nowTime(),
+              status: "running",
+              toolCallId,
+            }),
+          );
+          break;
+        }
+        case "TOOL_CALL_ARGS": {
+          const toolCallId = String(event.toolCallId);
+          const delta = String(event.delta ?? "");
+          setTimelineItems((current) =>
+            appendItemArgs(current, `tool_${toolCallId}`, delta, {
+              id: `tool_${toolCallId}`,
+              kind: "tool",
+              title: "tool",
+              label: "Started",
+              timestamp: nowTime(),
+              status: "running",
+              toolCallId,
+            }),
+          );
+          break;
+        }
+        case "TOOL_CALL_RESULT": {
+          const toolCallId = String(event.toolCallId);
+          const result = renderContent(event.content);
+          setTimelineItems((current) =>
+            current.map((item) =>
+              item.id === `tool_${toolCallId}`
+                ? {
+                    ...item,
+                    label: "Done",
+                    status: "done" as const,
+                    result,
+                  }
+                : item,
+            ),
+          );
+          break;
+        }
+        case "CUSTOM": {
+          if (event.name === "knuth.tool_result_required") {
+            const value = event.value as Partial<ClientToolRequest> | undefined;
+            if (!value?.runId || !value?.toolCallId || !value?.toolName) {
+              break;
+            }
+            const request: ClientToolRequest = {
+              runId: value.runId,
+              threadId: value.threadId || value.runId,
+              toolCallId: value.toolCallId,
+              toolName: value.toolName,
+              args: value.args ?? {},
+            };
+            setTimelineItems((current) =>
+              upsertItem(current, {
+                id: `tool_${request.toolCallId}`,
+                kind: "tool",
+                title: request.toolName,
+                label: "Client",
+                body: request.toolName,
+                args: formatJsonish(request.args),
+                timestamp: nowTime(),
+                status: "waiting",
+                toolCallId: request.toolCallId,
+              }),
+            );
+            setClientToolQueue((current) => {
+              const key = clientToolKey(request);
+              if (
+                submittedClientToolsRef.current.has(key) ||
+                current.some((item) => clientToolKey(item) === key)
+              ) {
+                return current;
+              }
+              return [...current, request];
+            });
+            break;
+          }
+
+          if (event.name !== "knuth.approval_requested") {
+            break;
+          }
+          const value = event.value as Partial<ApprovalView> | undefined;
+          if (!value?.approvalId) {
+            break;
+          }
+          const approval: ApprovalView = {
+            approvalId: value.approvalId,
+            toolCallId: value.toolCallId ?? "",
+            title: value.title ?? "approval requested",
+            reason: value.reason ?? "",
+            risk: value.risk ?? "",
+            preview: formatJsonish(value.preview ?? ""),
+          };
+          setApprovals((current) => [
+            ...current.filter((item) => item.approvalId !== approval.approvalId),
+            approval,
+          ]);
+          setTimelineItems((current) =>
+            upsertItem(current, {
+              id: `approval_${approval.approvalId}`,
+              kind: "approval",
+              title: approval.title,
+              label: "Approval",
+              body: approval.reason || approval.title,
+              args: approval.preview,
+              timestamp: nowTime(),
+              status: "waiting",
+              toolCallId: approval.toolCallId,
+              approvalId: approval.approvalId,
+            }),
+          );
+          break;
+        }
+        case "RUN_ERROR": {
+          const message = String(event.message ?? "run failed");
+          setRunning(false);
+          setError(message);
+          setTimelineItems((current) => [
+            ...current,
+            {
+              id: `error_${Date.now()}`,
+              kind: "error",
+              title: "Run error",
+              label: "Error",
+              body: message,
+              timestamp: nowTime(),
+              status: "failed",
+              raw: event,
+            },
+          ]);
+          break;
+        }
+        case "RUN_FINISHED": {
+          const threadId = String(event.threadId ?? activeThreadId ?? "");
+          const runId = String(event.runId ?? threadId);
+          setRunning(false);
+          setTimelineItems((current) =>
+            current.map((item) =>
+              item.id === `run_${runId}`
+                ? { ...item, title: "Completed", status: "done" as const }
+                : item,
+            ),
+          );
+          void refresh();
+          break;
+        }
+      }
+    },
+    [activeThreadId, refresh],
+  );
+
+  const runStream = useCallback(
+    async (payload: { threadId?: string; messages: WireMessage[] }) => {
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+      setRunning(true);
+      setError(undefined);
+      try {
+        await streamAgent(
+          baseUrl,
+          { ...payload, tools: CLIENT_TOOLS },
+          applyEvent,
+          controller.signal,
+        );
+      } catch (err) {
+        if (!(err instanceof DOMException && err.name === "AbortError")) {
+          setError(String(err));
+        }
+      } finally {
+        setRunning(false);
+        abortRef.current = null;
+        void refresh();
+      }
+    },
+    [applyEvent, baseUrl, refresh],
+  );
+
+  useEffect(() => {
+    if (running || clientToolQueue.length === 0 || processingClientToolsRef.current) {
+      return;
+    }
+    const requests = [...clientToolQueue];
+    const processedKeys = new Set(requests.map(clientToolKey));
+    processingClientToolsRef.current = true;
+
+    async function executeAndResume() {
+      try {
+        let resumeThreadId: string | undefined;
+        let submittedAny = false;
+        for (const request of requests) {
+          const key = clientToolKey(request);
+          if (submittedClientToolsRef.current.has(key)) {
+            continue;
+          }
+          submittedClientToolsRef.current.add(key);
+          resumeThreadId = request.threadId || request.runId;
+          const id = `tool_${request.toolCallId}`;
+          setTimelineItems((current) =>
+            upsertItem(current, {
+              id,
+              kind: "tool",
+              title: request.toolName,
+              label: "Executing",
+              body: request.toolName,
+              args: formatJsonish(request.args),
+              timestamp: nowTime(),
+              status: "running",
+              toolCallId: request.toolCallId,
+            }),
+          );
+          try {
+            const result = await executeClientTool(request.toolName, request.args);
+            await submitToolResult(baseUrl, {
+              runId: request.runId,
+              toolCallId: request.toolCallId,
+              outcome: "succeeded",
+              result,
+            });
+            submittedAny = true;
+            setTimelineItems((current) =>
+              upsertItem(current, {
+                id,
+                kind: "tool",
+                title: request.toolName,
+                label: "Done",
+                body: request.toolName,
+                args: formatJsonish(request.args),
+                result: renderContent(result),
+                timestamp: nowTime(),
+                status: "done",
+                toolCallId: request.toolCallId,
+              }),
+            );
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            try {
+              await submitToolResult(baseUrl, {
+                runId: request.runId,
+                toolCallId: request.toolCallId,
+                outcome: "failed",
+                error: message,
+              });
+              submittedAny = true;
+            } catch (submitErr) {
+              submittedClientToolsRef.current.delete(key);
+              setError(String(submitErr));
+            }
+            setTimelineItems((current) =>
+              upsertItem(current, {
+                id,
+                kind: "tool",
+                title: request.toolName,
+                label: "Failed",
+                body: request.toolName,
+                args: formatJsonish(request.args),
+                result: message,
+                timestamp: nowTime(),
+                status: "failed",
+                toolCallId: request.toolCallId,
+              }),
+            );
+          }
+        }
+
+        if (submittedAny && resumeThreadId) {
+          await runStream({ threadId: resumeThreadId, messages: [] });
+        }
+      } finally {
+        processingClientToolsRef.current = false;
+        setClientToolQueue((current) =>
+          current.filter((request) => !processedKeys.has(clientToolKey(request))),
+        );
+      }
+    }
+
+    void executeAndResume();
+  }, [baseUrl, clientToolQueue, runStream, running]);
+
+  const sendMessage = useCallback(
+    async (content: string) => {
+      const trimmed = content.trim();
+      if (!trimmed || running) {
+        return;
+      }
+      setDraft("");
+      setApprovals([]);
+      setClientToolQueue([]);
+      thinkingIdRef.current = null;
+      atBottomRef.current = true;
+      const userItem: TimelineItem = {
+        id: `local_${Date.now()}`,
+        kind: "user",
+        title: "You",
+        label: "Input",
+        body: trimmed,
+        timestamp: nowTime(),
+        status: "done",
+      };
+      setTimelineItems((current) => [...current, userItem]);
+      await runStream({
+        threadId: activeThreadId,
+        messages: [{ role: "user", content: trimmed }],
+      });
+    },
+    [activeThreadId, running, runStream],
+  );
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    void sendMessage(draft);
+  };
+
+  const selectThread = async (threadId: string) => {
+    abortRef.current?.abort();
+    setRunning(false);
+    setActiveThreadId(threadId);
+    setApprovals([]);
+    setClientToolQueue([]);
+    setAutoApprove(false);
+    thinkingIdRef.current = null;
+    setError(undefined);
+    atBottomRef.current = true;
+    try {
+      const history = await fetchHistory(baseUrl, threadId);
+      setTimelineItems(historyToTimeline(history));
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
+  const newThread = () => {
+    abortRef.current?.abort();
+    setRunning(false);
+    setActiveThreadId(undefined);
+    setTimelineItems([]);
+    setApprovals([]);
+    setClientToolQueue([]);
+    setAutoApprove(false);
+    thinkingIdRef.current = null;
+    setError(undefined);
+  };
+
+  const pause = async () => {
+    if (!activeThreadId) {
+      abortRef.current?.abort();
+      setRunning(false);
+      return;
+    }
+    try {
+      await pauseRun(baseUrl, activeThreadId);
+    } catch (err) {
+      setError(String(err));
+    }
+    abortRef.current?.abort();
+    setRunning(false);
+    void refresh();
+  };
+
+  const resume = () => {
+    if (!activeThreadId || running) {
+      return;
+    }
+    void runStream({ threadId: activeThreadId, messages: [] });
+  };
+
+  const decide = useCallback(
+    async (approval: ApprovalView, decision: "approved" | "denied") => {
+      const decisionStatus: TimelineStatus =
+        decision === "approved" ? "approved" : "denied";
+      try {
+        await resolveApproval(baseUrl, approval.approvalId, decision);
+      } catch (err) {
+        setError(String(err));
+        return;
+      }
+      setApprovals((current) =>
+        current.filter((item) => item.approvalId !== approval.approvalId),
+      );
+      setTimelineItems((current) =>
+        current.map((item) =>
+          item.approvalId === approval.approvalId
+            ? {
+                ...item,
+                label: decision === "approved" ? "Approved" : "Denied",
+                status: decisionStatus,
+              }
+            : item,
+        ),
+      );
+      await runStream({ threadId: activeThreadId, messages: [] });
+    },
+    [activeThreadId, baseUrl, runStream],
+  );
+
+  // "Approve all" → auto-resolve pending approvals for the rest of the session.
+  useEffect(() => {
+    if (!autoApprove || running || processingApprovalRef.current) {
+      return;
+    }
+    const next = approvals[0];
+    if (!next) {
+      return;
+    }
+    processingApprovalRef.current = true;
+    void (async () => {
+      try {
+        await decide(next, "approved");
+      } finally {
+        processingApprovalRef.current = false;
+      }
+    })();
+  }, [autoApprove, running, approvals, decide]);
+
+  return (
+    <div className="app">
+      <aside className="sidebar" aria-label="Conversations">
+        <div className="brand">
+          <div className="brandMark">K</div>
+          <div>
+            <div className="brandName">Knuth</div>
+            <div className="brandSub">literate agent</div>
+          </div>
+        </div>
+
+        <button className="newChat" type="button" onClick={newThread}>
+          <Plus size={17} />
+          <span>New conversation</span>
+        </button>
+
+        <div className="convList">
+          {groupedThreads.length ? (
+            groupedThreads.map((group) => (
+              <section key={group.label} className="convGroup">
+                <div className="convGroupLabel">{group.label}</div>
+                {group.threads.map((thread) => (
+                  <button
+                    key={thread.threadId}
+                    type="button"
+                    className={
+                      thread.threadId === activeThreadId
+                        ? "convItem active"
+                        : "convItem"
+                    }
+                    onClick={() => void selectThread(thread.threadId)}
+                  >
+                    <span className={`convDot ${statusTone(thread.status)}`} />
+                    <span className="convBody">
+                      <span className="convTitle">{threadTitle(thread)}</span>
+                      <span className="convMeta">
+                        <span className="convStatus">{shortStatus(thread.status)}</span>
+                        <span>·</span>
+                        <span>{formatThreadTime(thread.updatedAt || thread.createdAt)}</span>
+                      </span>
+                    </span>
+                  </button>
+                ))}
+              </section>
+            ))
+          ) : (
+            <div className="convEmpty">No conversations yet</div>
+          )}
+        </div>
+
+        <div className="sidebarFoot">
+          <button
+            type="button"
+            className={showEndpoint ? "endpointToggle open" : "endpointToggle"}
+            onClick={() => setShowEndpoint((value) => !value)}
+          >
+            <span className={connected ? "connDot" : "connDot down"} />
+            <span>{connected ? "Connected" : "Disconnected"}</span>
+            <Settings2 size={14} className="chev" />
+          </button>
+          {showEndpoint ? (
+            <label className="endpointField">
+              <span>AG-UI endpoint</span>
+              <input
+                value={baseUrl}
+                onChange={(event) => setBaseUrl(event.target.value)}
+                spellCheck={false}
+              />
+            </label>
+          ) : null}
+        </div>
+      </aside>
+
+      <section className="chat" aria-label="Conversation">
+        <header className="chatHeader">
+          <div className="chatTitleBlock">
+            <div className="chatTitle">{threadTitle(activeThread)}</div>
+            <div className="chatStatus">
+              {running ? <Loader2 size={13} className="spin" /> : null}
+              <span>{statusLabel}</span>
+              {autoApprove ? (
+                <button
+                  type="button"
+                  className="autoPill"
+                  title="Stop auto-approving tools"
+                  onClick={() => setAutoApprove(false)}
+                >
+                  <ShieldAlert size={12} />
+                  Auto-approving
+                  <X size={12} />
+                </button>
+              ) : null}
+            </div>
+          </div>
+          <div className="chatActions">
+            <button
+              className="iconBtn"
+              type="button"
+              title="Refresh"
+              onClick={() => void refresh()}
+            >
+              <RefreshCw size={16} />
+            </button>
+            {running ? (
+              <button
+                className="iconBtn danger"
+                type="button"
+                title="Pause run"
+                onClick={() => void pause()}
+              >
+                <CircleStop size={16} />
+              </button>
+            ) : canResume ? (
+              <button
+                className="iconBtn accent"
+                type="button"
+                title="Resume run"
+                onClick={resume}
+              >
+                <Play size={16} />
+              </button>
+            ) : null}
+          </div>
+        </header>
+
+        <div className="transcript" ref={transcriptRef} onScroll={onTranscriptScroll}>
+          {timelineItems.length ? (
+            <div className="thread">
+              {timelineItems.map((item) => (
+                <TranscriptItem
+                  key={item.id}
+                  item={item}
+                  approval={
+                    item.approvalId
+                      ? approvals.find((a) => a.approvalId === item.approvalId)
+                      : undefined
+                  }
+                  running={running}
+                  autoApprove={autoApprove}
+                  onDecide={decide}
+                  onAllowAll={() => setAutoApprove(true)}
+                />
+              ))}
+              {error ? (
+                <div className="errorMsg">
+                  <AlertTriangle size={16} />
+                  <span>{error}</span>
+                </div>
+              ) : null}
+            </div>
+          ) : (
+            <div className="empty">
+              <div className="emptyMark">K</div>
+              <div className="emptyTitle">Ask Knuth anything</div>
+              <p className="emptyText">
+                A literate agent over your codebase — it reasons in the open,
+                runs tools, and asks before anything risky.
+              </p>
+              <div className="examples">
+                {EXAMPLE_PROMPTS.map((prompt) => (
+                  <button
+                    key={prompt}
+                    type="button"
+                    className="exampleChip"
+                    onClick={() => void sendMessage(prompt)}
+                  >
+                    {prompt}
+                  </button>
+                ))}
+              </div>
+              {error ? (
+                <div className="errorMsg" style={{ marginTop: 18 }}>
+                  <AlertTriangle size={16} />
+                  <span>{error}</span>
+                </div>
+              ) : null}
+            </div>
+          )}
+        </div>
+
+        <form className="composer" onSubmit={submit}>
+          <div className="composerInner">
+            <textarea
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              placeholder="Message Knuth…"
+              rows={1}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  event.currentTarget.form?.requestSubmit();
+                }
+              }}
+            />
+            {running ? (
+              <button
+                className="stop"
+                type="button"
+                title="Stop"
+                onClick={() => void pause()}
+              >
+                <Square size={15} />
+              </button>
+            ) : (
+              <button
+                className="send"
+                type="submit"
+                title="Send"
+                disabled={!draft.trim()}
+              >
+                <ArrowUp size={18} />
+              </button>
+            )}
+          </div>
+          <div className="composerHint">
+            Enter to send · Shift + Enter for a new line
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
+function TranscriptItem({
+  item,
+  approval,
+  running,
+  autoApprove,
+  onDecide,
+  onAllowAll,
+}: {
+  item: TimelineItem;
+  approval: ApprovalView | undefined;
+  running: boolean;
+  autoApprove: boolean;
+  onDecide: (approval: ApprovalView, decision: "approved" | "denied") => void;
+  onAllowAll: () => void;
+}) {
+  switch (item.kind) {
+    case "user":
+      return (
+        <div className="turn user">
+          <div className="msgRole">
+            <span className="roleIcon">
+              <User size={13} />
+            </span>
+            You
+          </div>
+          <div className="bubble">{item.body}</div>
+        </div>
+      );
+
+    case "assistant":
+      return (
+        <div className="turn assistant">
+          <div className="msgRole">
+            <span className="roleIcon">
+              <Sparkles size={13} />
+            </span>
+            Knuth
+          </div>
+          {item.body ? (
+            <MarkdownView text={item.body} />
+          ) : item.status === "running" ? (
+            <div className="typing">
+              <span />
+              <span />
+              <span />
+            </div>
+          ) : null}
+        </div>
+      );
+
+    case "thinking": {
+      const isRunning = item.status === "running";
+      return (
+        <div className="turn">
+          <details className="think" data-running={isRunning} open={isRunning}>
+            <summary>
+              <ChevronRight size={14} className="chev" />
+              <Brain size={14} />
+              <span className={isRunning ? "shimmer" : undefined}>
+                {isRunning ? "Thinking…" : "Reasoning"}
+              </span>
+            </summary>
+            {item.body ? <div className="thinkBody">{item.body}</div> : null}
+          </details>
+        </div>
+      );
+    }
+
+    case "tool":
+      return (
+        <div className="turn">
+          <ToolCard item={item} />
+        </div>
+      );
+
+    case "approval":
+      return (
+        <div className="turn">
+          <ApprovalCard
+            item={item}
+            approval={approval}
+            running={running}
+            autoApprove={autoApprove}
+            onDecide={onDecide}
+            onAllowAll={onAllowAll}
+          />
+        </div>
+      );
+
+    case "error":
+      return (
+        <div className="turn">
+          <div className="errorMsg">
+            <AlertTriangle size={16} />
+            <span>{item.body}</span>
+          </div>
+        </div>
+      );
+
+    case "context":
+      return (
+        <div className="turn">
+          <details className="think">
+            <summary>
+              <ChevronRight size={14} className="chev" />
+              <span>{item.title}</span>
+            </summary>
+            {item.body ? <div className="thinkBody">{item.body}</div> : null}
+          </details>
+        </div>
+      );
+
+    case "run":
+      return (
+        <div className="turn">
+          <div className="divider">
+            {item.title}
+            {item.timestamp ? ` · ${item.timestamp}` : ""}
+          </div>
+        </div>
+      );
+  }
+}
+
+function statusChip(status: TimelineStatus, label: string): ReactNode {
+  const showSpinner = status === "running" || status === "queued";
+  return (
+    <span className={`chip ${status}`}>
+      {showSpinner ? <Loader2 size={11} className="spin" /> : null}
+      {label}
+    </span>
+  );
+}
+
+type ToolPresentation = {
+  kicker: string;
+  glyph: LucideIcon;
+  target?: string;
+};
+
+function parseArgs(raw?: string): Record<string, unknown> {
+  if (!raw) {
+    return {};
+  }
+  try {
+    const value = JSON.parse(raw);
+    return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function asString(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  return value == null ? "" : String(value);
+}
+
+const PROCESS_RE =
+  /^<process_output>\n<stdout>([\s\S]*?)<\/stdout>\n<stderr>([\s\S]*?)<\/stderr>\n<return_code>(-?\d+)<\/return_code>\n<offload>([\s\S]*?)<\/offload>\n<\/process_output>$/;
+
+function unescapeXml(value: string): string {
+  return value.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+}
+
+function parseProcessOutput(
+  result: string,
+): { stdout: string; stderr: string; code: number } | null {
+  const match = PROCESS_RE.exec(result.trim());
+  if (!match) {
+    return null;
+  }
+  return {
+    stdout: unescapeXml(match[1]),
+    stderr: unescapeXml(match[2]),
+    code: Number(match[3]),
+  };
+}
+
+function toolPresentation(
+  name: string,
+  args: Record<string, unknown>,
+): ToolPresentation {
+  switch (name) {
+    case "shell":
+      return { kicker: "Ran command", glyph: Terminal, target: asString(args.command) };
+    case "python":
+      return {
+        kicker: "Ran Python",
+        glyph: Terminal,
+        target: asString(args.command || args.code),
+      };
+    case "read_file":
+      return { kicker: "Read file", glyph: FileText, target: asString(args.path) };
+    case "write_file":
+      return { kicker: "Wrote file", glyph: FilePlus, target: asString(args.path) };
+    case "edit_file":
+      return { kicker: "Edited file", glyph: FilePen, target: asString(args.path) };
+    case "grep":
+      return { kicker: "Searched", glyph: Search, target: asString(args.pattern) };
+    case "glob":
+      return { kicker: "Listed files", glyph: FolderSearch, target: asString(args.pattern) };
+    default:
+      return { kicker: "Tool", glyph: Terminal, target: name };
+  }
+}
+
+function ToolCard({ item }: { item: TimelineItem }) {
+  const name = item.title;
+  const args = parseArgs(item.args);
+  const result = item.result?.trim() ?? "";
+  const present = toolPresentation(name, args);
+  const Glyph = present.glyph;
+  const target = present.target?.trim() || name;
+
+  return (
+    <div className="tool">
+      <div className="toolHead">
+        <span className="toolGlyph">
+          <Glyph size={15} />
+        </span>
+        <span className="toolHeadText">
+          <span className="toolKicker">{present.kicker}</span>
+          <span className="toolTarget">{target}</span>
+        </span>
+        {statusChip(item.status, item.label)}
+      </div>
+      <ToolBody name={name} args={args} result={result} status={item.status} />
+    </div>
+  );
+}
+
+function ToolBody({
+  name,
+  args,
+  result,
+  status,
+}: {
+  name: string;
+  args: Record<string, unknown>;
+  result: string;
+  status: TimelineStatus;
+}) {
+  if (status === "running" && !result) {
+    return null;
+  }
+
+  if ((name === "shell" || name === "python") && result) {
+    const proc = parseProcessOutput(result);
+    if (proc) {
+      const empty = !proc.stdout.trim() && !proc.stderr.trim();
+      return (
+        <div className="toolBody">
+          <span className={proc.code === 0 ? "exitChip ok" : "exitChip bad"}>
+            exit {proc.code}
+          </span>
+          {proc.stdout.trim() ? (
+            <pre className="io">{proc.stdout.replace(/\n$/, "")}</pre>
+          ) : null}
+          {proc.stderr.trim() ? (
+            <pre className="io err">{proc.stderr.replace(/\n$/, "")}</pre>
+          ) : null}
+          {empty ? <div className="toolNote">No output</div> : null}
+        </div>
+      );
+    }
+  }
+
+  if (name === "read_file" && result) {
+    const lines = result.split("\n");
+    const body = lines[0]?.startsWith("File(") ? lines.slice(1).join("\n") : result;
+    return (
+      <div className="toolBody">
+        <pre className="io fileView">{body}</pre>
+      </div>
+    );
+  }
+
+  if (name === "write_file") {
+    const content = asString(args.content);
+    return (
+      <div className="toolBody">
+        {content ? (
+          <pre className="io diffAdd">{content}</pre>
+        ) : result ? (
+          <div className="toolNote">{result}</div>
+        ) : null}
+      </div>
+    );
+  }
+
+  if (name === "edit_file") {
+    const oldStr = asString(args.old_string);
+    const newStr = asString(args.new_string);
+    if (oldStr || newStr) {
+      return (
+        <div className="toolBody">
+          <pre className="io diff">
+            {oldStr.split("\n").map((line, i) => (
+              <div key={`d${i}`} className="diffLine del">{`- ${line}`}</div>
+            ))}
+            {newStr.split("\n").map((line, i) => (
+              <div key={`a${i}`} className="diffLine add">{`+ ${line}`}</div>
+            ))}
+          </pre>
+          {result ? <div className="toolNote">{result}</div> : null}
+        </div>
+      );
+    }
+  }
+
+  if ((name === "grep" || name === "glob") && result) {
+    return (
+      <div className="toolBody">
+        <pre className="io">{result}</pre>
+      </div>
+    );
+  }
+
+  const argText = Object.keys(args).length ? JSON.stringify(args, null, 2) : "";
+  if (!argText && !result) {
+    return null;
+  }
+  return (
+    <div className="toolBody">
+      {result ? (
+        <details className="toolField" open>
+          <summary>Result</summary>
+          <pre className="io">{formatJsonish(result)}</pre>
+        </details>
+      ) : null}
+      {argText ? (
+        <details className="toolField" open={!result}>
+          <summary>Arguments</summary>
+          <pre className="io">{argText}</pre>
+        </details>
+      ) : null}
+    </div>
+  );
+}
+
+function ApprovalCard({
+  item,
+  approval,
+  running,
+  autoApprove,
+  onDecide,
+  onAllowAll,
+}: {
+  item: TimelineItem;
+  approval: ApprovalView | undefined;
+  running: boolean;
+  autoApprove: boolean;
+  onDecide: (approval: ApprovalView, decision: "approved" | "denied") => void;
+  onAllowAll: () => void;
+}) {
+  const pending = Boolean(approval) && item.status === "waiting" && !autoApprove;
+  return (
+    <div className="approval">
+      <div className="approvalHead">
+        <ShieldAlert size={15} />
+        Approval required
+      </div>
+      <div className="approvalTitle">{item.title}</div>
+      {item.body && item.body !== item.title ? (
+        <div className="approvalReason">{item.body}</div>
+      ) : null}
+      {approval?.risk ? <span className="riskBadge">{approval.risk}</span> : null}
+      {item.args && item.args.trim() ? (
+        <details className="approvalPreview">
+          <summary>Preview</summary>
+          <pre className="io">{formatJsonish(item.args)}</pre>
+        </details>
+      ) : null}
+      {pending && approval ? (
+        <div className="approvalActions">
+          <button
+            type="button"
+            className="btnApprove"
+            disabled={running}
+            onClick={() => onDecide(approval, "approved")}
+          >
+            <Check size={16} />
+            Approve
+          </button>
+          <button
+            type="button"
+            className="btnAll"
+            disabled={running}
+            title="Approve this and auto-approve the rest of this conversation"
+            onClick={onAllowAll}
+          >
+            <Check size={16} />
+            Approve all
+          </button>
+          <button
+            type="button"
+            className="btnDeny"
+            disabled={running}
+            onClick={() => onDecide(approval, "denied")}
+          >
+            <X size={16} />
+            Deny
+          </button>
+        </div>
+      ) : (
+        <div
+          className={
+            item.status === "denied" ? "resolvedNote denied" : "resolvedNote approved"
+          }
+        >
+          {item.status === "denied" ? <X size={15} /> : <Check size={15} />}
+          {item.status === "denied"
+            ? "Denied"
+            : item.status === "approved"
+              ? "Approved"
+              : "Resolved"}
+        </div>
+      )}
+    </div>
+  );
+}

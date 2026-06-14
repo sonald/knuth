@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["knuth-cli"]
+dev = ["knuth-cli", "knuth-agui", "knuth-im"]
 
 [tool.uv.workspace]
 members = ["packages/*"]
@@ -28,3 +28,5 @@ knuth-llmd = { workspace = true }
 knuth-runtime = { workspace = true }
 knuth-toold = { workspace = true }
 knuth-cli = { workspace = true }
+knuth-agui = { workspace = true }
+knuth-im = { workspace = true }

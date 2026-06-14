@@ -24,6 +24,7 @@ from knuth.core.invocations import (
     ApprovalStatus,
     ToolCallDecision,
     ToolInvocation,
+    ToolExecutionMode,
     ToolInvocationStatus,
     args_hash_for,
 )
@@ -43,6 +44,7 @@ from knuth.core.runtime_events import (
     StepStartedDraft,
     ToolBatchClosedDraft,
     ToolBatchPlannedDraft,
+    ToolInvocationAwaitingExternalResultDraft,
     ToolInvocationCompletedDraft,
     ToolInvocationMarkedUnknownDraft,
     ToolInvocationStartedDraft,
@@ -94,7 +96,7 @@ class RefoldStats:
 
 
 class RunLedger(Protocol):
-    async def create_run(self, query: str) -> AgentRun:
+    async def create_run(self, query: str, run_id: str | None = None) -> AgentRun:
         ...
 
     async def apply(
@@ -265,6 +267,7 @@ def _reduce_run_resumed(ctx: _ReduceContext, draft: RunResumedDraft) -> _Mutatio
         in {
             RunStatus.RUNNING,
             RunStatus.WAITING_APPROVAL,
+            RunStatus.WAITING_TOOL_RESULT,
             RunStatus.PAUSED,
             RunStatus.SUCCEEDED,
         },
@@ -279,6 +282,16 @@ def _reduce_run_resumed(ctx: _ReduceContext, draft: RunResumedDraft) -> _Mutatio
         not pending,
         "pending approvals must be resolved before resuming: "
         + ", ".join(approval.id for approval in pending),
+    )
+    waiting_results = [
+        invocation
+        for invocation in ctx.view.invocations.values()
+        if invocation.status == ToolInvocationStatus.WAITING_TOOL_RESULT
+    ]
+    _require(
+        not waiting_results,
+        "waiting tool results must be submitted before resuming: "
+        + ", ".join(invocation.tool_call_id for invocation in waiting_results),
     )
     ctx.run.status = RunStatus.RUNNING
     return ctx.mutations
@@ -424,6 +437,7 @@ def _reduce_tool_proposed(ctx: _ReduceContext, draft: ToolProposedDraft) -> _Mut
         "status": status_by_decision[draft.decision],
         "effect": draft.effect,
         "risk": draft.risk,
+        "execution_mode": draft.execution_mode,
         "last_event_seq": ctx.seq,
     }
     if draft.decision == ToolCallDecision.DENIED:
@@ -540,6 +554,43 @@ def _reduce_tool_invocation_started(
     return ctx.mutations
 
 
+@_reduces(ToolInvocationAwaitingExternalResultDraft)
+def _reduce_tool_invocation_awaiting_external_result(
+    ctx: _ReduceContext, draft: ToolInvocationAwaitingExternalResultDraft
+) -> _Mutations:
+    _require(
+        ctx.run.status in {RunStatus.RUNNING, RunStatus.WAITING_TOOL_RESULT},
+        "tool.invocation_awaiting_external_result requires a running or waiting run",
+    )
+    invocation = ctx.invocation(draft.tool_call_id)
+    _require(
+        invocation.status == ToolInvocationStatus.APPROVED,
+        "tool.invocation_awaiting_external_result requires an approved invocation",
+    )
+    _require(
+        invocation.execution_mode == ToolExecutionMode.EXTERNAL,
+        "tool.invocation_awaiting_external_result requires an external invocation",
+    )
+    _require(
+        invocation.tool_name == draft.tool_name,
+        "tool.invocation_awaiting_external_result tool_name mismatch",
+    )
+    _require(
+        invocation.args == draft.args,
+        "tool.invocation_awaiting_external_result args mismatch",
+    )
+    ctx.mutations.invocations.append(
+        invocation.model_copy(
+            update={
+                "status": ToolInvocationStatus.WAITING_TOOL_RESULT,
+                "last_event_seq": ctx.seq,
+            }
+        )
+    )
+    ctx.run.status = RunStatus.WAITING_TOOL_RESULT
+    return ctx.mutations
+
+
 @_reduces(ToolInvocationCompletedDraft)
 def _reduce_tool_invocation_completed(
     ctx: _ReduceContext, draft: ToolInvocationCompletedDraft
@@ -555,8 +606,13 @@ def _reduce_tool_invocation_completed(
     else:
         _require(
             invocation.status
-            in {ToolInvocationStatus.RUNNING, ToolInvocationStatus.UNKNOWN},
-            "tool.invocation_completed requires a running or unknown invocation, "
+            in {
+                ToolInvocationStatus.RUNNING,
+                ToolInvocationStatus.UNKNOWN,
+                ToolInvocationStatus.WAITING_TOOL_RESULT,
+            },
+            "tool.invocation_completed requires a running, unknown, or waiting "
+            "invocation, "
             f"got {invocation.status}",
         )
         new_status = (
@@ -696,8 +752,8 @@ class _LedgerMixin:
         draft = self._redact(draft)
         return await self._transact(run_id, draft)
 
-    async def create_run(self, query: str) -> AgentRun:
-        run_id = f"run_{uuid4().hex}"
+    async def create_run(self, query: str, run_id: str | None = None) -> AgentRun:
+        run_id = run_id or f"run_{uuid4().hex}"
         await self.apply(run_id, RunCreatedDraft(query=query))
         return await self.get_run(run_id)
 

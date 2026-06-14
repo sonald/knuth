@@ -14,6 +14,7 @@ from knuth.core.events import (
 )
 from knuth.core.types import ErrorInfo, RunStatus
 from knuth_llmd import InferenceConfig, InferenceRuntimeOptions
+from knuth_toold import ToolProvider
 
 from knuth_runtime.invocation import RunInvocationMode, RuntimeInvocation
 from knuth_runtime.loop import run_agent_loop
@@ -27,7 +28,12 @@ from knuth_runtime.result import RunResult, answer_from_events
 from knuth_runtime.services import RuntimeServices
 
 _RESUMABLE_STATUSES = frozenset(
-    {RunStatus.RUNNING, RunStatus.WAITING_APPROVAL, RunStatus.PAUSED}
+    {
+        RunStatus.RUNNING,
+        RunStatus.WAITING_APPROVAL,
+        RunStatus.WAITING_TOOL_RESULT,
+        RunStatus.PAUSED,
+    }
 )
 
 
@@ -41,6 +47,7 @@ class RunSession:
         prompt: str | None = None,
         run_id: str | None = None,
         listeners: Iterable[RuntimeEventListener] = (),
+        tool_providers: Iterable[ToolProvider] = (),
         runtime_options: InferenceRuntimeOptions | None = None,
     ) -> None:
         self._mode = mode
@@ -49,6 +56,7 @@ class RunSession:
         self._prompt = prompt
         self._run_id = run_id
         self._initial_listeners = tuple(listeners)
+        self._tool_providers = tuple(tool_providers)
         self._runtime_options = runtime_options
         self._exit_stack: AsyncExitStack | None = None
         self._task_group: anyio.abc.TaskGroup | None = None
@@ -86,6 +94,7 @@ class RunSession:
                 mode=self._mode,
                 services=self._services,
                 observation=self._observation,
+                tool_providers=self._tool_providers,
             )
             await invocation.emit(RunInvocationStartedDraft(mode=self._mode))
             await self._prepare_run(invocation)
@@ -140,7 +149,9 @@ class RunSession:
         if self._mode == "start":
             if self._prompt is None:
                 raise ValueError("prompt is required to start a new run")
-            run = await self._services.ledger.create_run(self._prompt)
+            run = await self._services.ledger.create_run(
+                self._prompt, run_id=self._run_id
+            )
             self._run_id = run.id
             return
         if self._run_id is None:

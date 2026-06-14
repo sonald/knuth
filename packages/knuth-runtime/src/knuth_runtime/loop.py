@@ -17,6 +17,7 @@ from knuth.core.events import (
 from knuth.core.invocations import (
     EXTERNAL_EFFECTS,
     ToolCallDecision,
+    ToolExecutionMode,
     ToolInvocation,
     ToolInvocationStatus,
     approval_id_for,
@@ -41,6 +42,7 @@ from knuth.core.runtime_events import (
     StepStartedDraft,
     ToolBatchClosedDraft,
     ToolBatchPlannedDraft,
+    ToolInvocationAwaitingExternalResultDraft,
     ToolInvocationCompletedDraft,
     ToolInvocationMarkedUnknownDraft,
     ToolInvocationStartedDraft,
@@ -71,6 +73,7 @@ _WAITING_OR_TERMINAL = frozenset(
     {
         RunStatus.PAUSED,
         RunStatus.WAITING_APPROVAL,
+        RunStatus.WAITING_TOOL_RESULT,
         RunStatus.SUCCEEDED,
         RunStatus.FAILED,
         RunStatus.CANCELLED,
@@ -139,6 +142,7 @@ async def _run_step(
         model_config_fingerprint=inference_config.model_dump_json(
             exclude={"run_id", "trace_id"}
         ),
+        tool_providers=invocation.tool_providers,
     )
     assert view.snapshot is not None
     await invocation.emit(
@@ -326,13 +330,19 @@ async def _drive_open_batch(
 
     # Propose: pure decision, safe to repeat after a crash.
     for inv in batch.by_status(ToolInvocationStatus.PROPOSED):
-        proposal = await services.tool_broker.propose(run_id, inv.tool_name, inv.args)
+        proposal = await services.tool_broker.propose(
+            run_id,
+            inv.tool_name,
+            inv.args,
+            overlay_providers=invocation.tool_providers,
+        )
         await invocation.emit(
             ToolProposedDraft(
                 tool_call_id=inv.tool_call_id,
                 decision=proposal.decision,
                 effect=proposal.effect,
                 risk=proposal.risk,
+                execution_mode=proposal.execution_mode,
                 error=proposal.error,
             )
         )
@@ -402,6 +412,23 @@ async def _drive_open_batch(
         )
         return RunStatus.PAUSED
 
+    for inv in batch.by_status(ToolInvocationStatus.APPROVED):
+        if inv.execution_mode != ToolExecutionMode.EXTERNAL:
+            continue
+        await invocation.emit(
+            ToolInvocationAwaitingExternalResultDraft(
+                tool_call_id=inv.tool_call_id,
+                tool_name=inv.tool_name,
+                args=inv.args,
+            )
+        )
+
+    state = await services.ledger.run_state(run_id)
+    batch = state.open_batch
+    assert batch is not None
+    if batch.by_status(ToolInvocationStatus.WAITING_TOOL_RESULT):
+        return RunStatus.WAITING_TOOL_RESULT
+
     # Execute the approved calls serially in plan order.
     for inv in batch.by_status(ToolInvocationStatus.APPROVED):
         attempt = inv.attempt + 1
@@ -411,7 +438,10 @@ async def _drive_open_batch(
                 attempt=attempt,
             )
         )
-        result = await services.tool_broker.execute(inv)
+        result = await services.tool_broker.execute(
+            inv,
+            overlay_providers=invocation.tool_providers,
+        )
         observation = result.to_observation_text()
         artifact_ref = None
         observation_preview = None
