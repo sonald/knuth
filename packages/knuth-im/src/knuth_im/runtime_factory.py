@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from pathlib import Path
 
 from knuth_cli.prompts import build_cli_system_sections
 from knuth_cli.tools import create_cli_tool_provider
 from knuth_llmd import InferenceConfig, LiteLLMInferenceClient
 from knuth_runtime import AgentRuntime, build_sqlite_runtime
+from knuth_toold import ToolProvider
 
 
 def load_dotenv(path: str | Path = ".env") -> None:
@@ -24,7 +26,11 @@ def load_dotenv(path: str | Path = ".env") -> None:
         os.environ.setdefault(key.strip(), value.strip())
 
 
-def build_runtime(db_path: str | Path | None = None) -> AgentRuntime:
+def build_runtime(
+    db_path: str | Path | None = None,
+    *,
+    tool_providers: Iterable[ToolProvider] = (),
+) -> AgentRuntime:
     api_key = os.environ.get("KNUTH_API_KEY")
     base_url = os.environ.get("KNUTH_BASE_URL")
     model = os.environ.get("KNUTH_MODEL")
@@ -45,6 +51,6 @@ def build_runtime(db_path: str | Path | None = None) -> AgentRuntime:
         inference_config=InferenceConfig(timeout_s=timeout),
         db_path=db_path or Path("~/.knuth/knuth-im.db"),
         section_providers=build_cli_system_sections(system_prompt),
-        tool_providers=[create_cli_tool_provider()],
+        tool_providers=[create_cli_tool_provider(), *tool_providers],
         include_default_tools=True,
     )

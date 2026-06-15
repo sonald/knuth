@@ -8,7 +8,6 @@ from knuth.core.inference_events import UsageInfo
 from knuth.core.invocations import (
     ToolCallDecision,
     ToolEffect,
-    ToolExecutionMode,
     ToolRisk,
 )
 from knuth.core.messages import ToolCall
@@ -120,7 +119,6 @@ class ToolProposedDraft(RuntimeEventDraftBase):
     decision: ToolCallDecision
     effect: ToolEffect = ToolEffect.READ
     risk: ToolRisk = ToolRisk.LOW
-    execution_mode: ToolExecutionMode = ToolExecutionMode.RUNTIME
     error: ErrorInfo | None = None
 
 

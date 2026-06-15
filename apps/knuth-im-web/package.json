@@ -1,6 +1,7 @@
 {
   "name": "knuth-im-web",
   "version": "0.1.0",
+  "author": "sonald (yinshuiboy@gmail.com)",
   "private": true,
   "main": "electron/main.cjs",
   "scripts": {
@@ -60,6 +61,7 @@
     "mac": {
       "category": "public.app-category.developer-tools",
       "identity": null,
+      "icon": "electron/assets/icon.icns",
       "target": [
         "dmg",
         "zip"

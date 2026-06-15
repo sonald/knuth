@@ -4,7 +4,7 @@ AG-UI transport for an already-constructed Knuth `AgentRuntime`.
 
 This package owns HTTP/SSE protocol adaptation only. It does not build a
 runtime, choose tools, choose prompts, or set policy. Host packages such as
-`knuth-im` construct the runtime and pass it to `create_app(runtime)`.
+`knuth-im` construct the runtime and pass it to `create_app(...)`.
 
 ## Architecture
 
@@ -35,10 +35,10 @@ AgentRuntime
 `threadId`/`runId` values must match `run_[A-Za-z0-9_-]{1,80}` before they can
 enter the runtime as a durable run id.
 
-Request-scoped AG-UI tools are exposed through an invocation overlay. They are
-not registered in the runtime-wide `ToolRegistry`; external/client tools enter
-the durable `waiting_tool_result` state until `/tool_result` records the
-observation.
+AG-UI client tools are exposed through `AGUIClientToolProvider`, a normal
+runtime-registered `ToolProvider` owned by this package and wired by the host.
+External/client tools enter the durable `waiting_tool_result` state until
+`/tool_result` records the observation.
 
 ## Test
 

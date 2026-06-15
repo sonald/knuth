@@ -24,7 +24,6 @@ from knuth.core.invocations import (
     ApprovalStatus,
     ToolCallDecision,
     ToolInvocation,
-    ToolExecutionMode,
     ToolInvocationStatus,
     args_hash_for,
 )
@@ -439,7 +438,6 @@ def _reduce_tool_proposed(ctx: _ReduceContext, draft: ToolProposedDraft) -> _Mut
         "status": status_by_decision[draft.decision],
         "effect": draft.effect,
         "risk": draft.risk,
-        "execution_mode": draft.execution_mode,
         "last_event_seq": ctx.seq,
     }
     if draft.decision == ToolCallDecision.DENIED:
@@ -568,10 +566,6 @@ def _reduce_tool_invocation_awaiting_external_result(
     _require(
         invocation.status == ToolInvocationStatus.APPROVED,
         "tool.invocation_awaiting_external_result requires an approved invocation",
-    )
-    _require(
-        invocation.execution_mode == ToolExecutionMode.EXTERNAL,
-        "tool.invocation_awaiting_external_result requires an external invocation",
     )
     _require(
         invocation.tool_name == draft.tool_name,

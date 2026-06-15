@@ -18,6 +18,7 @@ const { SettingsStore } = require("./settings-store.cjs");
 const APP_SCHEME = "knuth";
 const DEV_SERVER_URL = process.env.ELECTRON_START_URL || "http://127.0.0.1:3000";
 const APP_ROOT = path.join(__dirname, "..");
+const WINDOW_ICON = path.join(__dirname, "assets", "icon.png");
 const settingsStore = new SettingsStore({
   app,
   appRoot: APP_ROOT,
@@ -77,6 +78,7 @@ function createWindow() {
     minWidth: 1024,
     minHeight: 720,
     title: "Knuth IM",
+    icon: WINDOW_ICON,
     backgroundColor: "#f7f4ed",
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
     webPreferences: {

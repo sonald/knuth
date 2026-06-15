@@ -17,7 +17,6 @@ from knuth.core.events import (
 from knuth.core.invocations import (
     EXTERNAL_EFFECTS,
     ToolCallDecision,
-    ToolExecutionMode,
     ToolInvocation,
     ToolInvocationStatus,
     approval_id_for,
@@ -142,7 +141,6 @@ async def _run_step(
         model_config_fingerprint=inference_config.model_dump_json(
             exclude={"run_id", "trace_id"}
         ),
-        tool_providers=invocation.tool_providers,
     )
     assert view.snapshot is not None
     await invocation.emit(
@@ -334,7 +332,6 @@ async def _drive_open_batch(
             run_id,
             inv.tool_name,
             inv.args,
-            overlay_providers=invocation.tool_providers,
         )
         await invocation.emit(
             ToolProposedDraft(
@@ -342,7 +339,6 @@ async def _drive_open_batch(
                 decision=proposal.decision,
                 effect=proposal.effect,
                 risk=proposal.risk,
-                execution_mode=proposal.execution_mode,
                 error=proposal.error,
             )
         )
@@ -413,7 +409,7 @@ async def _drive_open_batch(
         return RunStatus.PAUSED
 
     for inv in batch.by_status(ToolInvocationStatus.APPROVED):
-        if inv.execution_mode != ToolExecutionMode.EXTERNAL:
+        if not await services.tool_broker.awaits_external_result(inv):
             continue
         await invocation.emit(
             ToolInvocationAwaitingExternalResultDraft(
@@ -438,10 +434,7 @@ async def _drive_open_batch(
                 attempt=attempt,
             )
         )
-        result = await services.tool_broker.execute(
-            inv,
-            overlay_providers=invocation.tool_providers,
-        )
+        result = await services.tool_broker.execute(inv)
         observation = result.to_observation_text()
         artifact_ref = None
         observation_preview = None

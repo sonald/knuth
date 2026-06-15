@@ -28,7 +28,7 @@ from knuth_runtime import MemoryRunLedger, build_memory_runtime
 from knuth_toold import ToolBroker, create_default_registry
 from knuth_runtime.policy import PolicyEngine
 
-from knuth_agui import create_app
+from knuth_agui import create_agui_client_tool_provider, create_app
 
 
 def _tool_name(tool: object) -> str | None:
@@ -243,13 +243,15 @@ class AGUIM2Tests(unittest.TestCase):
 
     def _client_tool_runtime(self):
         scripted_client = _ScriptedClientToolClient()
+        client_tool_provider = create_agui_client_tool_provider()
         runtime = build_memory_runtime(
             inference_client=scripted_client,
             inference_config=InferenceConfig(),
             ledger=MemoryRunLedger(),
+            tool_providers=[client_tool_provider],
             include_default_tools=False,
         )
-        return runtime, scripted_client
+        return runtime, scripted_client, client_tool_provider
 
     def _approval_runtime(self):
         return build_memory_runtime(
@@ -341,8 +343,8 @@ class AGUIM2Tests(unittest.TestCase):
         self.assertIn("hello", events[types.index("TOOL_CALL_RESULT")]["content"])
 
     def test_client_tool_round_trip_waits_for_tool_result_then_resumes(self) -> None:
-        runtime, scripted_client = self._client_tool_runtime()
-        app = create_app(runtime)
+        runtime, scripted_client, client_tool_provider = self._client_tool_runtime()
+        app = create_app(runtime, client_tool_provider=client_tool_provider)
         run_id = "run_client_tool_1"
         with TestClient(app) as client:
             first = self._post_agent(
@@ -414,7 +416,7 @@ class AGUIM2Tests(unittest.TestCase):
             self.assertIn("localhost:3000", tool_messages[0]["content"])
 
         global_tools = anyio.run(runtime.tools)
-        self.assertNotIn(
+        self.assertIn(
             "browser_context",
             [name for tool in global_tools if (name := _tool_name(tool)) is not None],
         )

@@ -1,14 +1,15 @@
-"""Per-request AG-UI client tools exposed as Knuth invocation overlays."""
+"""AG-UI client tools exposed through a normal Knuth ToolProvider."""
 
 from __future__ import annotations
 
+import json
 import re
+import threading
 from typing import Any
 
 from knuth.core.invocations import ToolInvocation
 from knuth_toold import (
     ToolEffect,
-    ToolExecutionMode,
     ToolManifest,
     ToolResult,
     ToolRisk,
@@ -19,7 +20,7 @@ _TOOL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,80}$")
 _EMPTY_OBJECT_SCHEMA = {"type": "object", "properties": {}}
 
 
-class ClientToolProvider:
+class AGUIClientToolProvider:
     """ToolProvider for browser/client-side AG-UI tools.
 
     The runtime can propose these tools and wait for an external result, but it
@@ -28,15 +29,19 @@ class ClientToolProvider:
 
     name = "agui-client"
 
-    def __init__(self, manifests: list[ToolManifest]) -> None:
-        self._manifests = tuple(manifests)
+    def __init__(self, manifests: list[ToolManifest] | None = None) -> None:
+        self._manifests: dict[str, ToolManifest] = {}
+        self._lock = threading.RLock()
+        self.register_many(manifests or [])
 
     @property
     def has_tools(self) -> bool:
-        return bool(self._manifests)
+        with self._lock:
+            return bool(self._manifests)
 
     async def list_tools(self) -> list[ToolManifest]:
-        return list(self._manifests)
+        with self._lock:
+            return list(self._manifests.values())
 
     async def call_tool(
         self, invocation: ToolInvocation, _ctx: ToolRuntimeContext
@@ -47,10 +52,34 @@ class ClientToolProvider:
             retryable=False,
         )
 
+    async def awaits_external_result(self, _invocation: ToolInvocation) -> bool:
+        return True
 
-def client_tool_provider_from_agui(tools: Any) -> ClientToolProvider:
+    def register_agui_tools(self, tools: Any) -> None:
+        self.register_many(manifests_from_agui(tools))
+
+    def register_many(self, manifests: list[ToolManifest]) -> None:
+        with self._lock:
+            for manifest in manifests:
+                self._register(manifest)
+
+    def _register(self, manifest: ToolManifest) -> None:
+        manifest = manifest.model_copy(update={"provider": self.name})
+        existing = self._manifests.get(manifest.name)
+        if existing is not None and _fingerprint(existing) != _fingerprint(manifest):
+            raise ValueError(
+                f"client tool already registered differently: {manifest.name}"
+            )
+        self._manifests[manifest.name] = manifest
+
+
+def create_agui_client_tool_provider() -> AGUIClientToolProvider:
+    return AGUIClientToolProvider()
+
+
+def manifests_from_agui(tools: Any) -> list[ToolManifest]:
     if tools in (None, ""):
-        return ClientToolProvider([])
+        return []
     if not isinstance(tools, list):
         raise ValueError("tools must be a list")
 
@@ -62,7 +91,7 @@ def client_tool_provider_from_agui(tools: Any) -> ClientToolProvider:
             raise ValueError(f"duplicate client tool name: {manifest.name}")
         names.add(manifest.name)
         manifests.append(manifest)
-    return ClientToolProvider(manifests)
+    return manifests
 
 
 def _manifest_from_agui_tool(item: Any) -> ToolManifest:
@@ -95,6 +124,14 @@ def _manifest_from_agui_tool(item: Any) -> ToolManifest:
         parameters=parameters,
         effect=ToolEffect.READ,
         risk=ToolRisk.LOW,
-        execution_mode=ToolExecutionMode.EXTERNAL,
-        provider=ClientToolProvider.name,
+        provider=AGUIClientToolProvider.name,
+    )
+
+
+def _fingerprint(manifest: ToolManifest) -> str:
+    return json.dumps(
+        manifest.model_dump(mode="json", exclude={"provider"}),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
     )

@@ -5,7 +5,6 @@ from typing import Any, Protocol, runtime_checkable
 
 from knuth.core.invocations import (
     ToolEffect,
-    ToolExecutionMode,
     ToolInvocation,
     ToolRisk,
 )
@@ -23,7 +22,6 @@ class ToolManifest(KnuthModel):
     cacheable: bool = False
     risk: ToolRisk = ToolRisk.LOW
     effect: ToolEffect = ToolEffect.READ
-    execution_mode: ToolExecutionMode = ToolExecutionMode.RUNTIME
     timeout_s: float | None = None
     provider: str = "builtin"
 
@@ -63,7 +61,6 @@ class Tool(Protocol):
 __all__ = [
     "Tool",
     "ToolEffect",
-    "ToolExecutionMode",
     "ToolManifest",
     "ToolResult",
     "ToolResultStatus",

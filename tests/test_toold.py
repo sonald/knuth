@@ -50,6 +50,11 @@ class _ToolSetProvider:
         return await self._tools[invocation.tool_name].invoke(invocation, ctx)
 
 
+class _DeferredToolSetProvider(_ToolSetProvider):
+    async def awaits_external_result(self, _invocation: ToolInvocation) -> bool:
+        return True
+
+
 class DefaultToolRegistryTests(unittest.TestCase):
     def test_default_registry_exposes_required_tools(self) -> None:
         registry = create_default_registry()
@@ -141,6 +146,23 @@ class DefaultToolRegistryTests(unittest.TestCase):
         )
 
         self.assertEqual(first.decision, second.decision)
+
+    def test_external_result_waiting_is_provider_capability_not_manifest_fact(self) -> None:
+        registry = ToolRegistry()
+        registry.add_provider(_DeferredToolSetProvider(_SleepyTool(name="client_side")))
+        broker = ToolBroker(registry)
+
+        proposal = anyio.run(broker.propose, "run-1", "client_side", {})
+
+        self.assertEqual(proposal.decision, ToolCallDecision.ALLOWED)
+        self.assertFalse(hasattr(proposal, "execution_mode"))
+        self.assertFalse(hasattr(registry.get_manifest("client_side"), "execution_mode"))
+        self.assertTrue(
+            anyio.run(
+                broker.awaits_external_result,
+                _invocation("client_side", {}),
+            )
+        )
 
     def test_tool_broker_wraps_execution_errors_as_tool_results(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:

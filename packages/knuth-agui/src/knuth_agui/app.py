@@ -16,9 +16,8 @@ from fastapi.responses import StreamingResponse
 from knuth.core.types import RunStatus
 from knuth_runtime import AgentRuntime, LedgerError
 from knuth_runtime.session import RunSession
-from knuth_toold import ToolProvider
 
-from knuth_agui.client_tools import client_tool_provider_from_agui
+from knuth_agui.client_tools import AGUIClientToolProvider
 from knuth_agui.events import (
     AGUIEvent,
     content_type,
@@ -104,7 +103,6 @@ async def _session_factory(
     *,
     thread_id: str,
     prompt: str | None,
-    tool_providers: tuple[ToolProvider, ...],
 ) -> Callable[[SSEBridgeListener], RunSession]:
     status = await _existing_status(runtime, thread_id)
     if status is None:
@@ -116,7 +114,6 @@ async def _session_factory(
                 prompt,
                 run_id=thread_id,
                 listeners=[listener],
-                tool_providers=tool_providers,
             )
 
         return start
@@ -133,7 +130,6 @@ async def _session_factory(
                 thread_id,
                 prompt,
                 listeners=[listener],
-                tool_providers=tool_providers,
             )
 
         return continue_run
@@ -144,7 +140,6 @@ async def _session_factory(
             return runtime.resume(
                 thread_id,
                 listeners=[listener],
-                tool_providers=tool_providers,
             )
 
         return resume
@@ -202,7 +197,12 @@ def _is_authorized(request: Request, auth_token: str) -> bool:
     return secrets.compare_digest(token, auth_token)
 
 
-def create_app(runtime: AgentRuntime, *, auth_token: str | None = None) -> FastAPI:
+def create_app(
+    runtime: AgentRuntime,
+    *,
+    auth_token: str | None = None,
+    client_tool_provider: AGUIClientToolProvider | None = None,
+) -> FastAPI:
     app = FastAPI(title="knuth-agui", version="0.2.0")
     app.add_middleware(
         CORSMiddleware,
@@ -241,16 +241,21 @@ def create_app(runtime: AgentRuntime, *, auth_token: str | None = None) -> FastA
         if not isinstance(messages, list):
             raise HTTPException(status_code=400, detail="messages must be a list")
         prompt = _latest_user_prompt(messages)
-        try:
-            client_tools = client_tool_provider_from_agui(body.get("tools") or [])
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        tool_providers = (client_tools,) if client_tools.has_tools else ()
+        tools = body.get("tools") or []
+        if tools:
+            if client_tool_provider is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail="AG-UI client tool provider is not configured",
+                )
+            try:
+                client_tool_provider.register_agui_tools(tools)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         make_session = await _session_factory(
             runtime,
             thread_id=thread_id,
             prompt=prompt,
-            tool_providers=tool_providers,
         )
 
         async def event_stream() -> AsyncIterator[str]:

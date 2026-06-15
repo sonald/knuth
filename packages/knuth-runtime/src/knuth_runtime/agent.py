@@ -79,7 +79,6 @@ class AgentRuntime:
         *,
         run_id: str | None = None,
         listeners: Iterable[RuntimeEventListener] = (),
-        tool_providers: Iterable[ToolProvider] = (),
     ) -> RunSession:
         return RunSession(
             mode="start",
@@ -88,7 +87,6 @@ class AgentRuntime:
             prompt=prompt,
             run_id=run_id,
             listeners=(*self._default_listeners, *listeners),
-            tool_providers=tool_providers,
         )
 
     def continue_run(
@@ -97,7 +95,6 @@ class AgentRuntime:
         prompt: str,
         *,
         listeners: Iterable[RuntimeEventListener] = (),
-        tool_providers: Iterable[ToolProvider] = (),
     ) -> RunSession:
         return RunSession(
             mode="continue",
@@ -106,7 +103,6 @@ class AgentRuntime:
             run_id=run_id,
             prompt=prompt,
             listeners=(*self._default_listeners, *listeners),
-            tool_providers=tool_providers,
         )
 
     def resume(
@@ -114,7 +110,6 @@ class AgentRuntime:
         run_id: str,
         *,
         listeners: Iterable[RuntimeEventListener] = (),
-        tool_providers: Iterable[ToolProvider] = (),
     ) -> RunSession:
         return RunSession(
             mode="resume",
@@ -122,7 +117,6 @@ class AgentRuntime:
             inference_config=self._inference_config,
             run_id=run_id,
             listeners=(*self._default_listeners, *listeners),
-            tool_providers=tool_providers,
         )
 
     async def approve(self, approval_id: str) -> Approval:

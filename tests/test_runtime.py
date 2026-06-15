@@ -834,6 +834,65 @@ class EventDrivenRuntimeTests(unittest.TestCase):
                 Path(workspace, "x.txt").read_text(encoding="utf-8"), "hello"
             )
 
+    def test_approval_resume_executes_tool_in_fresh_runtime(self) -> None:
+        """CLI approve/resume are separate processes; execute must not rely on
+        a registry index warmed by the original propose path."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir, "knuth.db")
+            first_runtime = build_sqlite_runtime(
+                inference_client=ScriptedInferenceClient(
+                    [
+                        InferenceMessage(
+                            role=InferenceRole.ASSISTANT,
+                            tool_calls=[
+                                CoreToolCall(
+                                    tool_call_id="call-shell",
+                                    name="shell",
+                                    arguments={"command": "printf ok"},
+                                )
+                            ],
+                        )
+                    ]
+                ),
+                inference_config=InferenceConfig(),
+                db_path=db_path,
+            )
+            first = anyio.run(first_runtime.run_once, "run shell")
+            pending = anyio.run(first_runtime.pending_approvals, first.run_id)
+            self.assertEqual(first.status, RunStatus.WAITING_APPROVAL)
+            self.assertEqual(len(pending), 1)
+
+            approve_runtime = build_sqlite_runtime(
+                inference_client=ScriptedInferenceClient(
+                    [InferenceMessage(role=InferenceRole.ASSISTANT, content="unused")]
+                ),
+                inference_config=InferenceConfig(),
+                db_path=db_path,
+            )
+            anyio.run(approve_runtime.approve, pending[0].id)
+
+            resume_runtime = build_sqlite_runtime(
+                inference_client=ScriptedInferenceClient(
+                    [InferenceMessage(role=InferenceRole.ASSISTANT, content="done")]
+                ),
+                inference_config=InferenceConfig(),
+                db_path=db_path,
+            )
+
+            async def resume():
+                async with resume_runtime.resume(first.run_id) as session:
+                    return await session.result()
+
+            resumed = anyio.run(resume)
+            events = anyio.run(resume_runtime.events, first.run_id)
+
+        completed = [
+            event for event in events if event.type == "tool.invocation_completed"
+        ]
+        self.assertEqual(resumed.status, RunStatus.SUCCEEDED)
+        self.assertEqual(completed[-1].outcome, "succeeded")
+        self.assertIn("ok", completed[-1].observation or "")
+
     def test_resume_without_resolving_approval_fails_loudly(self) -> None:
         runtime = _build_runtime(
             ScriptedInferenceClient(

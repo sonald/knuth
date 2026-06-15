@@ -3,8 +3,9 @@
 Host/runtime wiring for the Knuth IM web agent.
 
 `knuth-im` owns environment loading, model configuration, SQLite ledger choice,
-CLI system prompt/tool wiring, and the process entrypoint. It passes the
-constructed `AgentRuntime` into `knuth-agui.create_app(runtime)`.
+CLI system prompt/tool wiring, AG-UI client-tool provider registration, and the
+process entrypoint. It passes the constructed `AgentRuntime` into
+`knuth-agui.create_app(...)`.
 
 The host currently exposes the same local tool surface as `knuth-cli`: default
 server tools (`read_file`, `write_file`, `shell`, `python`) plus CLI-local

@@ -9,7 +9,7 @@ from pathlib import Path
 from collections.abc import Sequence
 
 import uvicorn
-from knuth_agui import create_app
+from knuth_agui import create_agui_client_tool_provider, create_app
 
 from knuth_im.runtime_factory import build_runtime, load_dotenv
 
@@ -104,9 +104,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     config = parse_server_config(argv)
     if config.workspace is not None:
         os.chdir(config.workspace)
+    client_tool_provider = create_agui_client_tool_provider()
     app = create_app(
-        build_runtime(db_path=config.db_path),
+        build_runtime(
+            db_path=config.db_path,
+            tool_providers=[client_tool_provider],
+        ),
         auth_token=config.auth_token,
+        client_tool_provider=client_tool_provider,
     )
     uvicorn.run(app, host=config.host, port=config.port)
 

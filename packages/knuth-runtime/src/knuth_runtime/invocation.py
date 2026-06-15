@@ -5,7 +5,6 @@ from datetime import UTC, datetime
 from typing import Literal, cast
 from uuid import uuid4
 
-from knuth_toold import ToolProvider
 from knuth.core.events import (
     DurableRuntimeEventDraft,
     RuntimeEvent,
@@ -27,7 +26,6 @@ class RuntimeInvocation:
     mode: RunInvocationMode
     services: RuntimeServices
     observation: LiveRuntimeObservation
-    tool_providers: tuple[ToolProvider, ...] = ()
 
     async def emit(self, event: RuntimeEventDraft) -> RuntimeEvent:
         if event.durability == EventDurability.DURABLE:

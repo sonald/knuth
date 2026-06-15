@@ -14,7 +14,6 @@ from knuth.core.events import (
 )
 from knuth.core.types import ErrorInfo, RunStatus
 from knuth_llmd import InferenceConfig, InferenceRuntimeOptions
-from knuth_toold import ToolProvider
 
 from knuth_runtime.invocation import RunInvocationMode, RuntimeInvocation
 from knuth_runtime.loop import run_agent_loop
@@ -47,7 +46,6 @@ class RunSession:
         prompt: str | None = None,
         run_id: str | None = None,
         listeners: Iterable[RuntimeEventListener] = (),
-        tool_providers: Iterable[ToolProvider] = (),
         runtime_options: InferenceRuntimeOptions | None = None,
     ) -> None:
         self._mode = mode
@@ -56,7 +54,6 @@ class RunSession:
         self._prompt = prompt
         self._run_id = run_id
         self._initial_listeners = tuple(listeners)
-        self._tool_providers = tuple(tool_providers)
         self._runtime_options = runtime_options
         self._exit_stack: AsyncExitStack | None = None
         self._task_group: anyio.abc.TaskGroup | None = None
@@ -94,7 +91,6 @@ class RunSession:
                 mode=self._mode,
                 services=self._services,
                 observation=self._observation,
-                tool_providers=self._tool_providers,
             )
             await invocation.emit(RunInvocationStartedDraft(mode=self._mode))
             await self._prepare_run(invocation)
