@@ -12,7 +12,20 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from knuth.core.events import RuntimeEvent
+from knuth.core.events import (
+    ApprovalRequested,
+    ModelAborted,
+    ModelCompleted,
+    ModelContentDelta,
+    ModelFailed,
+    ModelReasoningCompleted,
+    ModelReasoningDelta,
+    ModelToolCallCompleted,
+    RuntimeEvent,
+    ToolBatchPlanned,
+    ToolInvocationCompleted,
+    ToolInvocationStarted,
+)
 from knuth.core.messages import ToolCall
 from knuth_runtime.observation import RuntimeEventInterest, RuntimeEventOverflowPolicy
 from rich.console import Console
@@ -27,6 +40,8 @@ _MAX_ARG_LEN = 80
 _MAX_RESULT_LEN = 400
 _MAX_REASONING_TAIL = 80
 _MAX_TOOL_PREVIEW_LINES = 6
+
+_EventHandler = Callable[..., None]
 
 
 class EventRenderer:
@@ -50,7 +65,7 @@ class EventRenderer:
         self._content_parts: list[str] = []
 
         self._tool_names: dict[str, str] = {}
-        self._dispatch: dict[str, Callable[[Any], None]] = {
+        self._dispatch: dict[str, _EventHandler] = {
             "model.reasoning.delta": self._on_reasoning_delta,
             "model.reasoning.completed": self._on_reasoning_completed,
             "model.content.delta": self._on_content_delta,
@@ -81,53 +96,53 @@ class EventRenderer:
 
     # -- event handlers ----------------------------------------------------
 
-    def _on_reasoning_delta(self, event: Any) -> None:
+    def _on_reasoning_delta(self, event: ModelReasoningDelta) -> None:
         # Keep accumulated answer text buffered across interleaved reasoning;
         # flushing here would split streamed markdown into broken fragments.
         self._suspend_content()
         self._start_thinking()
         self._append_reasoning(event.delta)
 
-    def _on_reasoning_completed(self, _event: Any) -> None:
+    def _on_reasoning_completed(self, _event: ModelReasoningCompleted) -> None:
         self._stop_thinking()
 
-    def _on_content_delta(self, event: Any) -> None:
+    def _on_content_delta(self, event: ModelContentDelta) -> None:
         self._stop_thinking()
         self._append_content(event.delta)
 
-    def _on_tool_call_completed(self, event: Any) -> None:
+    def _on_tool_call_completed(self, event: ModelToolCallCompleted) -> None:
         self._stop_thinking()
         self._stop_content()
         self._print_tool_call(event.tool_call)
 
-    def _on_model_completed(self, _event: Any) -> None:
+    def _on_model_completed(self, _event: ModelCompleted) -> None:
         self._stop_thinking()
         self._stop_content()
 
-    def _on_model_failed(self, event: Any) -> None:
+    def _on_model_failed(self, event: ModelFailed) -> None:
         self._stop_thinking()
         self._stop_content()
         self._console.print(Text(f"✗ error: {event.error.message}", style="bold red"))
 
-    def _on_model_aborted(self, _event: Any) -> None:
+    def _on_model_aborted(self, _event: ModelAborted) -> None:
         self._stop_thinking()
         self._stop_content()
         self._console.print(Text("⊘ aborted", style="yellow"))
 
-    def _on_batch_planned(self, event: Any) -> None:
+    def _on_batch_planned(self, event: ToolBatchPlanned) -> None:
         for call in event.calls:
             self._tool_names[call.tool_call_id] = call.name
 
-    def _on_tool_started(self, event: Any) -> None:
+    def _on_tool_started(self, event: ToolInvocationStarted) -> None:
         self._stop_thinking()
         self._stop_content()
         name = self._tool_names.get(event.tool_call_id, event.tool_call_id)
         self._console.print(Text(f"  ⏳ {name}…", style="dim"))
 
-    def _on_tool_completed(self, event: Any) -> None:
+    def _on_tool_completed(self, event: ToolInvocationCompleted) -> None:
         self._print_tool_completed(event)
 
-    def _on_approval_requested(self, event: Any) -> None:
+    def _on_approval_requested(self, event: ApprovalRequested) -> None:
         self._stop_thinking()
         self._stop_content()
         title = event.title or event.reason or "tool call"
@@ -222,7 +237,7 @@ class EventRenderer:
         args = tool_call.arguments
         self._console.print(Text(f"● {name}({_format_args(args)})", style="bold blue"))
 
-    def _print_tool_completed(self, event: Any) -> None:
+    def _print_tool_completed(self, event: ToolInvocationCompleted) -> None:
         self._stop_thinking()
         self._stop_content()
         name = event.tool_name

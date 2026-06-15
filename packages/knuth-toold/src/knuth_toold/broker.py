@@ -18,6 +18,7 @@ from knuth.core.tools import ToolResult
 from knuth.core.types import ErrorInfo, KnuthModel
 
 from knuth_toold.base import ToolManifest, ToolRuntimeContext
+from knuth_toold.providers import ToolProvider
 from knuth_toold.registry import ToolRegistry
 
 
@@ -64,7 +65,7 @@ class ToolProposal(KnuthModel):
 @dataclass(frozen=True)
 class _ManifestOwner:
     manifest: ToolManifest
-    provider: Any
+    provider: ToolProvider
 
 
 class ToolBroker:
@@ -85,7 +86,7 @@ class ToolBroker:
     async def list_visible_tools(
         self,
         run_id: str,
-        overlay_providers: Iterable[Any] = (),
+        overlay_providers: Iterable[ToolProvider] = (),
     ) -> list[dict[str, Any]]:
         await self.registry.refresh()
         owners = await self._overlay_index(overlay_providers)
@@ -105,7 +106,7 @@ class ToolBroker:
         run_id: str,
         tool_name: str,
         args: dict[str, Any],
-        overlay_providers: Iterable[Any] = (),
+        overlay_providers: Iterable[ToolProvider] = (),
     ) -> ToolProposal:
         await self.registry.refresh()
         overlay = await self._overlay_index(overlay_providers)
@@ -158,7 +159,7 @@ class ToolBroker:
     async def execute(
         self,
         invocation: ToolInvocation,
-        overlay_providers: Iterable[Any] = (),
+        overlay_providers: Iterable[ToolProvider] = (),
     ) -> ToolResult:
         overlay = await self._overlay_index(overlay_providers)
         try:
@@ -193,7 +194,7 @@ class ToolBroker:
             return ToolResult.from_error(exc.__class__.__name__, str(exc))
 
     async def _overlay_index(
-        self, overlay_providers: Iterable[Any]
+        self, overlay_providers: Iterable[ToolProvider]
     ) -> dict[str, _ManifestOwner]:
         owners: dict[str, _ManifestOwner] = {}
         for provider in overlay_providers:

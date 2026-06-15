@@ -301,7 +301,9 @@ class LiteLLMInferenceClient:
         generation_id = f"gen_{uuid4().hex}"
         seq = 0
 
-        def event(event_class: type, fields: dict[str, Any] | None = None) -> InferenceEvent:
+        def event(
+            event_class: type, fields: Mapping[str, object] | None = None
+        ) -> InferenceEvent:
             nonlocal seq
             seq += 1
             return event_class(

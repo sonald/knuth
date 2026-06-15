@@ -54,6 +54,8 @@ from knuth.core.runtime_events import (
 )
 from knuth.core.types import RunStatus
 
+type SQLiteParam = str | int | float | bytes | None
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
@@ -732,7 +734,7 @@ def _open_batch_for(
     )
 
 
-class _LedgerMixin:
+class _LedgerMixin[TxnT]:
     """Template for :class:`RunLedger` implementations.
 
     Owns the apply orchestration — redact, load the aggregate view, reduce,
@@ -770,7 +772,7 @@ class _LedgerMixin:
         return redact_text(content) if redact_text is not None else content
 
     def _apply_in_txn(
-        self, txn: Any, run_id: str, draft: DurableRuntimeEventDraft
+        self, txn: TxnT, run_id: str, draft: DurableRuntimeEventDraft
     ) -> StoredRuntimeEvent:
         view = self._load_view(
             txn,
@@ -794,12 +796,12 @@ class _LedgerMixin:
         raise NotImplementedError
 
     def _load_view(
-        self, txn: Any, run_id: str, *, with_last_tool_call_ids: bool
+        self, txn: TxnT, run_id: str, *, with_last_tool_call_ids: bool
     ) -> _AggregateView:
         raise NotImplementedError
 
     def _persist(
-        self, txn: Any, run_id: str, event: StoredRuntimeEvent, mutations: _Mutations
+        self, txn: TxnT, run_id: str, event: StoredRuntimeEvent, mutations: _Mutations
     ) -> None:
         raise NotImplementedError
 
@@ -807,7 +809,7 @@ class _LedgerMixin:
         raise NotImplementedError
 
 
-class MemoryRunLedger(_LedgerMixin):
+class MemoryRunLedger(_LedgerMixin[None]):
     def __init__(self, redactor: EventRedactor | None = None) -> None:
         super().__init__(redactor)
         self._lock = anyio.Lock()
@@ -824,7 +826,7 @@ class MemoryRunLedger(_LedgerMixin):
             return self._apply_in_txn(None, run_id, draft)
 
     def _load_view(
-        self, txn: Any, run_id: str, *, with_last_tool_call_ids: bool
+        self, txn: None, run_id: str, *, with_last_tool_call_ids: bool
     ) -> _AggregateView:
         return _AggregateView(
             run=self._runs.get(run_id),
@@ -840,7 +842,7 @@ class MemoryRunLedger(_LedgerMixin):
         )
 
     def _persist(
-        self, txn: Any, run_id: str, event: StoredRuntimeEvent, mutations: _Mutations
+        self, txn: None, run_id: str, event: StoredRuntimeEvent, mutations: _Mutations
     ) -> None:
         self._events.setdefault(run_id, []).append(event)
         self._runs[run_id] = mutations.run
@@ -960,7 +962,7 @@ def _threaded[T, **P](fn: Callable[P, T]) -> Callable[P, Awaitable[T]]:
     return wrapper
 
 
-class SQLiteRunLedger(_LedgerMixin):
+class SQLiteRunLedger(_LedgerMixin[sqlite3.Connection]):
     def __init__(
         self, db_path: Path | str, redactor: EventRedactor | None = None
     ) -> None:
@@ -1113,7 +1115,7 @@ class SQLiteRunLedger(_LedgerMixin):
         conn: sqlite3.Connection,
         model_cls: type[M],
         sql: str,
-        params: tuple[Any, ...] = (),
+        params: tuple[SQLiteParam, ...] = (),
     ) -> list[M]:
         return [
             model_cls.model_validate_json(row[0]) for row in conn.execute(sql, params)
@@ -1217,7 +1219,7 @@ class SQLiteRunLedger(_LedgerMixin):
         self, limit: int = 20, status: RunStatus | None = None
     ) -> list[AgentRun]:
         sql = "select data_json from runs"
-        params: tuple[Any, ...] = ()
+        params: tuple[SQLiteParam, ...] = ()
         if status is not None:
             sql += " where status = ?"
             params += (status.value,)
@@ -1231,7 +1233,7 @@ class SQLiteRunLedger(_LedgerMixin):
         self, run_id: str, after_seq: int | None = None
     ) -> list[StoredRuntimeEvent]:
         sql = "select event_json from events where run_id = ?"
-        params: tuple[Any, ...] = (run_id,)
+        params: tuple[SQLiteParam, ...] = (run_id,)
         if after_seq is not None:
             sql += " and seq > ?"
             params += (after_seq,)
@@ -1272,7 +1274,7 @@ class SQLiteRunLedger(_LedgerMixin):
     @_threaded
     def pending_approvals(self, run_id: str | None = None) -> list[Approval]:
         sql = "select data_json from approvals where status = ?"
-        params: tuple[Any, ...] = (ApprovalStatus.PENDING.value,)
+        params: tuple[SQLiteParam, ...] = (ApprovalStatus.PENDING.value,)
         if run_id is not None:
             sql += " and run_id = ?"
             params += (run_id,)

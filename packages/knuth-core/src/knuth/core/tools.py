@@ -30,7 +30,7 @@ class ToolResult(KnuthModel):
         return f"Tool error: {self.error.message if self.error else 'unknown error'}"
 
     @classmethod
-    def success(cls, content: str | None = None, data: Any = None) -> "ToolResult":
+    def success(cls, content: str | None = None, data: object = None) -> "ToolResult":
         return cls(status=ToolResultStatus.SUCCESS, content=content, data=data)
 
     @classmethod

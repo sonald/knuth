@@ -3,8 +3,8 @@ from __future__ import annotations
 import html
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
 
 
 _TAGGED_PROCESS_RE = re.compile(
@@ -23,7 +23,7 @@ class TaggedProcessOutput:
     stdout: str
     stderr: str
     return_code: int
-    offload: dict[str, Any]
+    offload: dict[str, object]
 
 
 def render_tagged_process_output(
@@ -31,7 +31,7 @@ def render_tagged_process_output(
     stdout: str,
     stderr: str,
     return_code: int,
-    offload: dict[str, Any],
+    offload: Mapping[str, object],
 ) -> str:
     return "\n".join(
         [
@@ -50,11 +50,14 @@ def parse_tagged_process_output(content: str) -> TaggedProcessOutput | None:
     if match is None:
         return None
     try:
+        offload = json.loads(html.unescape(match.group("offload")))
+        if not isinstance(offload, dict):
+            return None
         return TaggedProcessOutput(
             stdout=html.unescape(match.group("stdout")),
             stderr=html.unescape(match.group("stderr")),
             return_code=int(match.group("return_code")),
-            offload=json.loads(html.unescape(match.group("offload"))),
+            offload={str(key): value for key, value in offload.items()},
         )
     except (TypeError, ValueError, json.JSONDecodeError):
         return None

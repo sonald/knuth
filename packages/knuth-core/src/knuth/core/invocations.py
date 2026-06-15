@@ -99,7 +99,7 @@ class Approval(KnuthModel):
     resolved_by: str | None = None
 
 
-def canonical_json(value: Any) -> str:
+def canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
 

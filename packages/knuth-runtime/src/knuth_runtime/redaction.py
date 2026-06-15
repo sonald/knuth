@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from typing import TypeVar
 
 from pydantic import BaseModel
 
@@ -119,7 +119,7 @@ class RegexSecretRedactor:
             return model
         return type(model).model_validate(redacted)
 
-    def _redact_value(self, value: Any) -> Any:
+    def _redact_value(self, value: object) -> object:
         if isinstance(value, str):
             return self.redact_text(value)
         if isinstance(value, dict):
@@ -130,7 +130,7 @@ class RegexSecretRedactor:
             return [self._redact_value(item) for item in value]
         return value
 
-    def _redact_entry(self, key: Any, value: Any) -> Any:
+    def _redact_entry(self, key: object, value: object) -> object:
         if (
             isinstance(key, str)
             and isinstance(value, str)

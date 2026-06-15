@@ -24,13 +24,25 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from typing import Any
 from uuid import uuid4
 
-from knuth.core.events import RuntimeEvent
+from knuth.core.events import (
+    ApprovalRequested,
+    ModelContentDelta,
+    ModelReasoningCompleted,
+    ModelReasoningDelta,
+    RuntimeEvent,
+    RunInvocationEnded,
+    RunInvocationStarted,
+    ToolBatchPlanned,
+    ToolInvocationAwaitingExternalResult,
+    ToolInvocationCompleted,
+)
 from knuth.core.types import RunStatus
 
 from knuth_agui import events as ag
+
+_AGUIHandler = Callable[..., list[ag.AGUIEvent]]
 
 
 class AGUITranslator:
@@ -39,7 +51,7 @@ class AGUITranslator:
         self.run_id = run_id
         self._text_message_id: str | None = None
         self._thinking_open = False
-        self._dispatch: dict[str, Callable[[Any], list[ag.AGUIEvent]]] = {
+        self._dispatch: dict[str, _AGUIHandler] = {
             "run.invocation.started": self._on_run_started,
             "run.invocation.ended": self._on_run_ended,
             "model.content.delta": self._on_content_delta,
@@ -83,17 +95,17 @@ class AGUITranslator:
 
     # -- handlers ----------------------------------------------------------
 
-    def _on_run_started(self, _event: Any) -> list[ag.AGUIEvent]:
+    def _on_run_started(self, _event: RunInvocationStarted) -> list[ag.AGUIEvent]:
         return [ag.run_started(self.thread_id, self.run_id)]
 
-    def _on_content_delta(self, event: Any) -> list[ag.AGUIEvent]:
+    def _on_content_delta(self, event: ModelContentDelta) -> list[ag.AGUIEvent]:
         out = self._close_thinking()
         out += self._open_text()
         assert self._text_message_id is not None
         out.append(ag.text_message_content(self._text_message_id, event.delta))
         return out
 
-    def _on_reasoning_delta(self, event: Any) -> list[ag.AGUIEvent]:
+    def _on_reasoning_delta(self, event: ModelReasoningDelta) -> list[ag.AGUIEvent]:
         out = self._close_text()
         if not self._thinking_open:
             self._thinking_open = True
@@ -101,10 +113,12 @@ class AGUITranslator:
         out.append(ag.thinking_text_content(event.delta))
         return out
 
-    def _on_reasoning_completed(self, _event: Any) -> list[ag.AGUIEvent]:
+    def _on_reasoning_completed(
+        self, _event: ModelReasoningCompleted
+    ) -> list[ag.AGUIEvent]:
         return self._close_thinking()
 
-    def _on_batch_planned(self, event: Any) -> list[ag.AGUIEvent]:
+    def _on_batch_planned(self, event: ToolBatchPlanned) -> list[ag.AGUIEvent]:
         out = self._close_open()
         for call in event.calls:
             out.append(ag.tool_call_start(call.tool_call_id, call.name))
@@ -114,7 +128,7 @@ class AGUITranslator:
             out.append(ag.tool_call_end(call.tool_call_id))
         return out
 
-    def _on_tool_completed(self, event: Any) -> list[ag.AGUIEvent]:
+    def _on_tool_completed(self, event: ToolInvocationCompleted) -> list[ag.AGUIEvent]:
         content = event.observation or event.observation_preview or ""
         if event.outcome == "denied":
             content = content or "Tool call denied."
@@ -126,7 +140,9 @@ class AGUITranslator:
             )
         ]
 
-    def _on_tool_awaiting_external_result(self, event: Any) -> list[ag.AGUIEvent]:
+    def _on_tool_awaiting_external_result(
+        self, event: ToolInvocationAwaitingExternalResult
+    ) -> list[ag.AGUIEvent]:
         return [
             ag.custom(
                 "knuth.tool_result_required",
@@ -140,7 +156,7 @@ class AGUITranslator:
             )
         ]
 
-    def _on_approval_requested(self, event: Any) -> list[ag.AGUIEvent]:
+    def _on_approval_requested(self, event: ApprovalRequested) -> list[ag.AGUIEvent]:
         return [
             ag.custom(
                 "knuth.approval_requested",
@@ -155,7 +171,7 @@ class AGUITranslator:
             )
         ]
 
-    def _on_run_ended(self, event: Any) -> list[ag.AGUIEvent]:
+    def _on_run_ended(self, event: RunInvocationEnded) -> list[ag.AGUIEvent]:
         out = self._close_open()
         status = event.status
         if event.error is not None or status == RunStatus.FAILED:
