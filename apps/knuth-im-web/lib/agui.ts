@@ -37,6 +37,18 @@ export type ThreadSummary = {
   lastSeq: number;
 };
 
+export type PendingApproval = {
+  approvalId: string;
+  runId: string;
+  toolCallId: string;
+  status: string;
+  title: string;
+  reason: string;
+  risk: string;
+  preview?: Record<string, unknown>;
+  createdAt?: string;
+};
+
 export type AGUIEvent = {
   type: string;
   [key: string]: unknown;
@@ -108,6 +120,22 @@ export async function fetchHistory(
   }
   const data = (await response.json()) as { messages?: WireMessage[] };
   return data.messages ?? [];
+}
+
+export async function fetchPendingApprovals(
+  endpoint: AgentEndpoint,
+  threadId: string,
+): Promise<PendingApproval[]> {
+  const connection = normalizeEndpoint(endpoint);
+  const response = await fetch(`${connection.baseUrl}/threads/${threadId}/approvals`, {
+    cache: "no-store",
+    headers: connection.headers,
+  });
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  const data = (await response.json()) as { approvals?: PendingApproval[] };
+  return data.approvals ?? [];
 }
 
 export async function pauseRun(endpoint: AgentEndpoint, runId: string): Promise<void> {

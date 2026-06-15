@@ -134,6 +134,23 @@ nextjs-portal {
   z-index: 1;
 }
 
+.brand,
+.chatHeader {
+  -webkit-app-region: drag;
+}
+
+button,
+input,
+textarea,
+select,
+a,
+.convList,
+.settingsPanel,
+.chatActions,
+.transcript {
+  -webkit-app-region: no-drag;
+}
+
 /* ---- sidebar -------------------------------------------------------- */
 
 .sidebar {

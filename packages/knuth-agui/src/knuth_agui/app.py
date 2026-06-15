@@ -304,6 +304,32 @@ def create_app(runtime: AgentRuntime, *, auth_token: str | None = None) -> FastA
     async def messages(thread_id: str) -> dict[str, Any]:
         return await history(thread_id)
 
+    @app.get("/threads/{thread_id}/approvals")
+    async def approvals(thread_id: str) -> dict[str, Any]:
+        _canonical_thread_id({"threadId": thread_id})
+        try:
+            await runtime.status(thread_id)
+            pending = await runtime.pending_approvals(thread_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="thread not found") from exc
+        return {
+            "threadId": thread_id,
+            "approvals": [
+                {
+                    "approvalId": approval.id,
+                    "runId": approval.run_id,
+                    "toolCallId": approval.tool_call_id,
+                    "status": approval.status.value,
+                    "title": approval.title,
+                    "reason": approval.reason,
+                    "risk": approval.risk,
+                    "preview": approval.approval_preview,
+                    "createdAt": approval.created_at,
+                }
+                for approval in pending
+            ],
+        }
+
     @app.post("/pause")
     async def pause(request: Request) -> dict[str, str]:
         body = await request.json()

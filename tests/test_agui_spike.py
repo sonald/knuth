@@ -166,6 +166,36 @@ class _ScriptedClientToolClient:
         )
 
 
+class _ScriptedApprovalClient:
+    """Ask for a dangerous server tool so the runtime waits for approval."""
+
+    model = "scripted-approval-model"
+
+    async def stream(self, messages, tools, config, runtime=None):
+        from knuth.core.events import InferenceGenerationStarted
+
+        gen = "approval-gen-1"
+        yield InferenceGenerationStarted(
+            generation_id=gen, seq=1, run_id=config.run_id, model=self.model
+        )
+        yield InferenceGenerationCompleted(
+            generation_id=gen,
+            seq=2,
+            run_id=config.run_id,
+            message=InferenceMessage(
+                role=InferenceRole.ASSISTANT,
+                content="",
+                tool_calls=[
+                    CoreToolCall(
+                        tool_call_id="shell-call-1",
+                        name="shell",
+                        arguments={"command": "pwd"},
+                    )
+                ],
+            ),
+        )
+
+
 _BROWSER_CONTEXT_TOOL = {
     "name": "browser_context",
     "description": "Return current browser context.",
@@ -220,6 +250,15 @@ class AGUIM2Tests(unittest.TestCase):
             include_default_tools=False,
         )
         return runtime, scripted_client
+
+    def _approval_runtime(self):
+        return build_memory_runtime(
+            inference_client=_ScriptedApprovalClient(),
+            inference_config=InferenceConfig(),
+            ledger=MemoryRunLedger(),
+            tool_providers=[create_cli_tool_provider()],
+            include_default_tools=False,
+        )
 
     def _post_agent(
         self, client: TestClient, body: dict, expected_status: int = 200
@@ -379,6 +418,34 @@ class AGUIM2Tests(unittest.TestCase):
             "browser_context",
             [name for tool in global_tools if (name := _tool_name(tool)) is not None],
         )
+
+    def test_pending_approvals_endpoint_restores_approval_card_data(self) -> None:
+        app = create_app(self._approval_runtime())
+        run_id = "run_approval_restore_1"
+        with TestClient(app) as client:
+            events = self._post_agent(
+                client,
+                {
+                    "threadId": run_id,
+                    "messages": [{"role": "user", "content": "where am I?"}],
+                },
+            )
+            custom = next(
+                event
+                for event in events
+                if event["type"] == "CUSTOM"
+                and event["name"] == "knuth.approval_requested"
+            )
+            response = client.get(f"/threads/{run_id}/approvals")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        approvals = response.json()["approvals"]
+        self.assertEqual(len(approvals), 1)
+        self.assertEqual(approvals[0]["approvalId"], custom["value"]["approvalId"])
+        self.assertEqual(approvals[0]["toolCallId"], "shell-call-1")
+        self.assertEqual(approvals[0]["title"], "Approve tool call: shell")
+        self.assertEqual(approvals[0]["preview"]["tool"], "shell")
+        self.assertEqual(approvals[0]["preview"]["args"]["command"], "pwd")
 
     def test_missing_thread_id_generates_canonical_run_id_and_history(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:

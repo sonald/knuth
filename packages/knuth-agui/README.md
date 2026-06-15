@@ -24,6 +24,8 @@ AgentRuntime
 - `GET /threads/{threadId}/history`: return `MESSAGES_SNAPSHOT` rebuilt from
   the ledger.
 - `GET /threads/{threadId}/messages`: alias for history.
+- `GET /threads/{threadId}/approvals`: list pending approvals for restoring
+  approval cards after conversation switches or reloads.
 - `POST /pause`: pause a created/running run.
 - `POST /approve`: resolve an approval; callers then open a new `/agent`
   resume stream.

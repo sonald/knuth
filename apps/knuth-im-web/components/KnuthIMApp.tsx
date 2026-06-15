@@ -48,9 +48,11 @@ import {
   AgentConnection,
   ClientToolSpec,
   DEFAULT_AGENT_URL,
+  PendingApproval,
   ThreadSummary,
   WireMessage,
   fetchHistory,
+  fetchPendingApprovals,
   fetchThreads,
   pauseRun,
   resolveApproval,
@@ -372,6 +374,38 @@ function historyToTimeline(messages: WireMessage[]): TimelineItem[] {
   });
 
   return items;
+}
+
+function approvalToView(approval: PendingApproval): ApprovalView {
+  return {
+    approvalId: approval.approvalId,
+    toolCallId: approval.toolCallId,
+    title: approval.title || "approval requested",
+    reason: approval.reason || "",
+    risk: approval.risk || "",
+    preview: formatJsonish(approval.preview ?? ""),
+  };
+}
+
+function appendApprovalItems(
+  items: TimelineItem[],
+  approvals: ApprovalView[],
+): TimelineItem[] {
+  return approvals.reduce(
+    (current, approval) =>
+      upsertItem(current, {
+        id: `approval_${approval.approvalId}`,
+        kind: "approval",
+        title: approval.title,
+        label: "Approval",
+        body: approval.reason || approval.title,
+        args: approval.preview,
+        status: "waiting",
+        toolCallId: approval.toolCallId,
+        approvalId: approval.approvalId,
+      }),
+    items,
+  );
 }
 
 function groupThreads(threads: ThreadSummary[]): ThreadGroup[] {
@@ -1219,8 +1253,13 @@ export function KnuthIMApp() {
     setError(undefined);
     atBottomRef.current = true;
     try {
-      const history = await fetchHistory(agentConnection, threadId);
-      setTimelineItems(historyToTimeline(history));
+      const [history, pendingApprovals] = await Promise.all([
+        fetchHistory(agentConnection, threadId),
+        fetchPendingApprovals(agentConnection, threadId),
+      ]);
+      const approvalViews = pendingApprovals.map(approvalToView);
+      setApprovals(approvalViews);
+      setTimelineItems(appendApprovalItems(historyToTimeline(history), approvalViews));
     } catch (err) {
       setError(String(err));
     }
