@@ -7,8 +7,8 @@ import anyio
 
 from knuth.core.invocations import ToolInvocation, args_hash_for
 from knuth.core.tools import ToolResult
-from knuth_cli.tools.process_output import parse_tagged_process_output
-from knuth_cli.tools.shell import ShellTool
+from knuth_toold.builtins import ShellTool
+from knuth_toold.process_output import parse_tagged_process_output
 from knuth_toold import ToolBroker, ToolRegistry
 from knuth_toold.base import ToolManifest, ToolRuntimeContext
 

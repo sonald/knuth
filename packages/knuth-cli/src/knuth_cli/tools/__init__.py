@@ -1,10 +1,9 @@
 from knuth.core.invocations import ToolInvocation
 from knuth.core.tools import ToolResult
-from knuth_cli.tools.files import EditFileTool, ReadFileTool, WriteFileTool
+from knuth_cli.tools.files import EditFileTool
 from knuth_cli.tools.search import GlobTool, GrepTool
-from knuth_cli.tools.shell import ShellTool
 from knuth_toold.base import Tool, ToolManifest, ToolRuntimeContext
-from knuth_toold.builtins import PythonTool
+from knuth_toold.builtins import PythonTool, ReadFileTool, ShellTool, WriteFileTool
 
 
 class CliToolProvider:
@@ -12,13 +11,9 @@ class CliToolProvider:
 
     def __init__(self) -> None:
         tools = (
-            ReadFileTool(),
-            WriteFileTool(),
             EditFileTool(),
             GlobTool(),
             GrepTool(),
-            ShellTool(),
-            PythonTool(),
         )
         self._tools: dict[str, Tool] = {tool.manifest.name: tool for tool in tools}
 

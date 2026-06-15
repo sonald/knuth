@@ -21,7 +21,7 @@ from rich.markdown import Markdown
 from rich.spinner import Spinner
 from rich.text import Text
 
-from knuth_cli.tools.process_output import TaggedProcessOutput, parse_tagged_process_output
+from knuth_toold.process_output import TaggedProcessOutput, parse_tagged_process_output
 
 _MAX_ARG_LEN = 80
 _MAX_RESULT_LEN = 400

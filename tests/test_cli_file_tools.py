@@ -6,7 +6,8 @@ import anyio
 
 from knuth.core.invocations import ToolInvocation, args_hash_for
 from knuth.core.tools import ToolResult
-from knuth_cli.tools.files import EditFileTool, ReadFileTool
+from knuth_cli.tools.files import EditFileTool
+from knuth_toold.builtins import ReadFileTool
 from knuth_toold import ToolBroker, ToolRegistry
 from knuth_toold.base import ToolManifest, ToolRuntimeContext
 

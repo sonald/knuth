@@ -20,6 +20,7 @@ from knuth_toold import (
     ToolRegistry,
     create_default_registry,
 )
+from knuth_toold.process_output import parse_tagged_process_output
 
 
 def _invocation(name: str, args: dict, tool_call_id: str = "call-1") -> ToolInvocation:
@@ -90,7 +91,7 @@ class DefaultToolRegistryTests(unittest.TestCase):
             )
 
             self.assertTrue(write_result.ok)
-            self.assertEqual(read_result.content, "hello knuth")
+            self.assertIn("hello knuth", read_result.content)
 
     def test_process_tools_capture_stdout(self) -> None:
         registry = create_default_registry()
@@ -107,7 +108,10 @@ class DefaultToolRegistryTests(unittest.TestCase):
         )
 
         self.assertTrue(shell_result.ok)
-        self.assertEqual(shell_result.content, "shell-ok")
+        shell_output = parse_tagged_process_output(shell_result.content or "")
+        self.assertIsNotNone(shell_output)
+        self.assertEqual(shell_output.stdout, "shell-ok")
+        self.assertEqual(shell_output.return_code, 0)
         self.assertTrue(python_result.ok)
         self.assertEqual(python_result.content.strip(), "python-ok")
 

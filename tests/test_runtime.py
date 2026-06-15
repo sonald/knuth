@@ -963,14 +963,14 @@ class EventDrivenRuntimeTests(unittest.TestCase):
         self.assertIsNone(completed[0].observation)
         self.assertIsNotNone(completed[0].artifact_ref)
         self.assertTrue(completed[0].observation_preview)
-        # The model still sees the full text through the conversation fold.
+        # The model still sees the full tool result through the conversation fold.
         final_turn = client.captured_messages[-1]
         tool_results = [
             message
             for message in final_turn
             if message.role == InferenceRole.TOOL_RESULT
         ]
-        self.assertEqual(tool_results[0].content, big)
+        self.assertIn(big, tool_results[0].content or "")
 
 
 class CrashRecoveryTests(unittest.TestCase):

@@ -6,8 +6,9 @@ Host/runtime wiring for the Knuth IM web agent.
 CLI system prompt/tool wiring, and the process entrypoint. It passes the
 constructed `AgentRuntime` into `knuth-agui.create_app(runtime)`.
 
-The host currently exposes the same local tool provider as `knuth-cli`
-(`read_file`, `write_file`, `edit_file`, `glob`, `grep`, `shell`, `python`).
+The host currently exposes the same local tool surface as `knuth-cli`: default
+server tools (`read_file`, `write_file`, `shell`, `python`) plus CLI-local
+tools (`edit_file`, `glob`, `grep`).
 Risky tools still go through the runtime policy/approval path.
 
 ## Run

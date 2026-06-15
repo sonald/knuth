@@ -32,7 +32,7 @@ async def build_runtime(
         db_path=db_path,
         section_providers=build_cli_system_sections(config.system_prompt),
         tool_providers=[create_cli_tool_provider()],
-        include_default_tools=False,
+        include_default_tools=True,
         enable_plugins=enable_plugins,
         debug_sink_dir=DEFAULT_DEBUG_SINK_DIR if debug else None,
     )

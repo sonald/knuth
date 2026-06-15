@@ -6,7 +6,7 @@ import anyio
 from rich.console import Console
 
 from knuth_cli.render import EventRenderer
-from knuth_cli.tools.process_output import render_tagged_process_output
+from knuth_toold.process_output import render_tagged_process_output
 
 
 class EventRendererShellToolTests(unittest.TestCase):

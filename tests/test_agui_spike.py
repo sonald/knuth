@@ -237,7 +237,7 @@ class AGUIM2Tests(unittest.TestCase):
             inference_config=InferenceConfig(),
             ledger=MemoryRunLedger(),
             tool_providers=[create_cli_tool_provider()],
-            include_default_tools=False,
+            include_default_tools=True,
         )
         return runtime, client
 
@@ -257,7 +257,7 @@ class AGUIM2Tests(unittest.TestCase):
             inference_config=InferenceConfig(),
             ledger=MemoryRunLedger(),
             tool_providers=[create_cli_tool_provider()],
-            include_default_tools=False,
+            include_default_tools=True,
         )
 
     def _post_agent(

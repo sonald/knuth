@@ -46,5 +46,5 @@ def build_runtime(db_path: str | Path | None = None) -> AgentRuntime:
         db_path=db_path or Path("~/.knuth/knuth-im.db"),
         section_providers=build_cli_system_sections(system_prompt),
         tool_providers=[create_cli_tool_provider()],
-        include_default_tools=False,
+        include_default_tools=True,
     )
