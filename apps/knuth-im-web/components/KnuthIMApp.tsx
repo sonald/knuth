@@ -10,11 +10,14 @@ import {
   FilePen,
   FilePlus,
   FileText,
+  FolderOpen,
   FolderSearch,
+  KeyRound,
   Loader2,
   Play,
   Plus,
   RefreshCw,
+  Save,
   Search,
   Settings2,
   ShieldAlert,
@@ -36,8 +39,13 @@ import {
   useRef,
   useState,
 } from "react";
+import type {
+  KnuthDesktopSettings,
+  KnuthDesktopSettingsInput,
+} from "../types/knuth-desktop";
 import {
   AGUIEvent,
+  AgentConnection,
   ClientToolSpec,
   DEFAULT_AGENT_URL,
   ThreadSummary,
@@ -107,11 +115,31 @@ type ThreadGroup = {
   threads: ThreadSummary[];
 };
 
+type SettingsDraft = {
+  modelBaseUrl: string;
+  model: string;
+  timeout: string;
+  workspace: string;
+  dbPath: string;
+  apiKey: string;
+  clearApiKey: boolean;
+};
+
 const EXAMPLE_PROMPTS = [
   "What files are in this project?",
   "Summarize the runtime architecture.",
   "Find every TODO in the codebase.",
 ];
+
+const EMPTY_SETTINGS_DRAFT: SettingsDraft = {
+  modelBaseUrl: "",
+  model: "",
+  timeout: "60",
+  workspace: "",
+  dbPath: "",
+  apiKey: "",
+  clearApiKey: false,
+};
 
 const CLIENT_TOOLS: ClientToolSpec[] = [
   {
@@ -405,8 +433,34 @@ function threadTitle(thread: ThreadSummary | undefined): string {
   return thread.query?.trim() || compactId(thread.threadId);
 }
 
+function settingsDraftFrom(settings: KnuthDesktopSettings): SettingsDraft {
+  return {
+    modelBaseUrl: settings.modelBaseUrl,
+    model: settings.model,
+    timeout: String(settings.timeout || 60),
+    workspace: settings.workspace,
+    dbPath: settings.dbPath,
+    apiKey: "",
+    clearApiKey: false,
+  };
+}
+
+function desktopConnectionFrom(backend: AgentConnection): AgentConnection {
+  return {
+    baseUrl: backend.baseUrl,
+    headers: backend.headers ?? {},
+    status: backend.status,
+    mode: backend.mode,
+    workspace: backend.workspace,
+    settings: backend.settings,
+    error: backend.error,
+  };
+}
+
 export function KnuthIMApp() {
   const [baseUrl, setBaseUrl] = useState(DEFAULT_AGENT_URL);
+  const [desktopConnection, setDesktopConnection] =
+    useState<AgentConnection | null>(null);
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [activeThreadId, setActiveThreadId] = useState<string>();
   const [timelineItems, setTimelineItems] = useState<TimelineItem[]>([]);
@@ -415,9 +469,18 @@ export function KnuthIMApp() {
   const [draft, setDraft] = useState("");
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string>();
-  const [connected, setConnected] = useState(true);
-  const [showEndpoint, setShowEndpoint] = useState(false);
+  const [connected, setConnected] = useState(false);
+  const [desktopDetected, setDesktopDetected] = useState(false);
+  const [desktopLoading, setDesktopLoading] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [autoApprove, setAutoApprove] = useState(false);
+  const [desktopSettings, setDesktopSettings] =
+    useState<KnuthDesktopSettings | null>(null);
+  const [settingsDraft, setSettingsDraft] =
+    useState<SettingsDraft>(EMPTY_SETTINGS_DRAFT);
+  const [settingsSaving, setSettingsSaving] = useState(false);
+  const [settingsError, setSettingsError] = useState<string>();
+  const [settingsMessage, setSettingsMessage] = useState<string>();
 
   const abortRef = useRef<AbortController | null>(null);
   const thinkingIdRef = useRef<string | null>(null);
@@ -433,36 +496,143 @@ export function KnuthIMApp() {
   );
 
   const groupedThreads = useMemo(() => groupThreads(threads), [threads]);
+  const backendNeedsSettings = desktopConnection?.status === "needs_settings";
+  const desktopBackendFailed = desktopConnection?.status === "failed";
+  const desktopBackendStarting =
+    desktopDetected &&
+    (desktopLoading ||
+      desktopConnection === null ||
+      desktopConnection.status === "starting");
+  const backendUnavailable =
+    Boolean(backendNeedsSettings) || desktopBackendFailed || desktopBackendStarting;
+  const desktopMode = Boolean(desktopConnection || desktopSettings);
+  const agentConnection = useMemo<AgentConnection>(() => {
+    if (desktopConnection && desktopConnection.baseUrl === baseUrl) {
+      return desktopConnection;
+    }
+    return { baseUrl, headers: {} };
+  }, [baseUrl, desktopConnection]);
 
   const canResume =
     activeThread?.status === "waiting_approval" ||
     activeThread?.status === "waiting_tool_result" ||
     activeThread?.status === "paused";
 
+  const connectionLabel = useMemo(() => {
+    if (backendNeedsSettings) {
+      return "Settings needed";
+    }
+    if (desktopBackendFailed) {
+      return "Backend failed";
+    }
+    if (desktopBackendStarting) {
+      return "Starting";
+    }
+    return connected ? "Connected" : "Disconnected";
+  }, [backendNeedsSettings, connected, desktopBackendFailed, desktopBackendStarting]);
+
   const statusLabel = useMemo(() => {
     if (running) {
       return "Working…";
+    }
+    if (desktopBackendStarting) {
+      return "Starting backend…";
     }
     if (activeThread) {
       return `${shortStatus(activeThread.status)} · ${activeThread.steps} steps`;
     }
     return "Ready";
-  }, [activeThread, running]);
+  }, [activeThread, running, desktopBackendStarting]);
 
   const refresh = useCallback(async () => {
+    if (desktopBackendStarting) {
+      setConnected(false);
+      return;
+    }
+    if (backendNeedsSettings) {
+      setConnected(false);
+      setError("Model settings required");
+      return;
+    }
+    if (desktopBackendFailed) {
+      setConnected(false);
+      setError(desktopConnection?.error ?? "Backend failed");
+      return;
+    }
     try {
-      const nextThreads = await fetchThreads(baseUrl);
+      const nextThreads = await fetchThreads(agentConnection);
       setThreads(nextThreads);
       setConnected(true);
+      setError(undefined);
     } catch {
       setConnected(false);
       setError("AG-UI backend unavailable");
     }
-  }, [baseUrl]);
+  }, [
+    agentConnection,
+    backendNeedsSettings,
+    desktopConnection,
+    desktopBackendFailed,
+    desktopConnection?.error,
+    desktopBackendStarting,
+  ]);
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadDesktopBackend() {
+      if (!window.knuthDesktop?.backend) {
+        return;
+      }
+      setDesktopDetected(true);
+      setDesktopLoading(true);
+      setConnected(false);
+      try {
+        const settings = await window.knuthDesktop.getSettings?.();
+        if (cancelled) {
+          return;
+        }
+        if (settings) {
+          setDesktopSettings(settings);
+          setSettingsDraft(settingsDraftFrom(settings));
+          if (!settings.ready) {
+            setShowSettings(true);
+          }
+        }
+        const backend = await window.knuthDesktop.backend();
+        if (cancelled) {
+          return;
+        }
+        const next = desktopConnectionFrom(backend);
+        setDesktopConnection(next);
+        setBaseUrl(next.baseUrl);
+        if (backend.status === "needs_settings") {
+          setConnected(false);
+          setError("Model settings required");
+          setShowSettings(true);
+        } else if (backend.status === "failed" && backend.error) {
+          setConnected(false);
+          setError(backend.error);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(String(err));
+          setConnected(false);
+        }
+      } finally {
+        if (!cancelled) {
+          setDesktopLoading(false);
+        }
+      }
+    }
+    void loadDesktopBackend();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     const node = transcriptRef.current;
@@ -478,6 +648,101 @@ export function KnuthIMApp() {
     }
     atBottomRef.current =
       node.scrollHeight - node.scrollTop - node.clientHeight < 80;
+  }, []);
+
+  const chooseWorkspace = useCallback(async () => {
+    try {
+      const selected = await window.knuthDesktop?.chooseWorkspace?.();
+      if (selected) {
+        setSettingsDraft((current) => ({ ...current, workspace: selected }));
+        setSettingsMessage(undefined);
+      }
+    } catch (err) {
+      setSettingsError(String(err));
+    }
+  }, []);
+
+  const saveDesktopSettings = useCallback(
+    async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      if (!window.knuthDesktop?.saveSettings) {
+        return;
+      }
+      setSettingsSaving(true);
+      setSettingsError(undefined);
+      setSettingsMessage(undefined);
+      const payload: KnuthDesktopSettingsInput = {
+        modelBaseUrl: settingsDraft.modelBaseUrl,
+        model: settingsDraft.model,
+        timeout: settingsDraft.timeout,
+        workspace: settingsDraft.workspace,
+        dbPath: settingsDraft.dbPath,
+      };
+      if (settingsDraft.apiKey.trim()) {
+        payload.apiKey = settingsDraft.apiKey;
+      }
+      if (settingsDraft.clearApiKey) {
+        payload.clearApiKey = true;
+      }
+
+      try {
+        const result = await window.knuthDesktop.saveSettings(payload);
+        setDesktopSettings(result.settings);
+        setSettingsDraft(settingsDraftFrom(result.settings));
+        setSettingsMessage("Saved");
+        const next = desktopConnectionFrom(result.backend);
+        setDesktopConnection(next);
+        setBaseUrl(next.baseUrl);
+        if (next.status === "ready" || next.status === "external") {
+          const nextThreads = await fetchThreads(next);
+          setThreads(nextThreads);
+          setConnected(true);
+          setError(undefined);
+        } else if (next.status === "needs_settings") {
+          setConnected(false);
+          setError("Model settings required");
+          setShowSettings(true);
+        } else if (next.status === "failed") {
+          setConnected(false);
+          setError(next.error ?? "Backend failed");
+        }
+      } catch (err) {
+        setSettingsError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setSettingsSaving(false);
+      }
+    },
+    [settingsDraft],
+  );
+
+  const restartDesktopBackend = useCallback(async () => {
+    if (!window.knuthDesktop?.restartBackend) {
+      return;
+    }
+    setSettingsError(undefined);
+    setSettingsMessage(undefined);
+    try {
+      const backend = await window.knuthDesktop.restartBackend();
+      const next = desktopConnectionFrom(backend);
+      setDesktopConnection(next);
+      setBaseUrl(next.baseUrl);
+      setSettingsMessage("Restarted");
+      if (next.status === "ready" || next.status === "external") {
+        const nextThreads = await fetchThreads(next);
+        setThreads(nextThreads);
+        setConnected(true);
+        setError(undefined);
+      } else if (next.status === "needs_settings") {
+        setConnected(false);
+        setError("Model settings required");
+        setShowSettings(true);
+      } else if (next.status === "failed") {
+        setConnected(false);
+        setError(next.error ?? "Backend failed");
+      }
+    } catch (err) {
+      setSettingsError(err instanceof Error ? err.message : String(err));
+    }
   }, []);
 
   const applyEvent = useCallback(
@@ -769,7 +1034,7 @@ export function KnuthIMApp() {
       setError(undefined);
       try {
         await streamAgent(
-          baseUrl,
+          agentConnection,
           { ...payload, tools: CLIENT_TOOLS },
           applyEvent,
           controller.signal,
@@ -784,7 +1049,7 @@ export function KnuthIMApp() {
         void refresh();
       }
     },
-    [applyEvent, baseUrl, refresh],
+    [agentConnection, applyEvent, refresh],
   );
 
   useEffect(() => {
@@ -822,7 +1087,7 @@ export function KnuthIMApp() {
           );
           try {
             const result = await executeClientTool(request.toolName, request.args);
-            await submitToolResult(baseUrl, {
+            await submitToolResult(agentConnection, {
               runId: request.runId,
               toolCallId: request.toolCallId,
               outcome: "succeeded",
@@ -846,7 +1111,7 @@ export function KnuthIMApp() {
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             try {
-              await submitToolResult(baseUrl, {
+              await submitToolResult(agentConnection, {
                 runId: request.runId,
                 toolCallId: request.toolCallId,
                 outcome: "failed",
@@ -886,11 +1151,24 @@ export function KnuthIMApp() {
     }
 
     void executeAndResume();
-  }, [baseUrl, clientToolQueue, runStream, running]);
+  }, [agentConnection, clientToolQueue, runStream, running]);
 
   const sendMessage = useCallback(
     async (content: string) => {
       const trimmed = content.trim();
+      if (backendNeedsSettings) {
+        setShowSettings(true);
+        setError("Model settings required");
+        return;
+      }
+      if (desktopBackendStarting) {
+        setError("Backend is still starting");
+        return;
+      }
+      if (desktopBackendFailed) {
+        setError(desktopConnection?.error ?? "Backend failed");
+        return;
+      }
       if (!trimmed || running) {
         return;
       }
@@ -914,7 +1192,15 @@ export function KnuthIMApp() {
         messages: [{ role: "user", content: trimmed }],
       });
     },
-    [activeThreadId, running, runStream],
+    [
+      activeThreadId,
+      backendNeedsSettings,
+      desktopBackendFailed,
+      desktopBackendStarting,
+      desktopConnection?.error,
+      running,
+      runStream,
+    ],
   );
 
   const submit = (event: FormEvent) => {
@@ -933,7 +1219,7 @@ export function KnuthIMApp() {
     setError(undefined);
     atBottomRef.current = true;
     try {
-      const history = await fetchHistory(baseUrl, threadId);
+      const history = await fetchHistory(agentConnection, threadId);
       setTimelineItems(historyToTimeline(history));
     } catch (err) {
       setError(String(err));
@@ -959,7 +1245,7 @@ export function KnuthIMApp() {
       return;
     }
     try {
-      await pauseRun(baseUrl, activeThreadId);
+      await pauseRun(agentConnection, activeThreadId);
     } catch (err) {
       setError(String(err));
     }
@@ -980,7 +1266,7 @@ export function KnuthIMApp() {
       const decisionStatus: TimelineStatus =
         decision === "approved" ? "approved" : "denied";
       try {
-        await resolveApproval(baseUrl, approval.approvalId, decision);
+        await resolveApproval(agentConnection, approval.approvalId, decision);
       } catch (err) {
         setError(String(err));
         return;
@@ -1001,7 +1287,7 @@ export function KnuthIMApp() {
       );
       await runStream({ threadId: activeThreadId, messages: [] });
     },
-    [activeThreadId, baseUrl, runStream],
+    [activeThreadId, agentConnection, runStream],
   );
 
   // "Approve all" → auto-resolve pending approvals for the rest of the session.
@@ -1076,22 +1362,195 @@ export function KnuthIMApp() {
         <div className="sidebarFoot">
           <button
             type="button"
-            className={showEndpoint ? "endpointToggle open" : "endpointToggle"}
-            onClick={() => setShowEndpoint((value) => !value)}
+            className={showSettings ? "endpointToggle open" : "endpointToggle"}
+            onClick={() => setShowSettings((value) => !value)}
           >
-            <span className={connected ? "connDot" : "connDot down"} />
-            <span>{connected ? "Connected" : "Disconnected"}</span>
+            <span
+              className={
+                connected && !backendNeedsSettings && !desktopBackendFailed
+                  ? "connDot"
+                  : "connDot down"
+              }
+            />
+            <span>{connectionLabel}</span>
             <Settings2 size={14} className="chev" />
           </button>
-          {showEndpoint ? (
-            <label className="endpointField">
-              <span>AG-UI endpoint</span>
-              <input
-                value={baseUrl}
-                onChange={(event) => setBaseUrl(event.target.value)}
-                spellCheck={false}
-              />
-            </label>
+          {showSettings ? (
+            <div className="settingsPanel">
+              {desktopMode ? (
+                <form className="settingsForm" onSubmit={saveDesktopSettings}>
+                  <label className="settingsField">
+                    <span>Model endpoint</span>
+                    <input
+                      value={settingsDraft.modelBaseUrl}
+                      onChange={(event) => {
+                        setSettingsMessage(undefined);
+                        setSettingsDraft((current) => ({
+                          ...current,
+                          modelBaseUrl: event.target.value,
+                        }));
+                      }}
+                      placeholder="https://api.example.com/v1"
+                      spellCheck={false}
+                    />
+                  </label>
+                  <label className="settingsField">
+                    <span>Model</span>
+                    <input
+                      value={settingsDraft.model}
+                      onChange={(event) => {
+                        setSettingsMessage(undefined);
+                        setSettingsDraft((current) => ({
+                          ...current,
+                          model: event.target.value,
+                        }));
+                      }}
+                      placeholder="provider/model"
+                      spellCheck={false}
+                    />
+                  </label>
+                  <label className="settingsField">
+                    <span>
+                      API key
+                      {desktopSettings?.hasApiKey ? (
+                        <span className="savedKey">saved</span>
+                      ) : null}
+                    </span>
+                    <span className="secretInput">
+                      <KeyRound size={14} />
+                      <input
+                        type="password"
+                        value={settingsDraft.apiKey}
+                        onChange={(event) => {
+                          setSettingsMessage(undefined);
+                          setSettingsDraft((current) => ({
+                            ...current,
+                            apiKey: event.target.value,
+                            clearApiKey: false,
+                          }));
+                        }}
+                        placeholder={
+                          desktopSettings?.hasApiKey ? "Saved API key" : "API key"
+                        }
+                        spellCheck={false}
+                      />
+                    </span>
+                  </label>
+                  {desktopSettings?.hasApiKey ? (
+                    <label className="settingsCheck">
+                      <input
+                        type="checkbox"
+                        checked={settingsDraft.clearApiKey}
+                        onChange={(event) => {
+                          setSettingsMessage(undefined);
+                          setSettingsDraft((current) => ({
+                            ...current,
+                            clearApiKey: event.target.checked,
+                            apiKey: event.target.checked ? "" : current.apiKey,
+                          }));
+                        }}
+                      />
+                      <span>Forget saved key</span>
+                    </label>
+                  ) : null}
+                  <label className="settingsField">
+                    <span>Workspace</span>
+                    <span className="pathInput">
+                      <input
+                        value={settingsDraft.workspace}
+                        onChange={(event) => {
+                          setSettingsMessage(undefined);
+                          setSettingsDraft((current) => ({
+                            ...current,
+                            workspace: event.target.value,
+                          }));
+                        }}
+                        spellCheck={false}
+                      />
+                      <button
+                        type="button"
+                        className="pathButton"
+                        title="Choose workspace"
+                        onClick={() => void chooseWorkspace()}
+                      >
+                        <FolderOpen size={15} />
+                      </button>
+                    </span>
+                  </label>
+                  <label className="settingsField">
+                    <span>Database</span>
+                    <input
+                      value={settingsDraft.dbPath}
+                      onChange={(event) => {
+                        setSettingsMessage(undefined);
+                        setSettingsDraft((current) => ({
+                          ...current,
+                          dbPath: event.target.value,
+                        }));
+                      }}
+                      spellCheck={false}
+                    />
+                  </label>
+                  <label className="settingsField short">
+                    <span>Timeout</span>
+                    <input
+                      type="number"
+                      min="1"
+                      max="3600"
+                      step="1"
+                      value={settingsDraft.timeout}
+                      onChange={(event) => {
+                        setSettingsMessage(undefined);
+                        setSettingsDraft((current) => ({
+                          ...current,
+                          timeout: event.target.value,
+                        }));
+                      }}
+                    />
+                  </label>
+                  <div className="settingsMeta">
+                    <span>AG-UI</span>
+                    <code>{baseUrl}</code>
+                  </div>
+                  {settingsError ? (
+                    <div className="settingsNotice danger">{settingsError}</div>
+                  ) : settingsMessage ? (
+                    <div className="settingsNotice ok">{settingsMessage}</div>
+                  ) : null}
+                  <div className="settingsActions">
+                    <button
+                      type="submit"
+                      className="settingsSave"
+                      disabled={settingsSaving}
+                    >
+                      {settingsSaving ? (
+                        <Loader2 size={14} className="spin" />
+                      ) : (
+                        <Save size={14} />
+                      )}
+                      Save
+                    </button>
+                    <button
+                      type="button"
+                      className="settingsRestart"
+                      onClick={() => void restartDesktopBackend()}
+                    >
+                      <RefreshCw size={14} />
+                      Restart
+                    </button>
+                  </div>
+                </form>
+              ) : (
+                <label className="endpointField">
+                  <span>AG-UI endpoint</span>
+                  <input
+                    value={baseUrl}
+                    onChange={(event) => setBaseUrl(event.target.value)}
+                    spellCheck={false}
+                  />
+                </label>
+              )}
+            </div>
           ) : null}
         </div>
       </aside>
@@ -1187,6 +1646,7 @@ export function KnuthIMApp() {
                     key={prompt}
                     type="button"
                     className="exampleChip"
+                    disabled={backendUnavailable}
                     onClick={() => void sendMessage(prompt)}
                   >
                     {prompt}
@@ -1208,8 +1668,15 @@ export function KnuthIMApp() {
             <textarea
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
-              placeholder="Message Knuth…"
+              placeholder={
+                backendNeedsSettings
+                  ? "Configure model settings…"
+                  : desktopBackendStarting
+                    ? "Starting backend…"
+                    : "Message Knuth…"
+              }
               rows={1}
+              disabled={backendUnavailable}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey) {
                   event.preventDefault();
@@ -1231,7 +1698,7 @@ export function KnuthIMApp() {
                 className="send"
                 type="submit"
                 title="Send"
-                disabled={!draft.trim()}
+                disabled={!draft.trim() || backendUnavailable}
               >
                 <ArrowUp size={18} />
               </button>

@@ -3,6 +3,29 @@ import { HttpAgent, type BaseEvent, type RunAgentInput } from "@ag-ui/client";
 export const DEFAULT_AGENT_URL =
   process.env.NEXT_PUBLIC_KNUTH_AGUI_URL ?? "http://127.0.0.1:8000";
 
+export type AgentConnection = {
+  baseUrl: string;
+  headers?: Record<string, string>;
+  status?: string;
+  mode?: string;
+  workspace?: string;
+  settings?: {
+    modelBaseUrl: string;
+    model: string;
+    timeout: number;
+    workspace: string;
+    dbPath: string;
+    hasApiKey: boolean;
+    apiKeySource: "stored" | "environment" | null;
+    secretStorage?: "local-file" | null;
+    missing: string[];
+    ready: boolean;
+  };
+  error?: string;
+};
+
+export type AgentEndpoint = string | AgentConnection;
+
 export type ThreadSummary = {
   threadId: string;
   runId: string;
@@ -47,8 +70,23 @@ export type ToolResultInput = {
   error?: unknown;
 };
 
-export async function fetchThreads(baseUrl: string): Promise<ThreadSummary[]> {
-  const response = await fetch(`${baseUrl}/threads`, { cache: "no-store" });
+function normalizeEndpoint(endpoint: AgentEndpoint): AgentConnection {
+  if (typeof endpoint === "string") {
+    return { baseUrl: endpoint, headers: {} };
+  }
+  return { ...endpoint, headers: endpoint.headers ?? {} };
+}
+
+function jsonHeaders(endpoint: AgentConnection): Record<string, string> {
+  return { ...endpoint.headers, "content-type": "application/json" };
+}
+
+export async function fetchThreads(endpoint: AgentEndpoint): Promise<ThreadSummary[]> {
+  const connection = normalizeEndpoint(endpoint);
+  const response = await fetch(`${connection.baseUrl}/threads`, {
+    cache: "no-store",
+    headers: connection.headers,
+  });
   if (!response.ok) {
     throw new Error(await response.text());
   }
@@ -57,11 +95,13 @@ export async function fetchThreads(baseUrl: string): Promise<ThreadSummary[]> {
 }
 
 export async function fetchHistory(
-  baseUrl: string,
+  endpoint: AgentEndpoint,
   threadId: string,
 ): Promise<WireMessage[]> {
-  const response = await fetch(`${baseUrl}/threads/${threadId}/history`, {
+  const connection = normalizeEndpoint(endpoint);
+  const response = await fetch(`${connection.baseUrl}/threads/${threadId}/history`, {
     cache: "no-store",
+    headers: connection.headers,
   });
   if (!response.ok) {
     throw new Error(await response.text());
@@ -70,10 +110,11 @@ export async function fetchHistory(
   return data.messages ?? [];
 }
 
-export async function pauseRun(baseUrl: string, runId: string): Promise<void> {
-  const response = await fetch(`${baseUrl}/pause`, {
+export async function pauseRun(endpoint: AgentEndpoint, runId: string): Promise<void> {
+  const connection = normalizeEndpoint(endpoint);
+  const response = await fetch(`${connection.baseUrl}/pause`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: jsonHeaders(connection),
     body: JSON.stringify({ runId }),
   });
   if (!response.ok) {
@@ -82,13 +123,14 @@ export async function pauseRun(baseUrl: string, runId: string): Promise<void> {
 }
 
 export async function resolveApproval(
-  baseUrl: string,
+  endpoint: AgentEndpoint,
   approvalId: string,
   decision: "approved" | "denied",
 ): Promise<void> {
-  const response = await fetch(`${baseUrl}/approve`, {
+  const connection = normalizeEndpoint(endpoint);
+  const response = await fetch(`${connection.baseUrl}/approve`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: jsonHeaders(connection),
     body: JSON.stringify({ approvalId, decision }),
   });
   if (!response.ok) {
@@ -97,12 +139,13 @@ export async function resolveApproval(
 }
 
 export async function submitToolResult(
-  baseUrl: string,
+  endpoint: AgentEndpoint,
   input: ToolResultInput,
 ): Promise<void> {
-  const response = await fetch(`${baseUrl}/tool_result`, {
+  const connection = normalizeEndpoint(endpoint);
+  const response = await fetch(`${connection.baseUrl}/tool_result`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: jsonHeaders(connection),
     body: JSON.stringify(input),
   });
   if (!response.ok) {
@@ -111,7 +154,7 @@ export async function submitToolResult(
 }
 
 export async function streamAgent(
-  baseUrl: string,
+  endpoint: AgentEndpoint,
   input: {
     threadId?: string;
     messages: WireMessage[];
@@ -120,8 +163,12 @@ export async function streamAgent(
   onEvent: (event: AGUIEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
+  const connection = normalizeEndpoint(endpoint);
   const threadId = input.threadId ?? "";
-  const agent = new HttpAgent({ url: `${baseUrl}/agent` });
+  const agent = new HttpAgent({
+    url: `${connection.baseUrl}/agent`,
+    headers: connection.headers,
+  });
   const runInput = {
     threadId,
     runId: threadId,

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 from collections.abc import AsyncIterator, Callable
 from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
 from knuth.core.types import RunStatus
 from knuth_runtime import AgentRuntime, LedgerError
@@ -192,17 +194,38 @@ def _tool_result_observation(body: dict[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
-def create_app(runtime: AgentRuntime) -> FastAPI:
+def _is_authorized(request: Request, auth_token: str) -> bool:
+    authorization = request.headers.get("authorization", "")
+    token = request.headers.get("x-knuth-auth-token", "")
+    if authorization.startswith("Bearer "):
+        token = authorization.removeprefix("Bearer ")
+    return secrets.compare_digest(token, auth_token)
+
+
+def create_app(runtime: AgentRuntime, *, auth_token: str | None = None) -> FastAPI:
     app = FastAPI(title="knuth-agui", version="0.2.0")
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
             "http://localhost:3000",
             "http://127.0.0.1:3000",
+            "knuth://app",
         ],
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    auth_token = auth_token or None
+
+    @app.middleware("http")
+    async def require_auth(request: Request, call_next):
+        if (
+            auth_token is not None
+            and request.method != "OPTIONS"
+            and request.url.path != "/healthz"
+            and not _is_authorized(request, auth_token)
+        ):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+        return await call_next(request)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

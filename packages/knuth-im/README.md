@@ -24,3 +24,22 @@ Optional environment:
 - `KNUTH_TIMEOUT`, default `60`
 - `KNUTH_IM_HOST`, default `127.0.0.1`
 - `KNUTH_IM_PORT`, default `8000`
+- `KNUTH_IM_DB_PATH`, default `~/.knuth/knuth-im.db`
+- `KNUTH_IM_WORKSPACE`, optional process working directory for local tools
+- `KNUTH_IM_AUTH_TOKEN`, optional local bearer token for protected endpoints
+- `KNUTH_IM_ENV_FILE`, default `.env`
+
+Equivalent CLI flags are available for sidecar hosts:
+
+```bash
+uv run knuth-im \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --db-path ~/.knuth/knuth-im.db \
+  --workspace /path/to/workspace \
+  --auth-token "$KNUTH_IM_AUTH_TOKEN"
+```
+
+When `--auth-token` is set, `/healthz` remains public for startup polling and
+other AG-UI endpoints require `Authorization: Bearer <token>` or
+`X-Knuth-Auth-Token`.

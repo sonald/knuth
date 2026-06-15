@@ -2,10 +2,19 @@
   "name": "knuth-im-web",
   "version": "0.1.0",
   "private": true,
+  "main": "electron/main.cjs",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "sidecar:build": "rm -rf sidecar/knuth-im sidecar/knuth-im.exe && uv run --with pyinstaller pyinstaller --noconfirm --clean --onedir --collect-data litellm --collect-submodules tiktoken_ext --name knuth-im --distpath sidecar --workpath ../../.scratch/pyinstaller/build --specpath ../../.scratch/pyinstaller/spec ../../packages/knuth-im/src/knuth_im/__main__.py",
+    "electron:dev": "node scripts/electron-dev.mjs",
+    "electron:dir": "npm run sidecar:build && npm run typecheck && npm run build && ELECTRON_MIRROR=${ELECTRON_MIRROR:-https://npmmirror.com/mirrors/electron/} electron-builder --mac --dir --publish never",
+    "electron:build": "npm run sidecar:build && npm run typecheck && npm run build && ELECTRON_MIRROR=${ELECTRON_MIRROR:-https://npmmirror.com/mirrors/electron/} electron-builder --mac --publish never",
+    "smoke:sidecar": "node scripts/smoke-sidecar.mjs",
+    "smoke:sidecar-binary": "node scripts/smoke-sidecar-binary.mjs",
+    "smoke:sidecar-real-env": "node scripts/smoke-sidecar-real-env.mjs",
+    "smoke:settings": "node scripts/smoke-settings-store.mjs"
   },
   "dependencies": {
     "@ag-ui/client": "0.0.57",
@@ -21,6 +30,40 @@
     "@types/node": "25.9.3",
     "@types/react": "19.2.17",
     "@types/react-dom": "19.2.3",
+    "electron": "^39.2.7",
+    "electron-builder": "^26.0.12",
     "typescript": "6.0.3"
+  },
+  "build": {
+    "appId": "ai.knuth.im",
+    "productName": "Knuth IM",
+    "asar": true,
+    "afterPack": "electron/after-pack.cjs",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "electron/**/*",
+      "out/**/*",
+      "package.json",
+      "!node_modules/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "sidecar",
+        "to": "knuth-im-sidecar",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "identity": null,
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    }
   }
 }

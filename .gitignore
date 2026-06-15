@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+.scratch/pyinstaller/
 
 # Virtual environments
 .venv
