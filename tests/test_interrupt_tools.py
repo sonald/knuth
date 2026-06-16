@@ -112,6 +112,27 @@ class _SelfWakingTool:
         )
 
 
+class _BlockingTool:
+    """Blocks forever, ignoring the signal — only force-cancel stops it."""
+
+    def __init__(self, name: str, effect: ToolEffect):
+        self._name = name
+        self._effect = effect
+
+    @property
+    def manifest(self) -> ToolManifest:
+        return ToolManifest(
+            name=self._name,
+            description="blocks forever",
+            parameters={"type": "object", "properties": {}},
+            effect=self._effect,
+            risk=ToolRisk.HIGH,
+        )
+
+    async def invoke(self, invocation, ctx: ToolRuntimeContext):
+        await anyio.sleep(100)
+
+
 class _RaisingOnInterruptTool:
     """Raises (e.g. cancellation) when interrupted, with no reliable outcome."""
 
@@ -201,6 +222,40 @@ class BrokerOutcomeTests(unittest.TestCase):
         result = anyio.run(scenario)
         self.assertEqual(result.outcome, ToolExecutionOutcome.INTERRUPTED)
         self.assertIn("cleanly", result.observation or "")
+
+    def test_real_cancellation_propagates_not_forged_into_outcome(self) -> None:
+        """A force-stop cancellation must propagate, not be converted into a
+        clean outcome (ADR-007 §9). Recovery — not the broker — settles it."""
+
+        async def scenario():
+            controller = InterruptController()
+            broker = _broker(_BlockingTool("danger", ToolEffect.EXTERNAL_WRITE))
+            await broker.registry.refresh()
+            controller.interrupt("user_stop")  # signal already set, like a stop
+            propagated = [False]
+            result = [None]
+
+            async with anyio.create_task_group() as tg:
+
+                async def run():
+                    try:
+                        result[0] = await broker.execute(
+                            _invocation("danger"), signal=controller.signal
+                        )
+                    except anyio.get_cancelled_exc_class():
+                        propagated[0] = True
+                        raise
+
+                tg.start_soon(run)
+                await anyio.sleep(0.02)
+                # Force-stop: cancel the task group while the tool blocks.
+                tg.cancel_scope.cancel()
+            return propagated[0], result[0]
+
+        propagated, result = anyio.run(scenario)
+        # The broker neither swallowed the cancellation nor forged an outcome.
+        self.assertTrue(propagated)
+        self.assertIsNone(result)
 
     def test_dangerous_tool_with_no_outcome_becomes_unknown(self) -> None:
         async def scenario():

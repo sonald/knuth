@@ -186,12 +186,23 @@ class ToolBroker:
                     retryable=True,
                 )
             )
+        except anyio.get_cancelled_exc_class():
+            # A real cancellation here is always a force-stop or teardown:
+            # graceful interrupt only sets the signal, it never cancels the tool
+            # task (verified: no graceful scope-cancel touches tool execution).
+            # ADR-007 §9 forbids forging a clean interrupted outcome on force
+            # stop, and the loop's interrupt collapse is shielded — so converting
+            # this to ``interrupted`` would write a clean INTERRUPTED collapse
+            # *during a force stop*. Propagate instead; the host/recovery path
+            # settles durable state conservatively (UNKNOWN for external writes,
+            # crash-failed otherwise) and abandons the rest of the batch.
+            raise
         except Exception as exc:
-            # A tool that surfaced an error while a stop was in flight is not
-            # itself a failure: fall back by effect (external/dangerous ->
-            # UNKNOWN, otherwise -> interrupted). A raw cancellation (force-stop
-            # teardown) is a BaseException and intentionally propagates here;
-            # the deadline/recovery path settles its durable state.
+            # A tool that surfaced a *non-cancellation* error while a stop was in
+            # flight is not itself a failure: fall back by effect
+            # (external/dangerous -> UNKNOWN, otherwise -> interrupted). This is
+            # the cooperative graceful path, e.g. a tool that caught its own
+            # wakeup and re-raised a domain error.
             if signal is not None and signal.interrupted:
                 return self._interrupt_fallback(manifest, exc)
             return ToolExecutionResult.failed(
