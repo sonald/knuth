@@ -23,8 +23,13 @@ from knuth.core.invocations import (
     args_hash_for,
 )
 from knuth.core.messages import InferenceMessage, ToolCall
+from knuth.core.tools import ToolExecutionOutcome
 from knuth.core.runtime_events import (
     ApprovalRequestedDraft,
+    ConversationNoticeDraft,
+    DurableRuntimeEventDraft,
+    InterruptActivePhase,
+    InterruptReason,
     ModelAbortedDraft,
     ModelCompletedDraft,
     ModelContentDeltaDraft,
@@ -36,6 +41,7 @@ from knuth.core.runtime_events import (
     ModelToolCallStartedDraft,
     PlannedToolCall,
     RunFailedDraft,
+    RunInterruptedDraft,
     RunPausedDraft,
     RunSucceededDraft,
     StepStartedDraft,
@@ -52,8 +58,76 @@ from knuth.core.types import ErrorInfo, RunStatus
 from knuth_llmd import InferenceConfig, InferenceRuntimeOptions
 
 from knuth_runtime.context import RunContext
+from knuth_runtime.interrupts import shielded_ledger_writes
 from knuth_runtime.invocation import RuntimeInvocation
 from knuth_runtime.ledger import OpenToolBatch, RunLedgerState
+
+# Reasons that mean active work was deliberately stopped, so the abandoned
+# attempt collapses to a durable INTERRUPTED fact rather than a resumable pause.
+_ACTIVE_STOP_REASONS = frozenset(
+    {"user_stop", "queued_user_prompt", "timeout", "shutdown", "hook_stop",
+     "runtime_stop"}
+)
+
+_MODEL_INTERRUPT_NOTICE = (
+    "The previous turn was stopped by the user before the assistant finished."
+    " The interrupted response was discarded; do not silently retry the old"
+    " action — wait for the user's next instruction."
+)
+
+_TOOL_INTERRUPT_NOTICE = (
+    "The previous turn was stopped by the user while tools were running."
+    " The tool observations above reflect what happened; do not silently retry"
+    " the stopped actions — wait for the user's next instruction."
+)
+
+
+_ACTIVE_STATUSES_LOOP = frozenset({RunStatus.CREATED, RunStatus.RUNNING})
+
+
+def _interrupt_reason(reason: str | None) -> InterruptReason:
+    """Map a signal reason onto the durable vocabulary, defaulting to user_stop."""
+    if reason in _ACTIVE_STOP_REASONS:
+        return reason  # type: ignore[return-value]
+    return "user_stop"
+
+
+async def _emit_interrupt_collapse(
+    invocation: RuntimeInvocation,
+    *,
+    reason: InterruptReason,
+    active_phase: InterruptActivePhase,
+    notice: str | None,
+    leading: list[DurableRuntimeEventDraft] | None = None,
+) -> None:
+    """Commit an interrupt safe point as one atomic durable transaction.
+
+    ``leading`` carries any phase-specific facts (model.aborted, tool
+    observations, batch closure) that must land with the notice and
+    ``run.interrupted`` so a crash or force-stop never sees half the collapse.
+    """
+    drafts: list[DurableRuntimeEventDraft] = list(leading or [])
+    if notice is not None:
+        drafts.append(ConversationNoticeDraft(kind="interrupted", content=notice))
+    drafts.append(
+        RunInterruptedDraft(reason=reason, active_phase=active_phase)
+    )
+    # Shield the durable writes: if backing cancellation woke the await that got
+    # us here, the unwind must not swallow the facts that close the work.
+    with shielded_ledger_writes():
+        await invocation.emit_many(drafts)
+
+
+async def _interrupt_at_loop_boundary(invocation: RuntimeInvocation) -> None:
+    reason = _interrupt_reason(invocation.interrupt_signal.reason)
+    await _emit_interrupt_collapse(
+        invocation,
+        reason=reason,
+        active_phase="loop",
+        # No active model/tool work to summarize between turns; the conversation
+        # already ends at a clean boundary, so no notice is required.
+        notice=None,
+    )
 
 # Observations above this size are offloaded to the artifact side store; the
 # event keeps an artifact_ref and an observation_preview (design §1.2).
@@ -73,6 +147,7 @@ _WAITING_OR_TERMINAL = frozenset(
         RunStatus.PAUSED,
         RunStatus.WAITING_APPROVAL,
         RunStatus.WAITING_TOOL_RESULT,
+        RunStatus.INTERRUPTED,
         RunStatus.SUCCEEDED,
         RunStatus.FAILED,
         RunStatus.CANCELLED,
@@ -92,6 +167,11 @@ async def run_agent_loop(
     """
     run_id = invocation.run_id
     services = invocation.services
+    # Carry the invocation's interrupt signal into the model boundary so llmd
+    # can wake its initial await and observe the signal between chunks.
+    runtime_options = (runtime_options or InferenceRuntimeOptions()).model_copy(
+        update={"abort_signal": invocation.interrupt_signal}
+    )
 
     while True:
         state = await services.ledger.run_state(run_id)
@@ -106,7 +186,16 @@ async def run_agent_loop(
                 return batch_status
             continue
 
-        if state.run.steps >= state.run.max_turns:
+        # Loop-level safe point: a signal that fired between turns (no active
+        # model/tool await to wake) collapses here before any new work starts.
+        if invocation.interrupt_signal.interrupted and status in _ACTIVE_STATUSES_LOOP:
+            await _interrupt_at_loop_boundary(invocation)
+            return RunStatus.INTERRUPTED
+
+        # Budget on committed model turns, not raw attempts: interrupted
+        # attempts bump ``steps`` but never ``committed_turns``, so repeated
+        # Ctrl+C cannot push the run to max_turns_exceeded.
+        if state.run.committed_turns >= state.run.max_turns:
             await invocation.emit(
                 RunFailedDraft(
                     error=ErrorInfo(
@@ -191,13 +280,22 @@ async def _run_step(
                 stream_error = event.error
                 break
             case InferenceAborted():
-                await invocation.emit(
-                    ModelAbortedDraft(step_id=step_id, reason=event.reason)
+                # A model request that cooperatively aborted on the interrupt
+                # signal is abandoned active work, not a provider failure and
+                # not a resumable pause. The discarded assistant partial never
+                # reaches durable conversation, so the model needs a notice next
+                # turn. There is no open batch yet, so the collapse is just the
+                # model.aborted fact, the notice, and run.interrupted — atomic.
+                await _emit_interrupt_collapse(
+                    invocation,
+                    reason=_interrupt_reason(event.reason),
+                    active_phase="model",
+                    notice=_MODEL_INTERRUPT_NOTICE,
+                    leading=[
+                        ModelAbortedDraft(step_id=step_id, reason=event.reason)
+                    ],
                 )
-                await invocation.emit(
-                    RunPausedDraft(reason=f"model_aborted: {event.reason}")
-                )
-                return RunStatus.PAUSED
+                return RunStatus.INTERRUPTED
             case InferenceGenerationCompleted():
                 assistant_message = event.message
                 finish_reason = event.finish_reason
@@ -425,40 +523,161 @@ async def _drive_open_batch(
     if batch.by_status(ToolInvocationStatus.WAITING_TOOL_RESULT):
         return RunStatus.WAITING_TOOL_RESULT
 
-    # Execute the approved calls serially in plan order.
-    for inv in batch.by_status(ToolInvocationStatus.APPROVED):
-        attempt = inv.attempt + 1
+    # Execute the approved calls serially in plan order, cooperating with the
+    # interrupt signal. A user stop ends the whole turn, not just one tool.
+    approved = list(batch.by_status(ToolInvocationStatus.APPROVED))
+    for position, inv in enumerate(approved):
+        if invocation.interrupt_signal.interrupted:
+            # Caught before this call started: abandon it and the rest, then
+            # collapse to INTERRUPTED atomically.
+            await _collapse_tool_interrupt(
+                invocation, batch, abandoned=approved[position:]
+            )
+            return RunStatus.INTERRUPTED
+
         await invocation.emit(
             ToolInvocationStartedDraft(
                 tool_call_id=inv.tool_call_id,
-                attempt=attempt,
+                attempt=inv.attempt + 1,
             )
         )
-        result = await services.tool_broker.execute(inv)
-        observation = result.to_observation_text()
-        artifact_ref = None
-        observation_preview = None
-        if len(observation) > OBSERVATION_INLINE_LIMIT:
-            artifact = await services.ledger.put_artifact(
-                run_id, "tool_observation", observation
+        result = await services.tool_broker.execute(
+            inv, signal=invocation.interrupt_signal
+        )
+
+        if result.outcome == ToolExecutionOutcome.UNKNOWN:
+            # Indeterminate side effect: mark unknown, abandon the rest so a
+            # later resume cannot run a stopped turn's remaining tools, then let
+            # the UNKNOWN gate below pause for human recovery.
+            await invocation.emit(
+                ToolInvocationMarkedUnknownDraft(
+                    tool_call_id=inv.tool_call_id,
+                    reason=result.reason or "indeterminate tool outcome",
+                )
             )
-            artifact_ref = artifact.id
-            observation_preview = observation[:_OBSERVATION_PREVIEW_CHARS]
-            observation = None
+            await _abandon_unstarted(invocation, approved[position + 1 :])
+            break
+
+        completion = await _completion_for(
+            services, run_id, inv, result
+        )
+        if result.outcome == ToolExecutionOutcome.INTERRUPTED:
+            # The active tool stopped cooperatively. Its observation, the
+            # abandoned observations, batch close, notice, and run.interrupted
+            # are one atomic collapse.
+            await _collapse_tool_interrupt(
+                invocation,
+                batch,
+                abandoned=approved[position + 1 :],
+                active=completion,
+            )
+            return RunStatus.INTERRUPTED
+        await invocation.emit(completion)
+
+    # Re-read: a tool may have become UNKNOWN above and now gates the batch.
+    state = await services.ledger.run_state(run_id)
+    batch = state.open_batch
+    assert batch is not None
+    if batch.by_status(ToolInvocationStatus.UNKNOWN):
         await invocation.emit(
-            ToolInvocationCompletedDraft(
-                tool_call_id=inv.tool_call_id,
-                tool_name=inv.tool_name,
-                outcome="succeeded" if result.ok else "failed",
-                observation=observation,
-                artifact_ref=artifact_ref,
-                observation_preview=observation_preview,
-                tool_status=result.status.value,
+            RunPausedDraft(
+                reason="unknown_tool_outcome: resolve with `knuth resolve <tool_call_id>`",
             )
         )
+        return RunStatus.PAUSED
 
     await invocation.emit(ToolBatchClosedDraft(batch_id=batch.batch_id))
     return None
+
+
+async def _completion_for(
+    services,
+    run_id: str,
+    inv: ToolInvocation,
+    result,
+) -> ToolInvocationCompletedDraft:
+    """Build the completion draft for a finished tool, offloading big text."""
+    observation = result.to_observation_text()
+    artifact_ref = None
+    observation_preview = None
+    if len(observation) > OBSERVATION_INLINE_LIMIT:
+        artifact = await services.ledger.put_artifact(
+            run_id, "tool_observation", observation
+        )
+        artifact_ref = artifact.id
+        observation_preview = observation[:_OBSERVATION_PREVIEW_CHARS]
+        observation = None
+    outcome_tag = (
+        "succeeded"
+        if result.outcome == ToolExecutionOutcome.SUCCEEDED
+        else "failed"
+        if result.outcome == ToolExecutionOutcome.FAILED
+        else "interrupted"
+    )
+    tool_status = result.tool_status or (
+        result.result.status.value if result.result is not None else None
+    )
+    return ToolInvocationCompletedDraft(
+        tool_call_id=inv.tool_call_id,
+        tool_name=inv.tool_name,
+        outcome=outcome_tag,
+        observation=observation,
+        artifact_ref=artifact_ref,
+        observation_preview=observation_preview,
+        tool_status=tool_status,
+    )
+
+
+def _abandon_draft(inv: ToolInvocation) -> ToolInvocationCompletedDraft:
+    return ToolInvocationCompletedDraft(
+        tool_call_id=inv.tool_call_id,
+        tool_name=inv.tool_name,
+        outcome="interrupted",
+        observation=(
+            f"Tool {inv.tool_name} was not executed: the user stopped this turn"
+            " before it ran."
+        ),
+        tool_status="abandoned",
+    )
+
+
+async def _abandon_unstarted(
+    invocation: RuntimeInvocation, unstarted: list[ToolInvocation]
+) -> None:
+    """Give unstarted invocations an interrupted observation (non-collapse path).
+
+    Used when the active tool is UNKNOWN: the batch cannot close cleanly, but
+    the remaining tools must still be abandoned so recovery never runs them.
+    """
+    for inv in unstarted:
+        await invocation.emit(_abandon_draft(inv))
+
+
+async def _collapse_tool_interrupt(
+    invocation: RuntimeInvocation,
+    batch: OpenToolBatch,
+    *,
+    abandoned: list[ToolInvocation],
+    active: ToolInvocationCompletedDraft | None = None,
+) -> None:
+    """Atomically close an interrupted tool batch and write the interrupt fact.
+
+    Observations for the active and abandoned invocations, ``tool.batch_closed``,
+    the user-stop notice, and ``run.interrupted`` commit in one transaction, so a
+    crash or force-stop never leaves a closed batch without the interruption.
+    """
+    leading: list[DurableRuntimeEventDraft] = []
+    if active is not None:
+        leading.append(active)
+    leading.extend(_abandon_draft(inv) for inv in abandoned)
+    leading.append(ToolBatchClosedDraft(batch_id=batch.batch_id))
+    await _emit_interrupt_collapse(
+        invocation,
+        reason=_interrupt_reason(invocation.interrupt_signal.reason),
+        active_phase="tool",
+        notice=_TOOL_INTERRUPT_NOTICE,
+        leading=leading,
+    )
 
 
 async def _has_pending_approval(

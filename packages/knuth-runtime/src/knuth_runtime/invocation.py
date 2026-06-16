@@ -14,6 +14,7 @@ from knuth.core.events import (
 )
 from knuth.core.types import EventDurability
 
+from knuth_runtime.interrupts import InterruptController
 from knuth_runtime.observation import LiveRuntimeObservation
 from knuth_runtime.services import RuntimeServices
 
@@ -26,6 +27,12 @@ class RuntimeInvocation:
     mode: RunInvocationMode
     services: RuntimeServices
     observation: LiveRuntimeObservation
+    interrupts: InterruptController
+
+    @property
+    def interrupt_signal(self):
+        """The invocation-scoped signal handed to the loop, llmd, and tools."""
+        return self.interrupts.signal
 
     async def emit(self, event: RuntimeEventDraft) -> RuntimeEvent:
         if event.durability == EventDurability.DURABLE:
@@ -42,3 +49,17 @@ class RuntimeInvocation:
             )
         await self.observation.publish(runtime_event)
         return runtime_event
+
+    async def emit_many(
+        self, drafts: list[DurableRuntimeEventDraft]
+    ) -> list[RuntimeEvent]:
+        """Commit several durable drafts atomically, then publish them live.
+
+        Semantic collapses such as the tool-batch interrupt safe point must be
+        one ledger transaction; the live publish happens only after the durable
+        write succeeds, so observers never see a half-applied collapse.
+        """
+        events = await self.services.ledger.apply_many(self.run_id, drafts)
+        for event in events:
+            await self.observation.publish(event)
+        return events

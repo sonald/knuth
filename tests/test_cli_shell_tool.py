@@ -6,7 +6,7 @@ from pathlib import Path
 import anyio
 
 from knuth.core.invocations import ToolInvocation, args_hash_for
-from knuth.core.tools import ToolResult
+from knuth.core.tools import ToolExecutionOutcome, ToolResult
 from knuth_toold.builtins import ShellTool
 from knuth_toold.process_output import parse_tagged_process_output
 from knuth_toold import ToolBroker, ToolRegistry
@@ -56,8 +56,8 @@ class CliShellToolTests(unittest.TestCase):
             tmp_path = Path(temp_dir)
             result = anyio.run(scenario, tmp_path, tmp_path / "offload")
 
-        parsed = parse_tagged_process_output(result.content or "")
-        self.assertTrue(result.ok)
+        parsed = parse_tagged_process_output(result.result.content or "")
+        self.assertEqual(result.outcome, ToolExecutionOutcome.SUCCEEDED)
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed.stdout, "hello<&>\n")
         self.assertEqual(parsed.stderr, "warn\n")
@@ -86,7 +86,7 @@ class CliShellToolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             tmp_path = Path(temp_dir)
             result = anyio.run(scenario, tmp_path, tmp_path / "offload")
-            parsed = parse_tagged_process_output(result.content or "")
+            parsed = parse_tagged_process_output(result.result.content or "")
             self.assertIsNotNone(parsed)
             offload = parsed.offload
             stdout_path = Path(offload["stdout"]["path"])
@@ -96,7 +96,7 @@ class CliShellToolTests(unittest.TestCase):
             stdout_content = stdout_path.read_text(encoding="utf-8")
             stderr_content = stderr_path.read_text(encoding="utf-8")
 
-        self.assertTrue(result.ok)
+        self.assertEqual(result.outcome, ToolExecutionOutcome.SUCCEEDED)
         self.assertEqual(parsed.stdout, "abcde")
         self.assertEqual(parsed.stderr, "qrstu")
         self.assertEqual(parsed.return_code, 0)
@@ -125,10 +125,10 @@ class CliShellToolTests(unittest.TestCase):
             tmp_path = Path(temp_dir)
             result = anyio.run(scenario, tmp_path, tmp_path / "offload")
 
-        parsed = parse_tagged_process_output(result.content or "")
-        self.assertFalse(result.ok)
-        self.assertEqual(result.error.code, "process_failed")
-        self.assertTrue(result.error.retryable)
+        parsed = parse_tagged_process_output(result.result.content or "")
+        self.assertEqual(result.outcome, ToolExecutionOutcome.FAILED)
+        self.assertEqual(result.result.error.code, "process_failed")
+        self.assertTrue(result.result.error.retryable)
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed.stderr, "nope")
         self.assertEqual(parsed.return_code, 7)

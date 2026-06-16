@@ -45,6 +45,7 @@ class ToolInvocationStatus(StrEnum):
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    INTERRUPTED = "interrupted"
     UNKNOWN = "unknown"
 
 

@@ -11,7 +11,7 @@ from knuth.core.invocations import (
     ToolRisk,
     args_hash_for,
 )
-from knuth.core.tools import ToolResult
+from knuth.core.tools import ToolExecutionOutcome, ToolResult
 from knuth_runtime.policy import PolicyEngine
 from knuth_toold import (
     ToolBroker,
@@ -95,8 +95,9 @@ class DefaultToolRegistryTests(unittest.TestCase):
                 _invocation("read_file", {"path": file_path}),
             )
 
-            self.assertTrue(write_result.ok)
-            self.assertIn("hello knuth", read_result.content)
+            self.assertEqual(write_result.outcome, ToolExecutionOutcome.SUCCEEDED)
+            self.assertEqual(read_result.outcome, ToolExecutionOutcome.SUCCEEDED)
+            self.assertIn("hello knuth", read_result.result.content)
 
     def test_process_tools_capture_stdout(self) -> None:
         registry = create_default_registry()
@@ -112,13 +113,13 @@ class DefaultToolRegistryTests(unittest.TestCase):
             _invocation("python", {"code": "print('python-ok')"}),
         )
 
-        self.assertTrue(shell_result.ok)
-        shell_output = parse_tagged_process_output(shell_result.content or "")
+        self.assertEqual(shell_result.outcome, ToolExecutionOutcome.SUCCEEDED)
+        shell_output = parse_tagged_process_output(shell_result.result.content or "")
         self.assertIsNotNone(shell_output)
         self.assertEqual(shell_output.stdout, "shell-ok")
         self.assertEqual(shell_output.return_code, 0)
-        self.assertTrue(python_result.ok)
-        self.assertEqual(python_result.content.strip(), "python-ok")
+        self.assertEqual(python_result.outcome, ToolExecutionOutcome.SUCCEEDED)
+        self.assertEqual(python_result.result.content.strip(), "python-ok")
 
     def test_tool_broker_uses_policy_for_approval_decisions(self) -> None:
         registry = create_default_registry()
@@ -177,8 +178,8 @@ class DefaultToolRegistryTests(unittest.TestCase):
                 ),
             )
 
-            self.assertFalse(result.ok)
-            self.assertEqual(result.error.code, "FileNotFoundError")
+            self.assertEqual(result.outcome, ToolExecutionOutcome.FAILED)
+            self.assertEqual(result.result.error.code, "FileNotFoundError")
 
     def test_tool_broker_denies_invalid_arguments(self) -> None:
         registry = create_default_registry()
@@ -226,9 +227,9 @@ class TimeoutTests(unittest.TestCase):
 
         result = anyio.run(broker.execute, _invocation("sleepy", {}))
 
-        self.assertFalse(result.ok)
-        self.assertEqual(result.error.code, "tool_timeout")
-        self.assertTrue(result.error.retryable)
+        self.assertEqual(result.outcome, ToolExecutionOutcome.FAILED)
+        self.assertEqual(result.result.error.code, "tool_timeout")
+        self.assertTrue(result.result.error.retryable)
 
 
 if __name__ == "__main__":

@@ -213,6 +213,13 @@ async def reconstruct_messages_from_events(
                     content=observation or "",
                 )
             )
+        elif event.type == "conversation.notice":
+            # A synthetic runtime notice is not human-authored, but every
+            # provider must see it through the ordinary conversation channel, so
+            # it projects as a user-role message at this (batch-closed) boundary.
+            messages.append(
+                InferenceMessage(role=InferenceRole.USER, content=event.content)
+            )
         elif event.type == "verification.failed":
             messages.append(
                 InferenceMessage(role=InferenceRole.USER, content=event.feedback)

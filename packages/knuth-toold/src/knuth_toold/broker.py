@@ -5,13 +5,15 @@ from typing import Any, Protocol
 import anyio
 from jsonschema import ValidationError, validate
 
+from knuth.core.interrupts import InterruptSignal
 from knuth.core.invocations import (
+    EXTERNAL_EFFECTS,
     ToolCallDecision,
     ToolEffect,
     ToolInvocation,
     ToolRisk,
 )
-from knuth.core.tools import ToolResult
+from knuth.core.tools import ToolExecutionOutcome, ToolExecutionResult, ToolResult
 from knuth.core.types import ErrorInfo, KnuthModel
 
 from knuth_toold.base import ToolManifest, ToolRuntimeContext
@@ -135,29 +137,83 @@ class ToolBroker:
             return False
         return bool(await method(invocation))
 
-    async def execute(self, invocation: ToolInvocation) -> ToolResult:
+    async def execute(
+        self,
+        invocation: ToolInvocation,
+        signal: InterruptSignal | None = None,
+    ) -> ToolExecutionResult:
+        """Execute one approved tool call and report a cooperative outcome.
+
+        The signal is handed to the tool so it can stop at its own safe point.
+        A tool may return a plain ``ToolResult`` (normalized to succeeded/failed)
+        or a richer ``ToolExecutionResult``. Routing of a raised exception
+        depends on the signal: a user-stop cancellation is not the tool's own
+        failure, so non-external tools fall back to ``interrupted`` while
+        external-write/dangerous tools fall back to ``unknown``.
+        """
         await self.registry.refresh()
         try:
             manifest = self.registry.get_manifest(invocation.tool_name)
         except KeyError:
-            return ToolResult.from_error(
-                "tool_not_found", f"Tool not found: {invocation.tool_name}"
+            return ToolExecutionResult.failed(
+                ToolResult.from_error(
+                    "tool_not_found", f"Tool not found: {invocation.tool_name}"
+                )
             )
         provider = self.registry.get_provider_for_tool(invocation.tool_name)
         ctx = ToolRuntimeContext(
             run_id=invocation.run_id,
             tool_call_id=invocation.tool_call_id,
+            interrupt_signal=signal,
         )
         try:
             if manifest.timeout_s is not None:
                 with anyio.fail_after(manifest.timeout_s):
-                    return await provider.call_tool(invocation, ctx)
-            return await provider.call_tool(invocation, ctx)
+                    raw = await provider.call_tool(invocation, ctx)
+            else:
+                raw = await provider.call_tool(invocation, ctx)
         except TimeoutError:
-            return ToolResult.from_error(
-                "tool_timeout",
-                f"Tool {invocation.tool_name} timed out after {manifest.timeout_s}s",
-                retryable=True,
+            return ToolExecutionResult.failed(
+                ToolResult.from_error(
+                    "tool_timeout",
+                    f"Tool {invocation.tool_name} timed out after"
+                    f" {manifest.timeout_s}s",
+                    retryable=True,
+                )
             )
         except Exception as exc:
-            return ToolResult.from_error(exc.__class__.__name__, str(exc))
+            if signal is not None and signal.interrupted:
+                return self._interrupt_fallback(manifest, exc)
+            return ToolExecutionResult.failed(
+                ToolResult.from_error(exc.__class__.__name__, str(exc))
+            )
+        return self._normalize(raw)
+
+    @staticmethod
+    def _normalize(raw: ToolResult | ToolExecutionResult) -> ToolExecutionResult:
+        if isinstance(raw, ToolExecutionResult):
+            return raw
+        return (
+            ToolExecutionResult.succeeded(raw)
+            if raw.ok
+            else ToolExecutionResult.failed(raw)
+        )
+
+    @staticmethod
+    def _interrupt_fallback(
+        manifest: ToolManifest, exc: BaseException
+    ) -> ToolExecutionResult:
+        if manifest.effect in EXTERNAL_EFFECTS:
+            return ToolExecutionResult.unknown(
+                reason=(
+                    f"{manifest.name} was interrupted by user stop and could not"
+                    " confirm whether its external side effect happened"
+                    f" ({exc.__class__.__name__})"
+                )
+            )
+        # A user stop is not the tool's own failure; default to interrupted.
+        return ToolExecutionResult.interrupted(
+            f"Tool {manifest.name} was interrupted by the user before it could"
+            " report a result.",
+            tool_status="interrupted",
+        )

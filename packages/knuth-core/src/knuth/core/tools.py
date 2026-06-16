@@ -42,3 +42,63 @@ class ToolResult(KnuthModel):
             content="",
             error=ErrorInfo(code=code, message=message, retryable=retryable),
         )
+
+
+class ToolExecutionOutcome(StrEnum):
+    """How a tool execution attempt resolved at the runtime execution layer.
+
+    Distinct from :class:`ToolResultStatus`: ``UNKNOWN`` is not a tool result and
+    must never become a tool_result message — it is the indeterminate-side-effect
+    case routed to recovery. ``INTERRUPTED`` is a cooperative stop reported by the
+    tool/provider, carrying a model-visible observation.
+    """
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+    UNKNOWN = "unknown"
+
+
+class ToolExecutionResult(KnuthModel):
+    """A tool/provider's cooperative report of one execution attempt.
+
+    Tools may return a plain :class:`ToolResult` (normalized to succeeded/failed)
+    or this richer report when they need to express ``interrupted``/``unknown``
+    with a custom observation, e.g. a shell tool warning about partial side
+    effects after a user stop.
+    """
+
+    outcome: ToolExecutionOutcome
+    result: ToolResult | None = None
+    observation: str | None = None
+    reason: str | None = None
+    tool_status: str | None = None
+
+    def to_observation_text(self) -> str:
+        if self.observation is not None:
+            return self.observation
+        if self.result is not None:
+            return self.result.to_observation_text()
+        return ""
+
+    @classmethod
+    def succeeded(cls, result: ToolResult) -> "ToolExecutionResult":
+        return cls(outcome=ToolExecutionOutcome.SUCCEEDED, result=result)
+
+    @classmethod
+    def failed(cls, result: ToolResult) -> "ToolExecutionResult":
+        return cls(outcome=ToolExecutionOutcome.FAILED, result=result)
+
+    @classmethod
+    def interrupted(
+        cls, observation: str, *, tool_status: str | None = None
+    ) -> "ToolExecutionResult":
+        return cls(
+            outcome=ToolExecutionOutcome.INTERRUPTED,
+            observation=observation,
+            tool_status=tool_status or "interrupted",
+        )
+
+    @classmethod
+    def unknown(cls, reason: str) -> "ToolExecutionResult":
+        return cls(outcome=ToolExecutionOutcome.UNKNOWN, reason=reason)

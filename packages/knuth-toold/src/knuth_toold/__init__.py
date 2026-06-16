@@ -1,6 +1,9 @@
 from knuth_toold.base import (
+    InterruptSignal,
     Tool,
     ToolEffect,
+    ToolExecutionOutcome,
+    ToolExecutionResult,
     ToolManifest,
     ToolResult,
     ToolResultStatus,
@@ -28,6 +31,7 @@ from knuth_toold.registry import ToolRegistry
 __all__ = [
     "AllowAllPolicy",
     "BuiltinToolProvider",
+    "InterruptSignal",
     "PolicyDecision",
     "PolicyEngine",
     "PythonTool",
@@ -36,6 +40,8 @@ __all__ = [
     "Tool",
     "ToolBroker",
     "ToolEffect",
+    "ToolExecutionOutcome",
+    "ToolExecutionResult",
     "ToolManifest",
     "ToolProposal",
     "ToolProvider",

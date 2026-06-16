@@ -5,7 +5,7 @@ from pathlib import Path
 import anyio
 
 from knuth.core.invocations import ToolInvocation, args_hash_for
-from knuth.core.tools import ToolResult
+from knuth.core.tools import ToolExecutionOutcome, ToolResult
 from knuth_cli.tools.files import EditFileTool
 from knuth_toold.builtins import ReadFileTool
 from knuth_toold import ToolBroker, ToolRegistry
@@ -84,10 +84,12 @@ class CliReadFileToolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             result = anyio.run(scenario, Path(temp_dir))
 
-        self.assertFalse(result.ok)
-        self.assertEqual(result.content, "")
-        self.assertIn("exceeds read_file max of 32768 bytes", result.error.message)
-        self.assertIn("no content returned", result.error.message)
+        self.assertEqual(result.outcome, ToolExecutionOutcome.FAILED)
+        self.assertEqual(result.result.content, "")
+        self.assertIn(
+            "exceeds read_file max of 32768 bytes", result.result.error.message
+        )
+        self.assertIn("no content returned", result.result.error.message)
 
 
 class CliEditFileToolTests(unittest.TestCase):
@@ -155,10 +157,10 @@ class CliEditFileToolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             failed, succeeded, content = anyio.run(scenario, Path(temp_dir))
 
-        self.assertFalse(failed.ok)
-        self.assertIn("found 2 matches", failed.error.message)
-        self.assertIn("replace_all", failed.error.message)
-        self.assertTrue(succeeded.ok)
+        self.assertEqual(failed.outcome, ToolExecutionOutcome.FAILED)
+        self.assertIn("found 2 matches", failed.result.error.message)
+        self.assertIn("replace_all", failed.result.error.message)
+        self.assertEqual(succeeded.outcome, ToolExecutionOutcome.SUCCEEDED)
         self.assertEqual(content, "BETA\nBETA\n")
 
     def test_edit_file_preserves_utf16_encoding(self) -> None:

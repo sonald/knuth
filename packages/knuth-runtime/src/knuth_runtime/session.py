@@ -15,7 +15,9 @@ from knuth.core.events import (
 from knuth.core.types import ErrorInfo, RunStatus
 from knuth_llmd import InferenceConfig, InferenceRuntimeOptions
 
+from knuth_runtime.interrupts import InterruptController
 from knuth_runtime.invocation import RunInvocationMode, RuntimeInvocation
+from knuth_runtime.ledger import RESUMABLE_STATUSES, LedgerError
 from knuth_runtime.loop import run_agent_loop
 from knuth_runtime.observation import (
     ListenerHandle,
@@ -25,15 +27,6 @@ from knuth_runtime.observation import (
 )
 from knuth_runtime.result import RunResult, answer_from_events
 from knuth_runtime.services import RuntimeServices
-
-_RESUMABLE_STATUSES = frozenset(
-    {
-        RunStatus.RUNNING,
-        RunStatus.WAITING_APPROVAL,
-        RunStatus.WAITING_TOOL_RESULT,
-        RunStatus.PAUSED,
-    }
-)
 
 
 class RunSession:
@@ -58,6 +51,7 @@ class RunSession:
         self._exit_stack: AsyncExitStack | None = None
         self._task_group: anyio.abc.TaskGroup | None = None
         self._observation: LiveRuntimeObservation | None = None
+        self._interrupts = InterruptController(run_id=run_id)
         self._done = anyio.Event()
         self._entered = False
         self._final_result: RunResult | None = None
@@ -86,11 +80,13 @@ class RunSession:
             for listener in self._initial_listeners:
                 await self._observation.add_listener(listener)
             await self._prepare_run_id()
+            self._interrupts = InterruptController(run_id=self.run_id)
             invocation = RuntimeInvocation(
                 run_id=self.run_id,
                 mode=self._mode,
                 services=self._services,
                 observation=self._observation,
+                interrupts=self._interrupts,
             )
             await invocation.emit(RunInvocationStartedDraft(mode=self._mode))
             await self._prepare_run(invocation)
@@ -112,6 +108,16 @@ class RunSession:
         elif self._observation is not None:
             await self._observation.aclose()
         await self._exit_stack.__aexit__(exc_type, exc, tb)
+
+    def interrupt(self, reason: str = "user_stop") -> bool:
+        """Trigger this invocation's interrupt signal and wake blocking awaits.
+
+        Returns whether this call first flipped the sticky signal. It does not
+        guarantee active work was running, nor that durable state has reached
+        ``INTERRUPTED`` — the agent loop's safe point owns that. Plain context
+        exit (``__aexit__``) never forges an interrupt; only this call does.
+        """
+        return self._interrupts.interrupt(reason)
 
     async def add_listener(self, listener: RuntimeEventListener) -> ListenerHandle:
         if not self._entered or self._observation is None:
@@ -164,13 +170,22 @@ class RunSession:
             if self._prompt is None:
                 raise ValueError("prompt is required to continue a run")
             await invocation.emit(UserMessageDraft(content=self._prompt))
-            if run.status == RunStatus.SUCCEEDED:
+            # A finished or interrupted run continues by opening a fresh turn:
+            # the new user input flips it back to RUNNING. The abandoned work of
+            # an INTERRUPTED run is never replayed; the loop starts from durable
+            # context.
+            if run.status in {RunStatus.SUCCEEDED, RunStatus.INTERRUPTED}:
                 await invocation.emit(RunResumedDraft(cause="user_message"))
             return
         # resume: unlock through the ledger; pending approvals make this fail
-        # loudly instead of silently re-entering the loop.
-        if run.status in _RESUMABLE_STATUSES:
-            await invocation.emit(RunResumedDraft(cause="user_resume"))
+        # loudly instead of silently re-entering the loop. INTERRUPTED and
+        # RUNNING are not resumable — the former abandoned its work (continue
+        # with new input), the latter is for live attach or explicit recovery.
+        if run.status not in RESUMABLE_STATUSES:
+            raise LedgerError(
+                f"run {invocation.run_id} is {run.status.value} and cannot be resumed"
+            )
+        await invocation.emit(RunResumedDraft(cause="user_resume"))
 
     async def _drive(self, invocation: RuntimeInvocation) -> None:
         status: RunStatus | None = None

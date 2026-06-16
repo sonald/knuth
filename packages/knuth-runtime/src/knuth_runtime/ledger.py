@@ -31,12 +31,14 @@ from knuth.core.runs import AgentRun, Artifact
 from knuth.core.runtime_events import (
     ApprovalRequestedDraft,
     ApprovalResolvedDraft,
+    ConversationNoticeDraft,
     ModelAbortedDraft,
     ModelCompletedDraft,
     ModelFailedDraft,
     RunCancelledDraft,
     RunCreatedDraft,
     RunFailedDraft,
+    RunInterruptedDraft,
     RunPausedDraft,
     RunResumedDraft,
     RunSucceededDraft,
@@ -105,6 +107,11 @@ class RunLedger(Protocol):
     ) -> StoredRuntimeEvent:
         ...
 
+    async def apply_many(
+        self, run_id: str, drafts: Iterable[DurableRuntimeEventDraft]
+    ) -> list[StoredRuntimeEvent]:
+        ...
+
     async def get_run(self, run_id: str) -> AgentRun:
         ...
 
@@ -143,6 +150,20 @@ class RunLedger(Protocol):
 _ACTIVE_STATUSES = frozenset({RunStatus.CREATED, RunStatus.RUNNING})
 _FINISHED_STATUSES = frozenset(
     {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED}
+)
+
+# The single definition of which durable statuses ``RuntimeControl.resume()``
+# may re-enter. ``RUNNING`` is deliberately excluded: a live RUNNING run is the
+# target of live attach or explicit recovery, not of ``resume`` (a fresh
+# process cannot prove no other process is still driving it). ``INTERRUPTED`` is
+# excluded because its active work was abandoned and must not replay; it
+# continues only through new user input via ``continue_run``.
+RESUMABLE_STATUSES = frozenset(
+    {
+        RunStatus.WAITING_APPROVAL,
+        RunStatus.WAITING_TOOL_RESULT,
+        RunStatus.PAUSED,
+    }
 )
 
 
@@ -255,8 +276,10 @@ def reduce_run_event(
 @_reduces(UserMessageDraft)
 def _reduce_user_message(ctx: _ReduceContext, draft: UserMessageDraft) -> _Mutations:
     _require(
-        ctx.run.status in {RunStatus.CREATED, RunStatus.SUCCEEDED},
-        f"user.message requires a created or succeeded run, got {ctx.run.status}",
+        ctx.run.status
+        in {RunStatus.CREATED, RunStatus.SUCCEEDED, RunStatus.INTERRUPTED},
+        "user.message requires a created, succeeded, or interrupted run, "
+        f"got {ctx.run.status}",
     )
     return ctx.mutations
 
@@ -271,6 +294,7 @@ def _reduce_run_resumed(ctx: _ReduceContext, draft: RunResumedDraft) -> _Mutatio
             RunStatus.WAITING_TOOL_RESULT,
             RunStatus.PAUSED,
             RunStatus.SUCCEEDED,
+            RunStatus.INTERRUPTED,
         },
         f"run.resumed not allowed from status {ctx.run.status}",
     )
@@ -305,6 +329,44 @@ def _reduce_run_paused(ctx: _ReduceContext, draft: RunPausedDraft) -> _Mutations
         f"run.paused requires an active run, got {ctx.run.status}",
     )
     ctx.run.status = RunStatus.PAUSED
+    return ctx.mutations
+
+
+@_reduces(RunInterruptedDraft)
+def _reduce_run_interrupted(
+    ctx: _ReduceContext, draft: RunInterruptedDraft
+) -> _Mutations:
+    # An interrupt only abandons *active* work. Waiting and terminal statuses
+    # are handled by their own local exit (approval/result wait) or are already
+    # done; folding an interrupt onto them would forge an abandonment.
+    _require(
+        ctx.run.status in _ACTIVE_STATUSES,
+        f"run.interrupted requires an active run, got {ctx.run.status}",
+    )
+    # The tool-batch interrupt collapse must close the batch (every invocation
+    # observed) before this fact lands, so the durable conversation never holds
+    # an assistant tool_use with no matching observation.
+    _require(
+        ctx.run.open_batch_id is None,
+        "run.interrupted requires no open tool batch; close it first",
+    )
+    ctx.run.status = RunStatus.INTERRUPTED
+    return ctx.mutations
+
+
+@_reduces(ConversationNoticeDraft)
+def _reduce_conversation_notice(
+    ctx: _ReduceContext, draft: ConversationNoticeDraft
+) -> _Mutations:
+    # The notice projects as a user-role message, so it may only sit at a valid
+    # conversation boundary: never between an assistant tool_use and its missing
+    # tool_result. An open batch means observations are still pending.
+    _require(
+        ctx.run.open_batch_id is None,
+        "conversation.notice requires no open tool batch",
+    )
+    # A synthetic notice records a runtime fact for the next model call; it does
+    # not move run status.
     return ctx.mutations
 
 
@@ -367,6 +429,9 @@ def _reduce_model_completed(
         draft.step_id == ctx.run.current_step_id,
         f"model.completed step {draft.step_id} is not the current step",
     )
+    # A model turn that reached completion is the unit ``max_turns`` budgets;
+    # attempts abandoned by an interrupt never get here, so they cost nothing.
+    ctx.run.committed_turns += 1
     return ctx.mutations
 
 
@@ -599,6 +664,27 @@ def _reduce_tool_invocation_completed(
             "denied observation backfill requires a denied invocation without observation",
         )
         new_status = ToolInvocationStatus.DENIED
+    elif draft.outcome == "interrupted":
+        # An interrupted observation closes either the active invocation that
+        # cooperatively stopped or an unstarted one abandoned because the user
+        # stopped the whole turn. Either way it must still lack an observation.
+        _require(
+            invocation.status
+            in {
+                ToolInvocationStatus.PROPOSED,
+                ToolInvocationStatus.AWAITING_APPROVAL,
+                ToolInvocationStatus.APPROVED,
+                ToolInvocationStatus.RUNNING,
+            }
+            and not invocation.observation_recorded,
+            "tool.invocation_completed(interrupted) requires an unobserved "
+            f"proposed/approved/running invocation, got {invocation.status}",
+        )
+        _require(
+            draft.observation is not None or draft.artifact_ref is not None,
+            "interrupted tool completion requires a model-visible observation",
+        )
+        new_status = ToolInvocationStatus.INTERRUPTED
     else:
         _require(
             invocation.status
@@ -748,6 +834,20 @@ class _LedgerMixin[TxnT]:
         draft = self._redact(draft)
         return await self._transact(run_id, draft)
 
+    async def apply_many(
+        self, run_id: str, drafts: Iterable[DurableRuntimeEventDraft]
+    ) -> list[StoredRuntimeEvent]:
+        """Append several drafts in one transaction.
+
+        Semantic collapses that need multiple decision events — the tool-batch
+        interrupt collapse most of all — must commit atomically, so a crash or
+        force-stop can never observe ``tool.batch_closed`` without the matching
+        notice and ``run.interrupted`` facts. Each draft is reduced against the
+        running view so ordering invariants still hold within the batch.
+        """
+        redacted = [self._redact(draft) for draft in drafts]
+        return await self._transact_many(run_id, redacted)
+
     async def create_run(self, query: str, run_id: str | None = None) -> AgentRun:
         run_id = run_id or f"run_{uuid4().hex}"
         await self.apply(run_id, RunCreatedDraft(query=query))
@@ -784,9 +884,25 @@ class _LedgerMixin[TxnT]:
         self._persist(txn, run_id, event, mutations)
         return event
 
+    def _apply_many_in_txn(
+        self,
+        txn: TxnT,
+        run_id: str,
+        drafts: list[DurableRuntimeEventDraft],
+    ) -> list[StoredRuntimeEvent]:
+        # Within one transaction each apply persists into ``txn``; the next
+        # ``_load_view`` reads those uncommitted writes, so per-draft invariants
+        # (seq, batch state) fold in order.
+        return [self._apply_in_txn(txn, run_id, draft) for draft in drafts]
+
     async def _transact(
         self, run_id: str, draft: DurableRuntimeEventDraft
     ) -> StoredRuntimeEvent:
+        raise NotImplementedError
+
+    async def _transact_many(
+        self, run_id: str, drafts: list[DurableRuntimeEventDraft]
+    ) -> list[StoredRuntimeEvent]:
         raise NotImplementedError
 
     def _load_view(
@@ -818,6 +934,29 @@ class MemoryRunLedger(_LedgerMixin[None]):
     ) -> StoredRuntimeEvent:
         async with self._lock:
             return self._apply_in_txn(None, run_id, draft)
+
+    async def _transact_many(
+        self, run_id: str, drafts: list[DurableRuntimeEventDraft]
+    ) -> list[StoredRuntimeEvent]:
+        async with self._lock:
+            # In-memory persist mutates in place, so emulate transaction
+            # rollback: snapshot the per-run containers and restore on any
+            # reducer failure, keeping the batch all-or-nothing.
+            events = list(self._events.get(run_id, []))
+            run = self._runs.get(run_id)
+            invocations = dict(self._invocations.get(run_id, {}))
+            approvals = dict(self._approvals)
+            try:
+                return self._apply_many_in_txn(None, run_id, drafts)
+            except BaseException:
+                self._events[run_id] = events
+                if run is None:
+                    self._runs.pop(run_id, None)
+                else:
+                    self._runs[run_id] = run
+                self._invocations[run_id] = invocations
+                self._approvals = approvals
+                raise
 
     def _load_view(
         self, txn: None, run_id: str, *, with_last_tool_call_ids: bool
@@ -1053,6 +1192,15 @@ class SQLiteRunLedger(_LedgerMixin[sqlite3.Connection]):
     ) -> StoredRuntimeEvent:
         with self._connect() as conn:
             return self._apply_in_txn(conn, run_id, draft)
+
+    @_threaded
+    def _transact_many(
+        self, run_id: str, drafts: list[DurableRuntimeEventDraft]
+    ) -> list[StoredRuntimeEvent]:
+        # The connection context manager commits on success and rolls back on
+        # any exception, so the whole draft sequence is one atomic durable fact.
+        with self._connect() as conn:
+            return self._apply_many_in_txn(conn, run_id, drafts)
 
     def _load_view(
         self, txn: sqlite3.Connection, run_id: str, *, with_last_tool_call_ids: bool

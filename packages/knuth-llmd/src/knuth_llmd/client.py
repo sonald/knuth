@@ -5,7 +5,10 @@ from collections.abc import Callable
 from typing import Any, AsyncIterator, Mapping, Protocol, Sequence
 from uuid import uuid4
 
+import anyio
 from pydantic import Field
+
+from knuth.core.interrupts import InterruptSignal
 
 from knuth.core.events import (
     InferenceAborted,
@@ -33,16 +36,67 @@ class InferenceConfig(KnuthModel):
     provider_options: dict[str, Any] = Field(default_factory=dict)
 
 
-class AbortSignal(Protocol):
-    def is_aborted(self) -> bool:
-        ...
-
-    async def checkpoint(self) -> None:
-        ...
-
-
 class InferenceRuntimeOptions(KnuthModel):
+    # An ``InterruptSignal`` (or compatible adapter). The model boundary observes
+    # it cooperatively: it wakes the initial request await (TTFT) and is polled
+    # between stream chunks, producing ``InferenceAborted(reason=signal.reason)``.
     abort_signal: Any | None = Field(default=None, exclude=True)
+
+
+def _signal_interrupted(signal: Any) -> bool:
+    if signal is None:
+        return False
+    interrupted = getattr(signal, "interrupted", None)
+    if interrupted is not None:
+        return bool(interrupted)
+    is_aborted = getattr(signal, "is_aborted", None)
+    return bool(is_aborted()) if is_aborted is not None else False
+
+
+def _signal_reason(signal: Any) -> str:
+    reason = getattr(signal, "reason", None)
+    return reason if isinstance(reason, str) and reason else "user_stop"
+
+
+async def _await_or_interrupt(
+    signal: Any, factory: Callable[[], Any]
+) -> tuple[Any, bool]:
+    """Await ``factory()`` but let an interrupt wake it (model TTFT).
+
+    Polling cannot break a single blocking await, so race it against the
+    signal's wakeup. Returns ``(result, interrupted)``; on interrupt the result
+    is ``None`` and the in-flight request is cancelled.
+    """
+    if signal is None or not hasattr(signal, "wait_interrupted"):
+        return await factory(), False
+    if _signal_interrupted(signal):
+        return None, True
+
+    result: list[Any] = [None]
+    error: list[BaseException | None] = [None]
+    interrupted = [False]
+
+    async with anyio.create_task_group() as tg:
+
+        async def _watch() -> None:
+            await signal.wait_interrupted()
+            interrupted[0] = True
+            tg.cancel_scope.cancel()
+
+        async def _work() -> None:
+            try:
+                result[0] = await factory()
+            except Exception as exc:  # captured so the caller re-raises it
+                error[0] = exc
+            finally:
+                tg.cancel_scope.cancel()
+
+        tg.start_soon(_watch)
+        tg.start_soon(_work)
+
+    if error[0] is not None and not interrupted[0]:
+        raise error[0]
+    return result[0], interrupted[0]
 
 
 class InferenceClient(Protocol):
@@ -314,8 +368,10 @@ class LiteLLMInferenceClient:
             )
 
         yield event(InferenceGenerationStarted, {"model": self.model})
-        if runtime and runtime.abort_signal:
-            await runtime.abort_signal.checkpoint()
+        signal = runtime.abort_signal if runtime else None
+        if _signal_interrupted(signal):
+            yield event(InferenceAborted, {"reason": _signal_reason(signal)})
+            return
 
         accumulator = StreamAccumulator()
         try:
@@ -325,10 +381,17 @@ class LiteLLMInferenceClient:
                 stream=True,
                 tools=tools,
             )
-            response = await self._completion_fn(**kwargs)
+            # The initial request await (TTFT) must be wakeable by the signal,
+            # not just observed after the first chunk arrives.
+            response, interrupted = await _await_or_interrupt(
+                signal, lambda: self._completion_fn(**kwargs)
+            )
+            if interrupted:
+                yield event(InferenceAborted, {"reason": _signal_reason(signal)})
+                return
             async for chunk in response:  # type: ignore[attr-defined]
-                if runtime and runtime.abort_signal and runtime.abort_signal.is_aborted():
-                    yield event(InferenceAborted, {"reason": "abort_signal"})
+                if _signal_interrupted(signal):
+                    yield event(InferenceAborted, {"reason": _signal_reason(signal)})
                     return
                 for event_class, fields in accumulator.feed_chunk(chunk):
                     yield event(event_class, fields)

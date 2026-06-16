@@ -15,6 +15,7 @@ from knuth_runtime.agent import (
     build_sqlite_runtime,
 )
 from knuth_runtime.debug import DEFAULT_DEBUG_SINK_DIR, DebugEventSink
+from knuth_runtime.interrupts import InterruptController
 from knuth_runtime.context import (
     ContextRedactor,
     StaticSectionProvider,
@@ -54,6 +55,7 @@ __all__ = [
     "DEFAULT_SECRET_PATTERNS",
     "DebugEventSink",
     "EventRedactor",
+    "InterruptController",
     "LedgerError",
     "MemoryRunLedger",
     "OpenToolBatch",

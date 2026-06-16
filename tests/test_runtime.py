@@ -1080,6 +1080,9 @@ class CrashRecoveryTests(unittest.TestCase):
             ),
             ledger,
         )
+        # A leftover RUNNING run is not resumable directly: recovery is the
+        # explicit gate that settles crashed work and pauses the run first.
+        anyio.run(runtime.recover_crashed_runs, run_id)
         result = self._resume(runtime, run_id)
         events = anyio.run(runtime.events, run_id)
 
@@ -1103,6 +1106,9 @@ class CrashRecoveryTests(unittest.TestCase):
             ),
             ledger,
         )
+        # Recovery first turns the leftover RUNNING run into a paused run with
+        # the in-flight external write marked UNKNOWN.
+        anyio.run(runtime.recover_crashed_runs, run_id)
         result = self._resume(runtime, run_id)
         self.assertEqual(result.status, RunStatus.PAUSED)
 

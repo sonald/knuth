@@ -61,6 +61,31 @@ class RunPausedDraft(RuntimeEventDraftBase):
     source: Literal["control", "hook"] = "control"
 
 
+InterruptReason = Literal[
+    "user_stop",
+    "queued_user_prompt",
+    "timeout",
+    "shutdown",
+    "hook_stop",
+    "runtime_stop",
+]
+
+InterruptActivePhase = Literal["model", "tool", "loop", "unknown"]
+
+
+class RunInterruptedDraft(RuntimeEventDraftBase):
+    type: Literal["run.interrupted"] = "run.interrupted"
+    reason: InterruptReason
+    active_phase: InterruptActivePhase
+    message: str | None = None
+
+
+class ConversationNoticeDraft(RuntimeEventDraftBase):
+    type: Literal["conversation.notice"] = "conversation.notice"
+    kind: Literal["interrupted", "runtime"]
+    content: str
+
+
 class RunCancelledDraft(RuntimeEventDraftBase):
     type: Literal["run.cancelled"] = "run.cancelled"
     reason: str
@@ -159,7 +184,7 @@ class ToolInvocationCompletedDraft(RuntimeEventDraftBase):
     type: Literal["tool.invocation_completed"] = "tool.invocation_completed"
     tool_call_id: str
     tool_name: str
-    outcome: Literal["succeeded", "failed", "denied"]
+    outcome: Literal["succeeded", "failed", "denied", "interrupted"]
     observation: str | None = None
     artifact_ref: str | None = None
     observation_preview: str | None = None
@@ -188,6 +213,8 @@ DurableRuntimeEventDraft = (
     | UserMessageDraft
     | RunResumedDraft
     | RunPausedDraft
+    | RunInterruptedDraft
+    | ConversationNoticeDraft
     | RunCancelledDraft
     | RunFailedDraft
     | RunSucceededDraft
@@ -310,6 +337,14 @@ class RunPaused(RunPausedDraft, StoredRuntimeEventBase):
     pass
 
 
+class RunInterrupted(RunInterruptedDraft, StoredRuntimeEventBase):
+    pass
+
+
+class ConversationNotice(ConversationNoticeDraft, StoredRuntimeEventBase):
+    pass
+
+
 class RunCancelled(RunCancelledDraft, StoredRuntimeEventBase):
     pass
 
@@ -419,6 +454,8 @@ StoredRuntimeEvent = (
     | UserMessage
     | RunResumed
     | RunPaused
+    | RunInterrupted
+    | ConversationNotice
     | RunCancelled
     | RunFailed
     | RunSucceeded

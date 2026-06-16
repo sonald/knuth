@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import hashlib
 import json
+import os
+import signal as signalmod
 import sys
 from pathlib import Path
 from typing import Any
@@ -10,7 +12,11 @@ from typing import Any
 import anyio
 
 from knuth.core.invocations import ToolEffect, ToolInvocation, ToolRisk
-from knuth.core.tools import ToolResult, ToolResultStatus
+from knuth.core.tools import (
+    ToolExecutionResult,
+    ToolResult,
+    ToolResultStatus,
+)
 
 from knuth_toold.base import ToolManifest, ToolRuntimeContext
 from knuth_toold.process_output import render_tagged_process_output
@@ -173,6 +179,7 @@ class ShellTool:
         offload_root: Path | str | None = None,
         threshold_bytes: int = 4096,
         preview_bytes: int = 2048,
+        interrupt_grace_s: float = 2.0,
     ) -> None:
         self._offload_root = (
             Path.home() / ".knuth" / "offload" / "shell"
@@ -181,6 +188,8 @@ class ShellTool:
         )
         self._threshold_bytes = threshold_bytes
         self._preview_bytes = preview_bytes
+        # Grace after a gentle terminate before a force kill on user stop.
+        self._interrupt_grace_s = interrupt_grace_s
 
     @property
     def manifest(self) -> ToolManifest:
@@ -204,23 +213,26 @@ class ShellTool:
 
     async def invoke(
         self, invocation: ToolInvocation, ctx: ToolRuntimeContext
-    ) -> ToolResult:
+    ) -> ToolResult | ToolExecutionResult:
         command = invocation.args.get("command")
         if not isinstance(command, str) or not command.strip():
             raise ValueError("command must be a non-empty string")
-        completed = await anyio.run_process(
-            ["/bin/sh", "-c", command],
-            check=False,
+
+        stdout_bytes, stderr_bytes, return_code, interrupted = await self._run_command(
+            command, ctx.interrupt_signal
         )
-        stdout_bytes = completed.stdout
-        stderr_bytes = completed.stderr
+        if interrupted:
+            # Cooperative stop: report INTERRUPTED with whatever partial output
+            # was captured and an explicit warning about possible side effects.
+            return self._interrupted_result(stdout_bytes, stderr_bytes, return_code)
+
         stdout = stdout_bytes.decode(errors="replace")
         stderr = stderr_bytes.decode(errors="replace")
         offload = await self._build_offload_payload(
             invocation=invocation,
             ctx=ctx,
             command=command,
-            return_code=completed.returncode,
+            return_code=return_code,
             stdout_bytes=stdout_bytes,
             stderr_bytes=stderr_bytes,
         )
@@ -230,25 +242,119 @@ class ShellTool:
         content = render_tagged_process_output(
             stdout=stdout,
             stderr=stderr,
-            return_code=completed.returncode,
+            return_code=return_code,
             offload=offload,
         )
         status = (
             ToolResultStatus.SUCCESS
-            if completed.returncode == 0
+            if return_code == 0
             else ToolResultStatus.ERROR
         )
         return ToolResult(
             status=status,
             content=content,
             error=None
-            if completed.returncode == 0
+            if return_code == 0
             else ToolResult.from_error(
                 "process_failed",
-                stderr or f"process failed with return code {completed.returncode}",
+                stderr or f"process failed with return code {return_code}",
                 retryable=True,
             ).error,
         )
+
+    async def _run_command(
+        self, command: str, signal: Any | None
+    ) -> tuple[bytes, bytes, int, bool]:
+        """Run the command, cooperating with an interrupt signal.
+
+        Returns ``(stdout, stderr, return_code, interrupted)``. On interrupt the
+        child is sent a gentle terminate, then force-killed after a short grace;
+        whatever output was captured before then is still returned.
+        """
+        stdout_buf = bytearray()
+        stderr_buf = bytearray()
+        interrupted = False
+        wakeable = signal is not None and hasattr(signal, "wait_interrupted")
+        # New session so a gentle stop reaches the whole command's process
+        # group, not just /bin/sh — otherwise a grandchild (e.g. ``sleep``)
+        # keeps the output pipe open and the drain never sees EOF.
+        process = await anyio.open_process(
+            ["/bin/sh", "-c", command], stdin=None, start_new_session=True
+        )
+        try:
+            async with anyio.create_task_group() as outer:
+                if wakeable:
+
+                    async def _watch() -> None:
+                        nonlocal interrupted
+                        await signal.wait_interrupted()
+                        interrupted = True
+                        await self._terminate(process)
+
+                    outer.start_soon(_watch)
+
+                # Drain both pipes until EOF (process exit or termination).
+                async with anyio.create_task_group() as drains:
+                    drains.start_soon(self._drain, process.stdout, stdout_buf)
+                    drains.start_soon(self._drain, process.stderr, stderr_buf)
+                await process.wait()
+                outer.cancel_scope.cancel()
+        finally:
+            if process.returncode is None:
+                with anyio.CancelScope(shield=True):
+                    self._signal_group(process, signalmod.SIGKILL)
+                    await process.wait()
+        return (
+            bytes(stdout_buf),
+            bytes(stderr_buf),
+            process.returncode if process.returncode is not None else -1,
+            interrupted,
+        )
+
+    @staticmethod
+    async def _drain(stream: Any | None, buffer: bytearray) -> None:
+        if stream is None:
+            return
+        async for chunk in stream:
+            buffer.extend(chunk)
+
+    async def _terminate(self, process: Any) -> None:
+        self._signal_group(process, signalmod.SIGTERM)
+        await anyio.sleep(self._interrupt_grace_s)
+        if process.returncode is None:
+            self._signal_group(process, signalmod.SIGKILL)
+
+    @staticmethod
+    def _signal_group(process: Any, sig: int) -> None:
+        """Signal the command's whole process group, falling back to the leader."""
+        pid = getattr(process, "pid", None)
+        if pid is None:
+            return
+        try:
+            os.killpg(os.getpgid(pid), sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                process.terminate() if sig == signalmod.SIGTERM else process.kill()
+            except ProcessLookupError:
+                pass
+
+    def _interrupted_result(
+        self, stdout_bytes: bytes, stderr_bytes: bytes, return_code: int
+    ) -> ToolExecutionResult:
+        stdout = self._preview(stdout_bytes)
+        stderr = self._preview(stderr_bytes)
+        observation = (
+            "Command was interrupted by the user before it finished. The partial"
+            " output below may be incomplete, and the command may already have"
+            " produced side effects.\n"
+            + render_tagged_process_output(
+                stdout=stdout,
+                stderr=stderr,
+                return_code=return_code,
+                offload={"status": "interrupted"},
+            )
+        )
+        return ToolExecutionResult.interrupted(observation, tool_status="interrupted")
 
     async def _build_offload_payload(
         self,
