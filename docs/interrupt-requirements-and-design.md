@@ -1,6 +1,6 @@
 # 可中断运行机制需求与设计
 
-状态：Draft
+状态：Implemented
 日期：2026-06-16
 依据：[ADR-007](decisions/ADR-007-interrupt-signal-and-reentry.md)、[CONTEXT.md](../CONTEXT.md)、[resume-interrupt-findings.md](resume-interrupt-findings.md)
 
@@ -434,10 +434,10 @@ git diff --check
 - 所有实现路径都能从 ledger 状态解释，不依赖旧进程里残留的 incidental state。
 - 全量 unit tests、compileall、diff check 通过；CLI/IM 的真实中断路径有 smoke 验证。
 
-## 仍待确认的问题
+## 已确认的决策（实现版）
 
-- `conversation.notice` 的 exact event name 是否采用 `conversation.notice`，还是 `run.notice`。
-- Shell tool 第一版是否默认 kill 子进程，还是先只设置 signal 并等待命令自然退出一个短 grace。
-- `INTERRUPTED` 后如果用户输入空的“继续”，是否由 CLI 原样作为新 user prompt 发送，还是提供本地快捷命令 `/continue` 生成固定 prompt。
-- AG-UI active run 上新 prompt 第一版采用 409 还是排队；推荐先 409，避免隐藏队列语义。
-- 是否引入 live-run lease / heartbeat 来支持跨进程自动 recovery；第一版在没有 lease 前不自动 recovery `RUNNING`。
+- `conversation.notice`：采用 `conversation.notice` 事件名。
+- Shell tool：收到 `user_stop` 后向子进程的进程组发送 `SIGTERM`，短 grace（默认 2s）后 `SIGKILL`；新建会话组确保孙子进程（如 `sleep`）一并停止；返回 `interrupted` outcome，observation 携带 partial output 与副作用警告。
+- `INTERRUPTED` 后继续：CLI 不提供 `/continue`，下一条普通用户输入原样作为新 prompt 走 `continue_run`（reducer 允许 `user.message` 从 `INTERRUPTED` 追加，`run.resumed(cause="user_message")` 翻回 `RUNNING`）。
+- AG-UI active run 上新 prompt：返回 409（`DuplicateActivePromptError`），不排队。
+- live-run lease / heartbeat：第一版不引入；没有 lease 前不自动 recovery `RUNNING`，由显式 `recover` 或 host live manager 的 deadline force-cancel 后调用 recovery 收口。
