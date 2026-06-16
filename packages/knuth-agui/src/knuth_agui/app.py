@@ -6,9 +6,11 @@ import json
 import re
 import secrets
 from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from typing import Any, Literal
 from uuid import uuid4
 
+import anyio
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -25,12 +27,14 @@ from knuth_agui.events import (
     messages_snapshot,
     run_error,
 )
-from knuth_agui.listener import SSEBridgeListener
+from knuth_agui.live import DuplicateActivePromptError, LiveRunManager
 from knuth_agui.translator import AGUITranslator
 
 _CANONICAL_RUN_ID = re.compile(r"^run_[A-Za-z0-9_-]{1,80}$")
+# RUNNING is deliberately excluded: a live RUNNING run is attached through the
+# LiveRunManager, not re-entered via resume. A RUNNING run with no live session
+# in this process is not auto-recovered.
 _RESUMABLE_STATUSES = {
-    RunStatus.RUNNING,
     RunStatus.WAITING_APPROVAL,
     RunStatus.WAITING_TOOL_RESULT,
     RunStatus.PAUSED,
@@ -103,13 +107,13 @@ async def _session_factory(
     *,
     thread_id: str,
     prompt: str | None,
-) -> Callable[[SSEBridgeListener], RunSession]:
+) -> Callable[[Any], RunSession]:
     status = await _existing_status(runtime, thread_id)
     if status is None:
         if prompt is None:
             raise HTTPException(status_code=400, detail="no user message in request")
 
-        def start(listener: SSEBridgeListener) -> RunSession:
+        def start(listener: Any) -> RunSession:
             return runtime.start(
                 prompt,
                 run_id=thread_id,
@@ -118,14 +122,14 @@ async def _session_factory(
 
         return start
 
-    if status == RunStatus.SUCCEEDED:
+    if status in {RunStatus.SUCCEEDED, RunStatus.INTERRUPTED}:
         if prompt is None:
             raise HTTPException(
                 status_code=400,
-                detail="a completed thread needs a new user message to continue",
+                detail="a finished thread needs a new user message to continue",
             )
 
-        def continue_run(listener: SSEBridgeListener) -> RunSession:
+        def continue_run(listener: Any) -> RunSession:
             return runtime.continue_run(
                 thread_id,
                 prompt,
@@ -136,7 +140,7 @@ async def _session_factory(
 
     if status in _RESUMABLE_STATUSES:
 
-        def resume(listener: SSEBridgeListener) -> RunSession:
+        def resume(listener: Any) -> RunSession:
             return runtime.resume(
                 thread_id,
                 listeners=[listener],
@@ -146,7 +150,7 @@ async def _session_factory(
 
     raise HTTPException(
         status_code=409,
-        detail=f"run {thread_id} is {status.value} and cannot be resumed",
+        detail=f"run {thread_id} is {status.value} and cannot be attached or resumed",
     )
 
 
@@ -202,8 +206,23 @@ def create_app(
     *,
     auth_token: str | None = None,
     client_tool_provider: AGUIClientToolProvider | None = None,
+    interrupt_deadline_s: float = 30.0,
 ) -> FastAPI:
-    app = FastAPI(title="knuth-agui", version="0.2.0")
+    manager = LiveRunManager(runtime, deadline_s=interrupt_deadline_s)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # A host task group owns live sessions for the app's lifetime, so an SSE
+        # disconnect only unsubscribes — the run keeps going here.
+        async with anyio.create_task_group() as tg:
+            manager.bind(tg)
+            try:
+                yield
+            finally:
+                await manager.shutdown()
+                tg.cancel_scope.cancel()
+
+    app = FastAPI(title="knuth-agui", version="0.2.0", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
@@ -252,28 +271,39 @@ def create_app(
                 client_tool_provider.register_agui_tools(tools)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-        make_session = await _session_factory(
-            runtime,
-            thread_id=thread_id,
-            prompt=prompt,
-        )
+
+        async def build_factory() -> Callable[[Any], RunSession]:
+            return await _session_factory(
+                runtime, thread_id=thread_id, prompt=prompt
+            )
+
+        try:
+            live, subscriber = await manager.start_or_attach(
+                thread_id, prompt=prompt, build_factory=build_factory
+            )
+        except DuplicateActivePromptError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"run {thread_id} already has an active invocation; attach"
+                    " without a prompt or stop it first"
+                ),
+            ) from exc
 
         async def event_stream() -> AsyncIterator[str]:
-            listener = SSEBridgeListener()
+            translator = AGUITranslator(thread_id, live.run_id)
             try:
-                async with make_session(listener) as session:
-                    translator = AGUITranslator(thread_id, session.run_id)
-                    async for event in listener.stream:
-                        for ag_event in translator.translate(event):
-                            yield encode_sse(ag_event)
-                        if event.type == "run.invocation.ended":
-                            break
+                async for event in subscriber.stream:
+                    for ag_event in translator.translate(event):
+                        yield encode_sse(ag_event)
+                    if event.type == "run.invocation.ended":
+                        break
             except Exception as exc:
-                yield encode_sse(
-                    run_error(str(exc), code=exc.__class__.__name__)
-                )
+                yield encode_sse(run_error(str(exc), code=exc.__class__.__name__))
             finally:
-                await listener.aclose()
+                # Passive disconnect only unsubscribes; the run keeps going.
+                live.fanout.remove(subscriber)
+                await subscriber.aclose()
 
         return StreamingResponse(event_stream(), media_type=content_type())
 
@@ -346,6 +376,26 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="run not found") from exc
         return {"runId": run_id, "status": status.value}
+
+    @app.post("/stop")
+    async def stop(request: Request) -> dict[str, Any]:
+        """UI stop: route a graceful interrupt to the live session.
+
+        Unlike ``/pause`` (a runtime resumable-pause control), this is the UI
+        stop semantics — it interrupts active work. With no live session it is
+        an idempotent no-op that reports the current durable status.
+        """
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="request body must be an object")
+        run_id = _run_id_from_control_body(body)
+        interrupted = await manager.interrupt(run_id)
+        if interrupted:
+            return {"runId": run_id, "interrupted": True}
+        status = await _existing_status(runtime, run_id)
+        if status is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        return {"runId": run_id, "interrupted": False, "status": status.value}
 
     @app.post("/tool_result")
     async def tool_result(request: Request) -> dict[str, Any]:

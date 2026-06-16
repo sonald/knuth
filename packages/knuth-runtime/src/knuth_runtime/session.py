@@ -80,7 +80,8 @@ class RunSession:
             for listener in self._initial_listeners:
                 await self._observation.add_listener(listener)
             await self._prepare_run_id()
-            self._interrupts = InterruptController(run_id=self.run_id)
+            # The controller is created once in __init__ so an interrupt that
+            # races __aenter__ is not lost; never recreate it here.
             invocation = RuntimeInvocation(
                 run_id=self.run_id,
                 mode=self._mode,

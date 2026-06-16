@@ -9,7 +9,7 @@ import threading
 from dataclasses import dataclass, field
 
 import anyio
-from knuth_runtime import AgentRuntime, RunResult, RuntimeObservationError
+from knuth_runtime import AgentRuntime, LedgerError, RunResult, RuntimeObservationError
 from rich.console import Console
 from rich.text import Text
 
@@ -27,19 +27,108 @@ _HELP = """Commands:
 
 _EXIT_INTERRUPTED = 130
 
+# How long a graceful interrupt may run before the driver force-cancels the
+# turn. Ctrl-C is a cooperative stop first; this deadline (or a second Ctrl-C)
+# is the force-stop escape hatch so a tool that never reaches a safe point
+# cannot pin the foreground forever.
+_INTERRUPT_DEADLINE_S = 5.0
 
-class _TurnInterrupted(Exception):
-    """The user pressed Ctrl-C while a turn was in flight."""
+
+class _TurnForced(Exception):
+    """The turn was force-stopped (second Ctrl-C or deadline) before it could
+    record a clean durable outcome."""
 
     def __init__(self, run_id: str | None) -> None:
-        super().__init__("turn interrupted")
+        super().__init__("turn force-stopped")
         self.run_id = run_id
+
+
+_ACTIONABLE_STATUSES = frozenset(
+    {
+        RunStatus.WAITING_APPROVAL,
+        RunStatus.WAITING_TOOL_RESULT,
+        RunStatus.PAUSED,
+        RunStatus.RUNNING,
+    }
+)
+
+
+async def _reenter_actionable(
+    runtime: AgentRuntime, console: Console, allowed_tools: set[str]
+) -> str | None:
+    """On entering interactive mode, restore the latest actionable run.
+
+    Rather than a blank prompt, re-show a pending approval, the external-result
+    wait, or a resumable paused run so the user does not have to reconstruct
+    state with external commands. A ``RUNNING`` run with no live session in this
+    process is not auto-recovered (another process may still drive it).
+    """
+    runs_fn = getattr(runtime, "runs", None)
+    if runs_fn is None:
+        return None
+    try:
+        runs = await runs_fn(limit=20)
+    except Exception:
+        return None
+    actionable = [run for run in runs if run.status in _ACTIONABLE_STATUSES]
+    if not actionable:
+        return None
+    if len(actionable) > 1:
+        console.print(
+            Text("Multiple runs need attention; pick one to resume:", style="yellow")
+        )
+        for run in actionable:
+            console.print(
+                Text(f"  {run.id} · {run.status.value}", style="dim")
+            )
+        console.print(Text("Use `knuth resume <id>` to choose.", style="dim"))
+        return None
+    run = actionable[0]
+    if run.status == RunStatus.WAITING_APPROVAL:
+        console.print(
+            Text(f"Resuming run {run.id}, waiting for approval:", style="yellow")
+        )
+        await _resolve_approvals(
+            runtime,
+            console,
+            RunResult(answer="", run_id=run.id, status=RunStatus.WAITING_APPROVAL),
+            run.id,
+            allowed_tools,
+        )
+        return run.id
+    if run.status == RunStatus.WAITING_TOOL_RESULT:
+        console.print(
+            Text(
+                f"Run {run.id} is waiting for an external tool result.",
+                style="yellow",
+            )
+        )
+        return run.id
+    if run.status == RunStatus.PAUSED:
+        console.print(
+            Text(
+                f"Run {run.id} is paused; resume with `knuth resume {run.id}`.",
+                style="yellow",
+            )
+        )
+        return run.id
+    # RUNNING with no live session in this process: do not auto-recover.
+    console.print(
+        Text(
+            f"Run {run.id} is RUNNING but this process holds no live session;"
+            " cannot attach. Use `knuth recover` if it is truly stranded.",
+            style="yellow",
+        )
+    )
+    return None
 
 
 async def run_interactive(runtime: AgentRuntime, console: Console) -> int:
     console.print(Text(_BANNER, style="bold"))
-    session_run_id: str | None = None
     allowed_tools: set[str] = set()
+    session_run_id: str | None = await _reenter_actionable(
+        runtime, console, allowed_tools
+    )
     while True:
         try:
             line = await _read_line(console, _PROMPT)
@@ -60,13 +149,17 @@ async def run_interactive(runtime: AgentRuntime, console: Console) -> int:
             )
             continue
         try:
-            session_run_id = await _run_turn_interruptible(
+            session_run_id, result = await _run_turn(
                 runtime, console, prompt, session_run_id, allowed_tools
             )
-        except _TurnInterrupted as interrupt:
-            session_run_id = await _pause_after_interrupt(
-                runtime, console, interrupt.run_id or session_run_id
-            )
+            if result is not None and result.status == RunStatus.INTERRUPTED:
+                console.print(
+                    Text(
+                        f"run {session_run_id} · interrupted"
+                        " (send a new message to continue)",
+                        style="dim",
+                    )
+                )
         except Exception as exc:
             console.print(
                 Text(
@@ -80,24 +173,29 @@ async def run_single(runtime: AgentRuntime, console: Console, prompt: str) -> in
     """Render a single streaming turn (used for ``knuth run <prompt>``)."""
     run_id: str | None = None
     try:
-        run_id, result = await _run_turn_with_result(
-            runtime, console, prompt, None, set()
-        )
-    except _TurnInterrupted as interrupt:
-        await _pause_after_interrupt(runtime, console, interrupt.run_id)
-        return _EXIT_INTERRUPTED
+        run_id, result = await _run_turn(runtime, console, prompt, None, set())
     except Exception as exc:
         console.print(
             Text(f"Run failed: {exc.__class__.__name__}: {exc}", style="bold red")
         )
         return 1
     if result is None:
-        return 1
+        # Force-stopped before a clean outcome.
+        return _EXIT_INTERRUPTED
     status = result.status
     footer = f"run {run_id} · {status.value if status else 'unknown'}"
     console.print(Text(footer, style="dim"))
     if status == RunStatus.SUCCEEDED:
         return 0
+    if status == RunStatus.INTERRUPTED:
+        console.print(
+            Text(
+                f"Run was interrupted. Continue with `knuth run --once` or a new"
+                f" message in `knuth run` on run {run_id}.",
+                style="yellow",
+            )
+        )
+        return _EXIT_INTERRUPTED
     if status == RunStatus.WAITING_APPROVAL:
         console.print(
             Text(
@@ -117,10 +215,31 @@ async def run_single(runtime: AgentRuntime, console: Console, prompt: str) -> in
 
 async def run_resume(runtime: AgentRuntime, console: Console, run_id: str) -> int:
     """Resume a paused or waiting run with live rendering and approvals."""
+    # A run waiting for approval cannot be resumed until the approval is
+    # resolved; rather than crash on the ledger error, route into the approval
+    # UI. An INTERRUPTED run is not resumable at all — say so plainly.
+    pending_fn = getattr(runtime, "pending_approvals", None)
+    pending = await pending_fn(run_id) if pending_fn is not None else []
+    if pending:
+        result = await _resolve_approvals(
+            runtime,
+            console,
+            RunResult(answer="", run_id=run_id, status=RunStatus.WAITING_APPROVAL),
+            run_id,
+            set(),
+        )
+        status = result.status
+        console.print(
+            Text(f"run {run_id} · {status.value if status else 'unknown'}", style="dim")
+        )
+        return 0 if status == RunStatus.SUCCEEDED else 2
     renderer = EventRenderer(console)
     try:
         async with runtime.resume(run_id, listeners=[renderer]) as session:
             result = await session.result()
+    except LedgerError as exc:
+        console.print(Text(f"Cannot resume run {run_id}: {exc}", style="bold red"))
+        return 2
     finally:
         renderer.finish()
     result = await _resolve_approvals(runtime, console, result, run_id, set())
@@ -135,77 +254,64 @@ async def run_resume(runtime: AgentRuntime, console: Console, run_id: str) -> in
     return 1
 
 
-async def _run_turn_interruptible(
-    runtime: AgentRuntime,
-    console: Console,
-    prompt: str,
-    session_run_id: str | None,
-    allowed_tools: set[str],
-) -> str | None:
-    run_id, _ = await _run_turn_with_result(
-        runtime, console, prompt, session_run_id, allowed_tools
-    )
-    return run_id
+async def _drive_session_to_result(
+    console: Console, session, *, allow_interrupt: bool
+) -> RunResult:
+    """Await a session result while making Ctrl-C a graceful interrupt.
 
-
-async def _run_turn_with_result(
-    runtime: AgentRuntime,
-    console: Console,
-    prompt: str,
-    session_run_id: str | None,
-    allowed_tools: set[str],
-) -> tuple[str | None, RunResult | None]:
-    """Run one turn, cancelling it (instead of dying) on Ctrl-C.
-
-    While the turn is in flight SIGINT cancels the turn's scope; the run is
-    then marked paused by the caller so it can be resumed.
+    The first SIGINT triggers the live interrupt signal: the agent loop reaches
+    its safe point and the run resolves to ``INTERRUPTED`` (not ``PAUSED``). A
+    second SIGINT, or the deadline, force-cancels the turn — the escape hatch,
+    which may leave durable state for recovery rather than a clean outcome.
     """
-    observed_run_id: list[str | None] = [session_run_id]
     result_holder: list[RunResult | None] = [None]
+    forced = [False]
+
     try:
-        with anyio.CancelScope() as turn_scope:
-            async with anyio.create_task_group() as tg:
+        async with anyio.create_task_group() as tg:
 
-                async def _watch_sigint() -> None:
-                    with anyio.open_signal_receiver(signal.SIGINT) as signals:
-                        async for _ in signals:
-                            turn_scope.cancel()
-                            return
+            async def _await_result() -> None:
+                result_holder[0] = await session.result()
+                tg.cancel_scope.cancel()
 
+            async def _deadline() -> None:
+                await anyio.sleep(_INTERRUPT_DEADLINE_S)
+                forced[0] = True
+                tg.cancel_scope.cancel()
+
+            async def _watch_sigint() -> None:
+                interrupt = getattr(session, "interrupt", None)
+                with anyio.open_signal_receiver(signal.SIGINT) as signals:
+                    count = 0
+                    async for _ in signals:
+                        count += 1
+                        if count == 1 and interrupt is not None:
+                            interrupt("user_stop")
+                            console.print(
+                                Text(
+                                    "⊘ interrupting… (Ctrl-C again to force)",
+                                    style="yellow",
+                                )
+                            )
+                            tg.start_soon(_deadline)
+                            continue
+                        forced[0] = True
+                        tg.cancel_scope.cancel()
+                        return
+
+            if allow_interrupt:
                 tg.start_soon(_watch_sigint)
-                try:
-                    observed_run_id[0], result_holder[0] = await _run_turn(
-                        runtime,
-                        console,
-                        prompt,
-                        session_run_id,
-                        allowed_tools,
-                        observed_run_id,
-                    )
-                finally:
-                    tg.cancel_scope.cancel()
+            tg.start_soon(_await_result)
     except BaseExceptionGroup as group:
+        # The task group wraps a session/result error; surface the single
+        # underlying exception so callers see the real cause.
         if len(group.exceptions) == 1:
             raise group.exceptions[0] from None
         raise
-    if turn_scope.cancelled_caught:
-        raise _TurnInterrupted(observed_run_id[0])
-    return observed_run_id[0], result_holder[0]
 
-
-async def _pause_after_interrupt(
-    runtime: AgentRuntime, console: Console, run_id: str | None
-) -> str | None:
-    console.print(Text("⊘ interrupted", style="yellow"))
-    if run_id is not None:
-        try:
-            status = await runtime.pause(run_id)
-        except Exception:
-            return run_id
-        console.print(
-            Text(f"run {run_id} · {status.value} (resume with /new message or `knuth resume`)", style="dim")
-        )
-    return run_id
+    if result_holder[0] is None:
+        raise _TurnForced(getattr(session, "run_id", None))
+    return result_holder[0]
 
 
 async def _run_turn(
@@ -214,7 +320,6 @@ async def _run_turn(
     prompt: str,
     session_run_id: str | None,
     allowed_tools: set[str],
-    observed_run_id: list[str | None] | None = None,
 ) -> tuple[str | None, RunResult | None]:
     renderer = EventRenderer(console)
     session_factory = (
@@ -222,11 +327,18 @@ async def _run_turn(
         if session_run_id is None
         else runtime.continue_run(session_run_id, prompt, listeners=[renderer])
     )
+    run_id = session_run_id
+    result: RunResult | None = None
     try:
         async with session_factory as session:
-            if observed_run_id is not None:
-                observed_run_id[0] = getattr(session, "run_id", session_run_id)
-            result = await session.result()
+            run_id = getattr(session, "run_id", session_run_id)
+            try:
+                result = await _drive_session_to_result(
+                    console, session, allow_interrupt=True
+                )
+            except _TurnForced as forced:
+                console.print(Text("⊘ interrupted (forced)", style="yellow"))
+                return forced.run_id or run_id, None
     except RuntimeObservationError as exc:
         result = exc.result if isinstance(exc.result, RunResult) else None
         console.print(
@@ -381,15 +493,25 @@ def _enable_utf8_erase() -> None:
 @dataclass
 class _ReadRequest:
     """One pending line read; ``abandoned`` drops the line instead of
-    delivering it to a caller that already gave up (Ctrl-C, cancellation)."""
+    delivering it to a caller that already gave up (Ctrl-C, cancellation).
+
+    ``wake`` is an optional thread-safe callback the async caller registers so
+    the reader thread can notify it directly (set an ``anyio.Event`` via the
+    loop), instead of the caller blocking an AnyIO worker on ``done.wait()``.
+    A worker blocked there would outlive a Ctrl-C and stall interpreter exit.
+    """
 
     done: threading.Event = field(default_factory=threading.Event)
     line: object = None
     abandoned: bool = False
+    wake: object = None
 
     def resolve(self, line: object) -> None:
         self.line = line
         self.done.set()
+        wake = self.wake
+        if wake is not None:
+            wake()
 
 
 class _StdinReader:
@@ -465,17 +587,25 @@ _stdin_reader = _StdinReader()
 async def _read_line(console: Console, prompt: str) -> str | None:
     """Read one line through the single stdin reader; None on EOF.
 
-    KeyboardInterrupt from Ctrl-C at the prompt propagates to the caller;
-    the in-flight read is marked abandoned so its line is discarded rather
-    than corrupting the next prompt.
+    The reader thread wakes this coroutine through a thread-safe callback, so
+    no AnyIO worker is parked on ``done.wait()``. KeyboardInterrupt or
+    cancellation at the prompt propagates to the caller after marking the
+    in-flight read abandoned, so its line is discarded rather than corrupting
+    the next prompt — and no worker is left blocked to stall exit.
     """
+    import asyncio
+
     while True:
         console.print(Text(prompt), end="")
         request = _stdin_reader.submit()
+        ready = anyio.Event()
+        loop = asyncio.get_running_loop()
+        request.wake = lambda: loop.call_soon_threadsafe(ready.set)
+        # Close the race where the reader resolved before ``wake`` was set.
+        if request.done.is_set():
+            ready.set()
         try:
-            await anyio.to_thread.run_sync(
-                request.done.wait, abandon_on_cancel=True
-            )
+            await ready.wait()
         except BaseException:
             request.abandoned = True
             raise
