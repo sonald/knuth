@@ -54,8 +54,8 @@ import {
   fetchHistory,
   fetchPendingApprovals,
   fetchThreads,
-  pauseRun,
   resolveApproval,
+  stopRun,
   streamAgent,
   submitToolResult,
 } from "../lib/agui";
@@ -1277,14 +1277,17 @@ export function KnuthIMApp() {
     setError(undefined);
   };
 
-  const pause = async () => {
+  // UI stop: interrupt active work server-side, then drop the local SSE
+  // subscription. Aborting the stream is only an unsubscribe now (the backend
+  // live manager keeps the run), so the interrupt must go through /stop.
+  const stop = async () => {
     if (!activeThreadId) {
       abortRef.current?.abort();
       setRunning(false);
       return;
     }
     try {
-      await pauseRun(agentConnection, activeThreadId);
+      await stopRun(agentConnection, activeThreadId);
     } catch (err) {
       setError(String(err));
     }
@@ -1628,8 +1631,8 @@ export function KnuthIMApp() {
               <button
                 className="iconBtn danger"
                 type="button"
-                title="Pause run"
-                onClick={() => void pause()}
+                title="Stop run"
+                onClick={() => void stop()}
               >
                 <CircleStop size={16} />
               </button>
@@ -1728,7 +1731,7 @@ export function KnuthIMApp() {
                 className="stop"
                 type="button"
                 title="Stop"
-                onClick={() => void pause()}
+                onClick={() => void stop()}
               >
                 <Square size={15} />
               </button>

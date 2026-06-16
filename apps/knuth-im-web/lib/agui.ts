@@ -150,6 +150,22 @@ export async function pauseRun(endpoint: AgentEndpoint, runId: string): Promise<
   }
 }
 
+// UI stop: interrupt active model/tool work via the live manager. Unlike
+// pauseRun (a resumable runtime pause), this discards in-flight work so the run
+// resolves to INTERRUPTED rather than a replayable PAUSED — matching ADR-007's
+// "UI stop -> /stop -> live interrupt" semantics.
+export async function stopRun(endpoint: AgentEndpoint, runId: string): Promise<void> {
+  const connection = normalizeEndpoint(endpoint);
+  const response = await fetch(`${connection.baseUrl}/stop`, {
+    method: "POST",
+    headers: jsonHeaders(connection),
+    body: JSON.stringify({ runId }),
+  });
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+}
+
 export async function resolveApproval(
   endpoint: AgentEndpoint,
   approvalId: string,

@@ -54,9 +54,12 @@ class _Subscriber:
         await self._send.aclose()
         await self._receive.aclose()
 
-    def close_send(self) -> None:
-        # End any blocked ``async for`` so the SSE handler unwinds cleanly.
+    def close(self) -> None:
+        # Sync close of both ends. Called once the run ended and its final event
+        # was already delivered, so no handler is mid-iteration; this ends any
+        # idle ``async for`` cleanly and releases the streams.
         self._send.close()
+        self._receive.close()
 
 
 class _Fanout:
@@ -83,7 +86,8 @@ class _Fanout:
 
     def close_all(self) -> None:
         for subscriber in list(self._subscribers):
-            subscriber.close_send()
+            subscriber.close()
+        self._subscribers.clear()
 
 
 @dataclass
@@ -161,12 +165,16 @@ class LiveRunManager:
             async with self._lock:
                 self._live.pop(live.run_id, None)
             if forced:
-                # The deadline force-cancelled this invocation. We owe a
-                # conservative durable outcome rather than a zombie RUNNING run:
-                # recovery settles in-flight work and pauses the run.
+                # The deadline force-cancelled this invocation after a user
+                # stop. We owe a conservative durable outcome rather than a
+                # zombie RUNNING run: recovery settles the in-flight tool and
+                # abandons the rest of the (user-stopped) batch so a later
+                # resume cannot run tools from a turn the user already stopped.
                 with anyio.CancelScope(shield=True):
                     try:
-                        await self._runtime.recover_crashed_runs(live.run_id)
+                        await self._runtime.recover_crashed_runs(
+                            live.run_id, abandon_unstarted=True
+                        )
                     except Exception:
                         pass
             live.fanout.close_all()

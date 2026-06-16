@@ -153,6 +153,38 @@ class ModelAbortSafePointTests(unittest.TestCase):
         result = anyio.run(scenario)
         self.assertEqual(result.status, RunStatus.INTERRUPTED)
 
+    def test_non_user_abort_pauses_instead_of_interrupting(self) -> None:
+        async def scenario():
+            # The model aborts for a provider reason with NO live interrupt
+            # signal: this is not a user stop and must not forge run.interrupted.
+            class _ProviderAbortClient:
+                model = "provider-abort"
+
+                async def stream(self, messages, tools, config, runtime=None):
+                    yield InferenceAborted(
+                        generation_id="g1",
+                        seq=1,
+                        run_id=config.run_id,
+                        reason="provider_overloaded",
+                    )
+
+            runtime = build_memory_runtime(
+                inference_client=_ProviderAbortClient(),
+                inference_config=InferenceConfig(),
+                ledger=MemoryRunLedger(),
+            )
+            async with runtime.start("hello") as session:
+                result = await session.result()
+                events = await runtime.events(session.run_id)
+            return result, events
+
+        result, events = anyio.run(scenario)
+        self.assertEqual(result.status, RunStatus.PAUSED)
+        types = [e.type for e in events]
+        self.assertIn("model.aborted", types)
+        self.assertIn("run.paused", types)
+        self.assertNotIn("run.interrupted", types)
+
     def test_normal_completion_does_not_write_interrupt(self) -> None:
         async def scenario():
             class _OkClient:

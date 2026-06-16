@@ -166,6 +166,11 @@ class ToolBroker:
             tool_call_id=invocation.tool_call_id,
             interrupt_signal=signal,
         )
+        # Cooperation, not preemption (design R4): poll-friendly tools observe
+        # ``signal.interrupted`` and return their own outcome; single-blocking
+        # tools bind the signal themselves (e.g. the shell tool waking its
+        # subprocess). The broker does not impose a cancel scope, which would
+        # rob a cooperative tool of the chance to report a precise outcome.
         try:
             if manifest.timeout_s is not None:
                 with anyio.fail_after(manifest.timeout_s):
@@ -182,6 +187,11 @@ class ToolBroker:
                 )
             )
         except Exception as exc:
+            # A tool that surfaced an error while a stop was in flight is not
+            # itself a failure: fall back by effect (external/dangerous ->
+            # UNKNOWN, otherwise -> interrupted). A raw cancellation (force-stop
+            # teardown) is a BaseException and intentionally propagates here;
+            # the deadline/recovery path settles its durable state.
             if signal is not None and signal.interrupted:
                 return self._interrupt_fallback(manifest, exc)
             return ToolExecutionResult.failed(

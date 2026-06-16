@@ -74,6 +74,44 @@ class _LongRunningTool:
         return ToolResult.success(content="finished")
 
 
+class _SelfWakingTool:
+    """A single-blocking tool that binds the signal to wake its own await.
+
+    This is the design's blocking-tool pattern (like the shell tool): it does
+    not poll, it waits on ``wait_interrupted`` and reports its own outcome —
+    the broker never preempts it with a cancel scope.
+    """
+
+    @property
+    def manifest(self) -> ToolManifest:
+        return ToolManifest(
+            name="blocking",
+            description="single blocking await woken by the signal",
+            parameters={"type": "object", "properties": {}},
+            effect=ToolEffect.LOCAL_WRITE,
+            risk=ToolRisk.MEDIUM,
+        )
+
+    async def invoke(self, invocation, ctx: ToolRuntimeContext):
+        signal = ctx.interrupt_signal
+        done = anyio.Event()
+        async with anyio.create_task_group() as tg:
+
+            async def _watch() -> None:
+                await signal.wait_interrupted()
+                done.set()
+                tg.cancel_scope.cancel()
+
+            async def _work() -> None:
+                await done.wait()  # never completes on its own here
+
+            tg.start_soon(_watch)
+            tg.start_soon(_work)
+        return ToolExecutionResult.interrupted(
+            "blocking tool woke on the signal and stopped cleanly"
+        )
+
+
 class _RaisingOnInterruptTool:
     """Raises (e.g. cancellation) when interrupted, with no reliable outcome."""
 
@@ -140,6 +178,29 @@ class BrokerOutcomeTests(unittest.TestCase):
         result = anyio.run(scenario)
         self.assertEqual(result.outcome, ToolExecutionOutcome.INTERRUPTED)
         self.assertIn("cooperatively", result.observation or "")
+
+    def test_self_waking_blocking_tool_reports_interrupted(self) -> None:
+        async def scenario():
+            controller = InterruptController()
+            broker = _broker(_SelfWakingTool())
+            await broker.registry.refresh()
+            result = [None]
+
+            async with anyio.create_task_group() as tg:
+
+                async def run():
+                    result[0] = await broker.execute(
+                        _invocation("blocking"), signal=controller.signal
+                    )
+
+                tg.start_soon(run)
+                await anyio.sleep(0.02)
+                controller.interrupt("user_stop")
+            return result[0]
+
+        result = anyio.run(scenario)
+        self.assertEqual(result.outcome, ToolExecutionOutcome.INTERRUPTED)
+        self.assertIn("cleanly", result.observation or "")
 
     def test_dangerous_tool_with_no_outcome_becomes_unknown(self) -> None:
         async def scenario():

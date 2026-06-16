@@ -449,6 +449,36 @@ class AGUIM2Tests(unittest.TestCase):
         self.assertEqual(approvals[0]["preview"]["tool"], "shell")
         self.assertEqual(approvals[0]["preview"]["args"]["command"], "pwd")
 
+    def test_reopening_waiting_approval_thread_returns_409_not_failed_stream(
+        self,
+    ) -> None:
+        app = create_app(self._approval_runtime())
+        run_id = "run_reopen_approval_1"
+        with TestClient(app) as client:
+            self._post_agent(
+                client,
+                {
+                    "threadId": run_id,
+                    "messages": [{"role": "user", "content": "where am I?"}],
+                },
+            )
+            # The run is now WAITING_APPROVAL with no live session. Re-posting
+            # /agent must not create a doomed resume; it returns a clear 409 and
+            # the approval card data is still available via the dedicated route.
+            reopen = client.post(
+                "/agent",
+                json={
+                    "threadId": run_id,
+                    "messages": [{"role": "user", "content": "still there?"}],
+                },
+            )
+            approvals = client.get(f"/threads/{run_id}/approvals")
+
+        self.assertEqual(reopen.status_code, 409, reopen.text)
+        self.assertIn("approval", reopen.json()["detail"])
+        self.assertEqual(approvals.status_code, 200)
+        self.assertEqual(len(approvals.json()["approvals"]), 1)
+
     def test_missing_thread_id_generates_canonical_run_id_and_history(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             app = create_app(self._runtime(workspace))

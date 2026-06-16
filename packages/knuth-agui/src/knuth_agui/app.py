@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
+from knuth.core.invocations import ToolInvocationStatus
 from knuth.core.types import RunStatus
 from knuth_runtime import AgentRuntime, LedgerError
 from knuth_runtime.session import RunSession
@@ -139,6 +140,11 @@ async def _session_factory(
         return continue_run
 
     if status in _RESUMABLE_STATUSES:
+        # Resume only once the blocking control point is resolved. Otherwise the
+        # ledger would reject the resume and the failure would surface only as a
+        # truncated stream; return a clear 409 pointing at the right endpoint so
+        # re-opening a waiting thread still shows actionable guidance.
+        await _require_resumable(runtime, thread_id, status)
 
         def resume(listener: Any) -> RunSession:
             return runtime.resume(
@@ -152,6 +158,38 @@ async def _session_factory(
         status_code=409,
         detail=f"run {thread_id} is {status.value} and cannot be attached or resumed",
     )
+
+
+async def _require_resumable(
+    runtime: AgentRuntime, thread_id: str, status: RunStatus
+) -> None:
+    if status == RunStatus.WAITING_APPROVAL:
+        pending = await runtime.pending_approvals(thread_id)
+        if pending:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"run {thread_id} is waiting for approval; resolve it via"
+                    " /approve (see /threads/{thread_id}/approvals) before"
+                    " resuming"
+                ),
+            )
+        return
+    if status == RunStatus.WAITING_TOOL_RESULT:
+        state = await runtime.run_state(thread_id)
+        waiting = (
+            state.open_batch.by_status(ToolInvocationStatus.WAITING_TOOL_RESULT)
+            if state.open_batch is not None
+            else ()
+        )
+        if waiting:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"run {thread_id} is waiting for an external tool result;"
+                    " submit it via /tool_result before resuming"
+                ),
+            )
 
 
 def _run_id_from_control_body(body: dict[str, Any]) -> str:

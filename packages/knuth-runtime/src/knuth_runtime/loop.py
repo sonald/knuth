@@ -280,22 +280,39 @@ async def _run_step(
                 stream_error = event.error
                 break
             case InferenceAborted():
-                # A model request that cooperatively aborted on the interrupt
-                # signal is abandoned active work, not a provider failure and
-                # not a resumable pause. The discarded assistant partial never
-                # reaches durable conversation, so the model needs a notice next
-                # turn. There is no open batch yet, so the collapse is just the
-                # model.aborted fact, the notice, and run.interrupted — atomic.
-                await _emit_interrupt_collapse(
-                    invocation,
-                    reason=_interrupt_reason(event.reason),
-                    active_phase="model",
-                    notice=_MODEL_INTERRUPT_NOTICE,
-                    leading=[
-                        ModelAbortedDraft(step_id=step_id, reason=event.reason)
-                    ],
+                # Only a user-driven stop becomes a durable interrupt. The safe
+                # point verifies the live signal actually fired (or the reason
+                # is an active-stop reason) before collapsing; a provider's own
+                # or non-user abort is recorded and routed to a resumable pause,
+                # not forged into ``run.interrupted``.
+                signalled = invocation.interrupt_signal.interrupted
+                is_active_stop = event.reason in _ACTIVE_STOP_REASONS
+                if signalled or is_active_stop:
+                    # The discarded assistant partial never reaches durable
+                    # conversation, so the model needs a notice next turn. No
+                    # open batch yet, so the collapse is the model.aborted fact,
+                    # the notice, and run.interrupted — atomic.
+                    await _emit_interrupt_collapse(
+                        invocation,
+                        reason=_interrupt_reason(
+                            invocation.interrupt_signal.reason or event.reason
+                        ),
+                        active_phase="model",
+                        notice=_MODEL_INTERRUPT_NOTICE,
+                        leading=[
+                            ModelAbortedDraft(step_id=step_id, reason=event.reason)
+                        ],
+                    )
+                    return RunStatus.INTERRUPTED
+                # Non-user abort: record it and pause for recovery rather than
+                # discarding the turn as a user interrupt.
+                await invocation.emit(
+                    ModelAbortedDraft(step_id=step_id, reason=event.reason)
                 )
-                return RunStatus.INTERRUPTED
+                await invocation.emit(
+                    RunPausedDraft(reason=f"model_aborted: {event.reason}")
+                )
+                return RunStatus.PAUSED
             case InferenceGenerationCompleted():
                 assistant_message = event.message
                 finish_reason = event.finish_reason

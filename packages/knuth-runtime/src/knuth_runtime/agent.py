@@ -199,6 +199,10 @@ class AgentRuntime:
     async def status(self, run_id: str) -> RunStatus:
         return (await self._services.ledger.get_run(run_id)).status
 
+    async def run_state(self, run_id: str):
+        """Current run projection: status, open batch, and pending approvals."""
+        return await self._services.ledger.run_state(run_id)
+
     async def pause(self, run_id: str) -> RunStatus:
         """Mark an in-flight run as paused so it can be resumed later.
 
@@ -239,18 +243,25 @@ class AgentRuntime:
         return await self._services.ledger.refold()
 
     async def recover_crashed_runs(
-        self, run_id: str | None = None
+        self, run_id: str | None = None, *, abandon_unstarted: bool = False
     ) -> list[CrashRecoveryReport]:
-        """Settle work a dead process left in flight (design §5.2).
+        """Settle work a dead or force-stopped process left in flight.
 
         For every RUNNING run (or just ``run_id``): running invocations are
         settled by effect split — retryable effects fail with a crash
         observation, external writes become UNKNOWN — and the run is paused,
         so durable state no longer claims an execution that is not happening.
 
+        When ``abandon_unstarted`` is set (the host/live-manager force-cancel
+        path, where the cancellation followed a *user stop*), the open batch's
+        unstarted invocations also receive abandoned observations, so a later
+        resume cannot run tools from a turn the user already stopped. Plain
+        crash recovery leaves them as the batch's resume point.
+
         v0 has no worker lease, so liveness cannot be proven from the ledger;
-        this runs only on explicit request (``knuth recover``), never
-        automatically against runs another process may still be driving.
+        this runs only on explicit request (``knuth recover``) or the host's own
+        force-cancel cleanup, never automatically against runs another process
+        may still be driving.
         """
         ledger = self._services.ledger
         if run_id is not None:
@@ -272,6 +283,10 @@ class AgentRuntime:
                 failed, unknown = await settle_crashed_invocations(
                     apply_event, state.open_batch
                 )
+                if abandon_unstarted:
+                    await self._abandon_unstarted_in_batch(
+                        apply_event, state.open_batch
+                    )
             await ledger.apply(
                 run.id,
                 RunPausedDraft(reason="recovered after crash; resume to continue"),
@@ -280,6 +295,31 @@ class AgentRuntime:
                 CrashRecoveryReport(run_id=run.id, failed=failed, unknown=unknown)
             )
         return reports
+
+    @staticmethod
+    async def _abandon_unstarted_in_batch(apply_event, batch) -> None:
+        from knuth.core.invocations import ToolInvocationStatus
+
+        unstarted = batch.by_status(
+            ToolInvocationStatus.PROPOSED,
+            ToolInvocationStatus.AWAITING_APPROVAL,
+            ToolInvocationStatus.APPROVED,
+        )
+        for inv in unstarted:
+            if inv.observation_recorded:
+                continue
+            await apply_event(
+                ToolInvocationCompletedDraft(
+                    tool_call_id=inv.tool_call_id,
+                    tool_name=inv.tool_name,
+                    outcome="interrupted",
+                    observation=(
+                        f"Tool {inv.tool_name} was not executed: the user stopped"
+                        " this turn before it ran."
+                    ),
+                    tool_status="abandoned",
+                )
+            )
 
 
 class _DemoInferenceClient:

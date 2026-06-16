@@ -62,6 +62,24 @@ class _ToolModel:
         )
 
 
+class _TwoToolModel:
+    model = "two-tool"
+
+    async def stream(self, messages, tools, config, runtime=None):
+        yield InferenceGenerationCompleted(
+            generation_id="g1",
+            seq=1,
+            run_id=config.run_id,
+            message=InferenceMessage(
+                role=InferenceRole.ASSISTANT,
+                tool_calls=[
+                    CoreToolCall(tool_call_id="c1", name="stuck", arguments={}, index=0),
+                    CoreToolCall(tool_call_id="c2", name="stuck", arguments={}, index=1),
+                ],
+            ),
+        )
+
+
 class _StuckTool:
     """Never checks the signal and never returns — a tool stuck off-safe-point."""
 
@@ -229,6 +247,31 @@ class LiveManagerTests(unittest.TestCase):
         # marked the external-write invocation UNKNOWN.
         self.assertEqual(status, RunStatus.PAUSED)
         self.assertEqual(inv_status, ToolInvocationStatus.UNKNOWN)
+
+    def test_force_cleanup_abandons_unstarted_batch_siblings(self) -> None:
+        async def scenario():
+            runtime = _runtime(_TwoToolModel(), _StuckTool())
+            manager = LiveRunManager(runtime, deadline_s=0.2)
+            async with anyio.create_task_group() as tg:
+                manager.bind(tg)
+                live, _ = await manager.start_or_attach(
+                    "run_e", prompt="go", build_factory=_factory(runtime, "go", "run_e")
+                )
+                await anyio.sleep(0.1)
+                await manager.interrupt("run_e")
+                await live.finished.wait()
+                tg.cancel_scope.cancel()
+            status = await runtime.status("run_e")
+            c1 = await runtime._services.ledger.get_invocation("c1")
+            c2 = await runtime._services.ledger.get_invocation("c2")
+            return status, c1.status, c2.status
+
+        status, c1_status, c2_status = anyio.run(scenario)
+        self.assertEqual(status, RunStatus.PAUSED)
+        # Active tool: UNKNOWN; the unstarted sibling must be abandoned so a
+        # later resume cannot run a tool from a turn the user stopped.
+        self.assertEqual(c1_status, ToolInvocationStatus.UNKNOWN)
+        self.assertEqual(c2_status, ToolInvocationStatus.INTERRUPTED)
 
 
 if __name__ == "__main__":
