@@ -22,6 +22,7 @@ _HELP = """Commands:
   /help            Show this help
   /tools           List available tools
   /new, /clear     Start a fresh conversation
+  /resume [run]    Resume the current or specified waiting/paused run
   /status          Show the current run status
   /exit, /quit     Leave the session"""
 
@@ -131,10 +132,14 @@ async def run_interactive(runtime: AgentRuntime, console: Console) -> int:
     )
     while True:
         try:
-            line = await _read_line(console, _PROMPT)
-        except KeyboardInterrupt:
+            line = await _read_line(
+                console, _PROMPT, preserve_late_line_on_cancel=True
+            )
+        except BaseException as exc:
+            if not isinstance(exc, (KeyboardInterrupt, anyio.get_cancelled_exc_class())):
+                raise
             console.print()
-            return 0
+            continue
         if line is None:  # EOF (Ctrl-D)
             console.print()
             return 0
@@ -145,7 +150,7 @@ async def run_interactive(runtime: AgentRuntime, console: Console) -> int:
             return 0
         if prompt.startswith("/"):
             session_run_id = await _handle_slash(
-                runtime, console, prompt, session_run_id
+                runtime, console, prompt, session_run_id, allowed_tools
             )
             continue
         try:
@@ -215,43 +220,89 @@ async def run_single(runtime: AgentRuntime, console: Console, prompt: str) -> in
 
 async def run_resume(runtime: AgentRuntime, console: Console, run_id: str) -> int:
     """Resume a paused or waiting run with live rendering and approvals."""
-    # A run waiting for approval cannot be resumed until the approval is
-    # resolved; rather than crash on the ledger error, route into the approval
-    # UI. An INTERRUPTED run is not resumable at all — say so plainly.
-    pending_fn = getattr(runtime, "pending_approvals", None)
-    pending = await pending_fn(run_id) if pending_fn is not None else []
-    if pending:
-        result = await _resolve_approvals(
-            runtime,
-            console,
-            RunResult(answer="", run_id=run_id, status=RunStatus.WAITING_APPROVAL),
-            run_id,
-            set(),
-        )
-        status = result.status
-        console.print(
-            Text(f"run {run_id} · {status.value if status else 'unknown'}", style="dim")
-        )
-        return 0 if status == RunStatus.SUCCEEDED else 2
-    renderer = EventRenderer(console)
     try:
-        async with runtime.resume(run_id, listeners=[renderer]) as session:
-            result = await session.result()
+        result = await _resume_existing_run(runtime, console, run_id, set())
+    except _TurnForced as forced:
+        console.print(Text("⊘ interrupted (forced)", style="yellow"))
+        if forced.run_id:
+            console.print(Text(f"run {forced.run_id} · unknown", style="dim"))
+        return _EXIT_INTERRUPTED
     except LedgerError as exc:
         console.print(Text(f"Cannot resume run {run_id}: {exc}", style="bold red"))
         return 2
-    finally:
-        renderer.finish()
-    result = await _resolve_approvals(runtime, console, result, run_id, set())
+    if result is None:
+        return 2
     status = result.status
     console.print(
         Text(f"run {run_id} · {status.value if status else 'unknown'}", style="dim")
     )
     if status == RunStatus.SUCCEEDED:
         return 0
-    if status in {RunStatus.WAITING_APPROVAL, RunStatus.PAUSED}:
+    if status in {
+        RunStatus.INTERRUPTED,
+        RunStatus.WAITING_APPROVAL,
+        RunStatus.WAITING_TOOL_RESULT,
+        RunStatus.PAUSED,
+        RunStatus.RUNNING,
+    }:
         return 2
     return 1
+
+
+async def _resume_existing_run(
+    runtime: AgentRuntime,
+    console: Console,
+    run_id: str,
+    allowed_tools: set[str],
+) -> RunResult | None:
+    """Resume a durable control point using the foreground interrupt driver."""
+    status_fn = getattr(runtime, "status", None)
+    status: RunStatus | None = None
+    if status_fn is not None:
+        try:
+            status = await status_fn(run_id)
+        except Exception:
+            status = None
+    if status == RunStatus.INTERRUPTED:
+        console.print(
+            Text(
+                f"Run {run_id} was interrupted; send a new message to continue.",
+                style="yellow",
+            )
+        )
+        return RunResult(answer="", run_id=run_id, status=status)
+    if status == RunStatus.RUNNING:
+        console.print(
+            Text(
+                f"Run {run_id} is RUNNING but this process holds no live session;"
+                " cannot attach. Use `knuth recover` if it is truly stranded.",
+                style="yellow",
+            )
+        )
+        return RunResult(answer="", run_id=run_id, status=status)
+
+    # A run waiting for approval cannot be resumed until the approval is
+    # resolved; rather than crash on the ledger error, route into the approval UI.
+    pending_fn = getattr(runtime, "pending_approvals", None)
+    pending = await pending_fn(run_id) if pending_fn is not None else []
+    if pending:
+        return await _resolve_approvals(
+            runtime,
+            console,
+            RunResult(answer="", run_id=run_id, status=RunStatus.WAITING_APPROVAL),
+            run_id,
+            allowed_tools,
+        )
+
+    renderer = EventRenderer(console)
+    try:
+        async with runtime.resume(run_id, listeners=[renderer]) as session:
+            result = await _drive_session_to_result(
+                console, session, allow_interrupt=True
+            )
+    finally:
+        renderer.finish()
+    return await _resolve_approvals(runtime, console, result, run_id, allowed_tools)
 
 
 async def _drive_session_to_result(
@@ -359,7 +410,13 @@ async def _run_turn(
     finally:
         renderer.finish()
     run_id = result.run_id
-    result = await _resolve_approvals(runtime, console, result, run_id, allowed_tools)
+    try:
+        result = await _resolve_approvals(
+            runtime, console, result, run_id, allowed_tools
+        )
+    except _TurnForced as forced:
+        console.print(Text("⊘ interrupted (forced)", style="yellow"))
+        return forced.run_id or run_id, None
     return run_id, result
 
 
@@ -407,9 +464,13 @@ async def _resolve_approvals(
                 console.print(Text(f"  ✘ denied {label}", style="dim"))
         renderer = EventRenderer(console)
         renderer.remember_tool_names(tool_names)
-        async with runtime.resume(run_id, listeners=[renderer]) as session:
-            result = await session.result()
-        renderer.finish()
+        try:
+            async with runtime.resume(run_id, listeners=[renderer]) as session:
+                result = await _drive_session_to_result(
+                    console, session, allow_interrupt=True
+                )
+        finally:
+            renderer.finish()
     return result
 
 
@@ -427,9 +488,14 @@ def _print_approval_handoff(console: Console, run_id: str, pending: list) -> Non
 
 
 async def _handle_slash(
-    runtime: AgentRuntime, console: Console, command: str, session_run_id: str | None
+    runtime: AgentRuntime,
+    console: Console,
+    command: str,
+    session_run_id: str | None,
+    allowed_tools: set[str],
 ) -> str | None:
-    name = command.split()[0]
+    parts = command.split()
+    name = parts[0]
     if name == "/help":
         console.print(_HELP)
     elif name == "/tools":
@@ -448,9 +514,75 @@ async def _handle_slash(
         else:
             status = await runtime.status(session_run_id)
             console.print(Text(f"{session_run_id}: {status.value}", style="dim"))
+    elif name == "/resume":
+        target_run_id = parts[1] if len(parts) > 1 else session_run_id
+        if len(parts) > 2:
+            console.print(Text("Usage: /resume [run_id]", style="red"))
+            return session_run_id
+        if target_run_id is None:
+            target_run_id = await _find_single_actionable_run_id(runtime, console)
+        if target_run_id is None:
+            return session_run_id
+        try:
+            result = await _resume_existing_run(
+                runtime, console, target_run_id, allowed_tools
+            )
+        except _TurnForced as forced:
+            console.print(Text("⊘ interrupted (forced)", style="yellow"))
+            return forced.run_id or target_run_id
+        except LedgerError as exc:
+            console.print(
+                Text(f"Cannot resume run {target_run_id}: {exc}", style="bold red")
+            )
+            return target_run_id
+        if result is not None:
+            status = result.status
+            console.print(
+                Text(
+                    f"run {result.run_id} · {status.value if status else 'unknown'}",
+                    style="dim",
+                )
+            )
+            if status == RunStatus.INTERRUPTED:
+                console.print(
+                    Text("Send a new message to continue this run.", style="dim")
+                )
+            return result.run_id
+        return target_run_id
     else:
         console.print(Text(f"Unknown command: {name}", style="red"))
     return session_run_id
+
+
+async def _find_single_actionable_run_id(
+    runtime: AgentRuntime, console: Console
+) -> str | None:
+    runs_fn = getattr(runtime, "runs", None)
+    if runs_fn is None:
+        console.print(Text("No active run to resume.", style="dim"))
+        return None
+    try:
+        runs = await runs_fn(limit=20)
+    except Exception as exc:
+        console.print(
+            Text(
+                f"Could not list runs: {exc.__class__.__name__}: {exc}",
+                style="bold red",
+            )
+        )
+        return None
+    actionable = [run for run in runs if run.status in _ACTIONABLE_STATUSES]
+    if not actionable:
+        console.print(Text("No active run to resume.", style="dim"))
+        return None
+    if len(actionable) > 1:
+        console.print(
+            Text("Multiple runs need attention; use /resume <id>:", style="yellow")
+        )
+        for run in actionable:
+            console.print(Text(f"  {run.id} · {run.status.value}", style="dim"))
+        return None
+    return actionable[0].id
 
 
 _DECODE_ERROR = object()
@@ -504,6 +636,7 @@ class _ReadRequest:
     done: threading.Event = field(default_factory=threading.Event)
     line: object = None
     abandoned: bool = False
+    preserve_late_line: bool = False
     wake: object = None
 
     def resolve(self, line: object) -> None:
@@ -526,6 +659,7 @@ class _StdinReader:
 
     def __init__(self) -> None:
         self._requests: queue.Queue[_ReadRequest] = queue.Queue()
+        self._late_lines: queue.Queue[object] = queue.Queue()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._tty_prepared = False
@@ -535,6 +669,11 @@ class _StdinReader:
             self._tty_prepared = True
             _enable_utf8_erase()
         request = _ReadRequest()
+        try:
+            request.resolve(self._late_lines.get_nowait())
+            return request
+        except queue.Empty:
+            pass
         self._requests.put(request)
         self._ensure_thread()
         return request
@@ -550,10 +689,18 @@ class _StdinReader:
     def _loop(self) -> None:
         while True:
             request = self._requests.get()
+            try:
+                request.resolve(self._late_lines.get_nowait())
+                continue
+            except queue.Empty:
+                pass
             raw = self._read_one_line()
             if request.abandoned:
-                # The caller is gone; swallowing the line keeps it from
-                # leaking into (or tearing) the next read.
+                if request.preserve_late_line:
+                    self._late_lines.put(raw)
+                # Most abandoned reads drop their eventual line; top-level
+                # prompt Ctrl-C preserves it so the next prompt does not eat the
+                # user's first real command after the signal.
                 continue
             request.resolve(raw)
 
@@ -584,7 +731,9 @@ class _StdinReader:
 _stdin_reader = _StdinReader()
 
 
-async def _read_line(console: Console, prompt: str) -> str | None:
+async def _read_line(
+    console: Console, prompt: str, *, preserve_late_line_on_cancel: bool = False
+) -> str | None:
     """Read one line through the single stdin reader; None on EOF.
 
     The reader thread wakes this coroutine through a thread-safe callback, so
@@ -608,6 +757,7 @@ async def _read_line(console: Console, prompt: str) -> str | None:
             await ready.wait()
         except BaseException:
             request.abandoned = True
+            request.preserve_late_line = preserve_late_line_on_cancel
             raise
         if request.line is _DECODE_ERROR:
             console.print(

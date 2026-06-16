@@ -164,6 +164,30 @@ class ReentryStatusTests(unittest.TestCase):
         self.assertEqual(status, RunStatus.RUNNING)
         self.assertIn("no live session", output)
 
+    def test_resume_slash_refuses_interrupted_run(self) -> None:
+        class _Runtime:
+            resume_called = False
+
+            async def status(self, run_id: str) -> RunStatus:
+                return RunStatus.INTERRUPTED
+
+            def resume(self, run_id: str, *, listeners=()):
+                self.resume_called = True
+                raise AssertionError("interrupted runs must not resume")
+
+        async def scenario():
+            runtime = _Runtime()
+            console, buffer = _console()
+            adopted = await repl._handle_slash(
+                runtime, console, "/resume run-1", None, set()
+            )
+            return adopted, runtime.resume_called, buffer.getvalue()
+
+        adopted, resume_called, output = anyio.run(scenario)
+        self.assertEqual(adopted, "run-1")
+        self.assertFalse(resume_called)
+        self.assertIn("was interrupted", output)
+
 
 class _DummyClient:
     model = "dummy"

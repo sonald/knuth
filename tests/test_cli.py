@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import io
 import tempfile
@@ -326,6 +327,79 @@ class CliTests(unittest.TestCase):
         self.assertIn("Knuth agent ready", output.getvalue())
         self.assertIn("real-ish: hello", output.getvalue())
 
+    def test_interactive_prompt_ctrl_c_stays_in_repl(self) -> None:
+        output = io.StringIO()
+
+        async def runtime_factory() -> _StreamingFakeRuntime:
+            return _StreamingFakeRuntime()
+
+        with (
+            patch(
+                "knuth_cli.repl._read_line",
+                side_effect=[KeyboardInterrupt, "/exit"],
+            ) as read_line,
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["run"], runtime_factory=runtime_factory)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(read_line.call_count, 2)
+        self.assertIn("Knuth agent ready", output.getvalue())
+
+    def test_interactive_prompt_cancellation_stays_in_repl(self) -> None:
+        output = io.StringIO()
+
+        async def runtime_factory() -> _StreamingFakeRuntime:
+            return _StreamingFakeRuntime()
+
+        with (
+            patch(
+                "knuth_cli.repl._read_line",
+                side_effect=[asyncio.CancelledError(), "/exit"],
+            ) as read_line,
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["run"], runtime_factory=runtime_factory)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(read_line.call_count, 2)
+        self.assertIn("Knuth agent ready", output.getvalue())
+
+    def test_interactive_resume_slash_command_resumes_current_run(self) -> None:
+        output = io.StringIO()
+        input_stream = io.StringIO("hello\n/resume\n/exit\n")
+
+        async def runtime_factory() -> _StreamingFakeRuntime:
+            return _StreamingFakeRuntime()
+
+        with (
+            patch("sys.stdin", input_stream),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["run"], runtime_factory=runtime_factory)
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("real-ish: hello", output.getvalue())
+        self.assertIn("real-ish: resumed", output.getvalue())
+        self.assertIn("run run-1 · succeeded", output.getvalue())
+
+    def test_interactive_resume_slash_command_accepts_run_id(self) -> None:
+        output = io.StringIO()
+        input_stream = io.StringIO("/resume run-2\n/exit\n")
+
+        async def runtime_factory() -> _StreamingFakeRuntime:
+            return _StreamingFakeRuntime()
+
+        with (
+            patch("sys.stdin", input_stream),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["run"], runtime_factory=runtime_factory)
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("real-ish: resumed", output.getvalue())
+        self.assertIn("run run-2 · succeeded", output.getvalue())
+
     def test_interactive_run_reports_turn_errors_without_crashing_repl(self) -> None:
         output = io.StringIO()
         input_stream = io.StringIO("hello\n/exit\n")
@@ -482,6 +556,22 @@ class StdinReaderTests(unittest.TestCase):
 
         self.assertFalse(first.done.is_set())
         self.assertEqual(second.line, "fresh line")
+
+    def test_preserved_abandoned_request_hands_line_to_next_read(self) -> None:
+        from knuth_cli.repl import _StdinReader
+
+        fake = _BlockingFakeStdin()
+        reader = _StdinReader()
+        with patch("sys.stdin", fake):
+            first = reader.submit()
+            first.abandoned = True
+            first.preserve_late_line = True
+            second = reader.submit()
+            fake.push("next prompt line\n")
+            self.assertTrue(second.done.wait(timeout=5))
+
+        self.assertFalse(first.done.is_set())
+        self.assertEqual(second.line, "next prompt line")
 
     def test_reads_are_served_strictly_in_order(self) -> None:
         from knuth_cli.repl import _StdinReader
