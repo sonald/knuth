@@ -16,7 +16,10 @@ from pydantic import BaseModel
 from knuth.core.events import (
     DurableRuntimeEventDraft,
     StoredRuntimeEvent,
+    ledger_message_id,
     parse_stored_runtime_event_json,
+    rewrite_id_for_begin_seq,
+    rewrite_message_id,
     store_runtime_event,
 )
 from knuth.core.invocations import (
@@ -32,7 +35,9 @@ from knuth.core.runtime_events import (
     ApprovalRequestedDraft,
     ApprovalResolvedDraft,
     ConversationNoticeDraft,
+    MessageRewriteAnchor,
     MessageRewriteAnchorDraft,
+    MessageRewriteMessage,
     MessageRewriteMessageDraft,
     ModelAbortedDraft,
     ModelCompletedDraft,
@@ -45,6 +50,7 @@ from knuth.core.runtime_events import (
     RunResumedDraft,
     RunSucceededDraft,
     StepStartedDraft,
+    TapePosition,
     ToolBatchClosedDraft,
     ToolBatchPlannedDraft,
     ToolInvocationAwaitingExternalResultDraft,
@@ -169,6 +175,11 @@ RESUMABLE_STATUSES = frozenset(
     }
 )
 
+SQLITE_LEDGER_SCHEMA_VERSION = 2
+_BREAKING_SCHEMA_MESSAGE = (
+    "breaking ledger schema: remove the legacy database or use a new one"
+)
+
 
 @dataclass
 class _RewriteRecord:
@@ -182,7 +193,7 @@ class _RewriteRecord:
 @dataclass
 class _RewriteValidationState:
     rewrites: dict[str, _RewriteRecord] = field(default_factory=dict)
-    open_rewrites: dict[str, MessageRewriteAnchorDraft] = field(default_factory=dict)
+    open_rewrites: dict[str, MessageRewriteAnchor] = field(default_factory=dict)
     open_message_ids: dict[str, tuple[str, ...]] = field(default_factory=dict)
     message_ids: set[str] = field(default_factory=set)
     projected_messages: dict[str, InferenceMessage] = field(default_factory=dict)
@@ -223,7 +234,7 @@ def _event_message_id(event: StoredRuntimeEvent) -> str | None:
         "conversation.notice",
         "verification.failed",
     }:
-        return f"m:{event.seq}"
+        return ledger_message_id(event.seq)
     return None
 
 
@@ -328,46 +339,38 @@ def _fold_message_rewrite_state(
 
 
 def _validate_rewrite_draft_batch(drafts: list[DurableRuntimeEventDraft]) -> None:
-    rewrite_drafts = [
-        draft
-        for draft in drafts
-        if isinstance(draft, MessageRewriteAnchorDraft | MessageRewriteMessageDraft)
-    ]
-    if not rewrite_drafts:
-        return
-    grouped: dict[str, list[DurableRuntimeEventDraft]] = {}
-    for draft in rewrite_drafts:
-        grouped.setdefault(draft.rewrite_id, []).append(draft)
-    for rewrite_id, group in grouped.items():
-        anchors = [
-            draft for draft in group if isinstance(draft, MessageRewriteAnchorDraft)
-        ]
-        begins = [draft for draft in anchors if draft.kind == "begin"]
-        ends = [draft for draft in anchors if draft.kind == "end"]
-        _require(len(begins) == 1, f"rewrite {rewrite_id} requires one begin anchor")
-        _require(len(ends) == 1, f"rewrite {rewrite_id} requires one end anchor")
-        begin_index = next(
-            index for index, draft in enumerate(drafts) if draft is begins[0]
+    index = 0
+    while index < len(drafts):
+        draft = drafts[index]
+        if not isinstance(draft, MessageRewriteAnchorDraft | MessageRewriteMessageDraft):
+            index += 1
+            continue
+        _require(
+            isinstance(draft, MessageRewriteAnchorDraft) and draft.kind == "begin",
+            "message rewrite block must start with a begin anchor",
         )
-        end_index = next(
-            index for index, draft in enumerate(drafts) if draft is ends[0]
+        begin = draft
+        cursor = index + 1
+        while cursor < len(drafts) and isinstance(
+            drafts[cursor], MessageRewriteMessageDraft
+        ):
+            cursor += 1
+        _require(
+            cursor < len(drafts)
+            and isinstance(drafts[cursor], MessageRewriteAnchorDraft)
+            and drafts[cursor].kind == "end",
+            "message rewrite block requires a closing end anchor",
+        )
+        end = drafts[cursor]
+        _require(
+            begin.middleware == end.middleware,
+            "message rewrite block middleware mismatch",
         )
         _require(
-            begin_index < end_index,
-            f"rewrite {rewrite_id} begin anchor must precede end anchor",
+            begin.operation == end.operation,
+            "message rewrite block operation mismatch",
         )
-        for draft in group:
-            index = next(
-                idx for idx, candidate in enumerate(drafts) if candidate is draft
-            )
-            _require(
-                begin_index <= index <= end_index,
-                f"rewrite {rewrite_id} events must be contiguous in apply_many",
-            )
-        _require(
-            end_index - begin_index + 1 == len(group),
-            f"rewrite {rewrite_id} events must be a contiguous apply_many block",
-        )
+        index = cursor + 1
 
 
 @dataclass
@@ -1166,7 +1169,12 @@ class _LedgerMixin[TxnT]:
         return redact_text(content) if redact_text is not None else content
 
     def _apply_in_txn(
-        self, txn: TxnT, run_id: str, draft: DurableRuntimeEventDraft
+        self,
+        txn: TxnT,
+        run_id: str,
+        draft: DurableRuntimeEventDraft,
+        *,
+        generated_fields: dict[str, Any] | None = None,
     ) -> StoredRuntimeEvent:
         view = self._load_view(
             txn,
@@ -1177,10 +1185,15 @@ class _LedgerMixin[TxnT]:
         )
         seq = (view.run.last_seq if view.run else 0) + 1
         now = utc_now()
-        mutations = reduce_run_event(view, draft, run_id=run_id, seq=seq, now=now)
         event = store_runtime_event(
-            run_id, seq, draft, event_id=f"evt_{uuid4().hex}", created_at=now
+            run_id,
+            seq,
+            draft,
+            event_id=f"evt_{uuid4().hex}",
+            created_at=now,
+            generated_fields=generated_fields,
         )
+        mutations = reduce_run_event(view, event, run_id=run_id, seq=seq, now=now)
         self._persist(txn, run_id, event, mutations)
         return event
 
@@ -1193,7 +1206,57 @@ class _LedgerMixin[TxnT]:
         # Within one transaction each apply persists into ``txn``; the next
         # ``_load_view`` reads those uncommitted writes, so per-draft invariants
         # (seq, batch state) fold in order.
-        return [self._apply_in_txn(txn, run_id, draft) for draft in drafts]
+        events: list[StoredRuntimeEvent] = []
+        index = 0
+        while index < len(drafts):
+            draft = drafts[index]
+            if not isinstance(
+                draft, MessageRewriteAnchorDraft | MessageRewriteMessageDraft
+            ):
+                events.append(self._apply_in_txn(txn, run_id, draft))
+                index += 1
+                continue
+            _require(
+                isinstance(draft, MessageRewriteAnchorDraft) and draft.kind == "begin",
+                "message rewrite block must start with a begin anchor",
+            )
+            end_index = index + 1
+            while end_index < len(drafts) and isinstance(
+                drafts[end_index], MessageRewriteMessageDraft
+            ):
+                end_index += 1
+            block = drafts[index : end_index + 1]
+            events.extend(self._apply_rewrite_block_in_txn(txn, run_id, block))
+            index = end_index + 1
+        return events
+
+    def _apply_rewrite_block_in_txn(
+        self,
+        txn: TxnT,
+        run_id: str,
+        drafts: list[DurableRuntimeEventDraft],
+    ) -> list[StoredRuntimeEvent]:
+        view = self._load_view(txn, run_id, with_last_tool_call_ids=False)
+        begin_seq = (view.run.last_seq if view.run else 0) + 1
+        rewrite_id = rewrite_id_for_begin_seq(begin_seq)
+        events: list[StoredRuntimeEvent] = []
+        message_ordinal = 0
+        for draft in drafts:
+            generated_fields: dict[str, Any] = {"rewrite_id": rewrite_id}
+            if isinstance(draft, MessageRewriteMessageDraft):
+                generated_fields["message_id"] = rewrite_message_id(
+                    rewrite_id, message_ordinal
+                )
+                message_ordinal += 1
+            events.append(
+                self._apply_in_txn(
+                    txn,
+                    run_id,
+                    draft,
+                    generated_fields=generated_fields,
+                )
+            )
+        return events
 
     async def _transact(
         self, run_id: str, draft: DurableRuntimeEventDraft
@@ -1487,9 +1550,20 @@ class SQLiteRunLedger(_LedgerMixin[sqlite3.Connection]):
             or "last_event_seq" not in invocation_columns
             or "tool_call_id" not in approval_columns
         ):
-            raise RuntimeError(
-                "breaking ledger schema: remove the legacy database or use a new one"
+            raise RuntimeError(_BREAKING_SCHEMA_MESSAGE)
+        version = conn.execute("pragma user_version").fetchone()[0]
+        if version == 0:
+            has_rows = any(
+                conn.execute(f"select exists(select 1 from {table} limit 1)").fetchone()[
+                    0
+                ]
+                for table in ("runs", "events")
             )
+            if not has_rows:
+                conn.execute(f"pragma user_version = {SQLITE_LEDGER_SCHEMA_VERSION}")
+                version = SQLITE_LEDGER_SCHEMA_VERSION
+        if version != SQLITE_LEDGER_SCHEMA_VERSION:
+            raise RuntimeError(_BREAKING_SCHEMA_MESSAGE)
 
     @_threaded
     def _transact(

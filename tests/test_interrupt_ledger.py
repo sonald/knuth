@@ -38,7 +38,7 @@ from knuth.core.runtime_events import (
 )
 from knuth.core.types import RunStatus
 from knuth_runtime import LedgerError, MemoryRunLedger
-from knuth_runtime.context import reconstruct_messages_from_events
+from knuth_runtime.context import raw_ledger_messages_from_events
 
 
 def _snapshot() -> ContextSnapshot:
@@ -288,7 +288,7 @@ class ConversationNoticeTests(unittest.TestCase):
                 ConversationNoticeDraft(kind="interrupted", content="stopped by user"),
             )
             events = await ledger.list_events(run_id)
-            return await reconstruct_messages_from_events(
+            return await raw_ledger_messages_from_events(
                 events, ledger.get_artifact_text
             )
 

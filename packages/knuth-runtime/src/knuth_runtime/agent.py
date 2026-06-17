@@ -26,7 +26,7 @@ from knuth_runtime.context import (
     ContextRedactor,
     SystemSectionProvider,
     project_messages_from_events,
-    reconstruct_messages_from_events,
+    raw_ledger_messages_from_events,
 )
 from knuth_runtime.ledger import (
     EventRedactor,
@@ -243,7 +243,7 @@ class AgentRuntime:
 
     async def messages(self, run_id: str) -> list[InferenceMessage]:
         events = await self._services.ledger.list_events(run_id)
-        return await reconstruct_messages_from_events(
+        return await raw_ledger_messages_from_events(
             events, self._services.ledger.get_artifact_text
         )
 
@@ -283,7 +283,6 @@ class AgentRuntime:
                     record["replacement_messages"].append(
                         {
                             "message_id": event.message_id,
-                            "index": event.index,
                             "role": event.message.role.value,
                             "content": event.message.content,
                             "tool_call_id": event.message.tool_call_id,

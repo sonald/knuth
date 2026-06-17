@@ -98,6 +98,9 @@ from knuth.core.runtime_events import (
     UserMessageDraft,
     VerificationFailed,
     VerificationFailedDraft,
+    ledger_message_id,
+    rewrite_id_for_begin_seq,
+    rewrite_message_id,
 )
 
 __all__ = [
@@ -194,6 +197,9 @@ __all__ = [
     "VerificationFailed",
     "VerificationFailedDraft",
     "emit_transient_runtime_event",
+    "ledger_message_id",
     "parse_stored_runtime_event_json",
+    "rewrite_id_for_begin_seq",
+    "rewrite_message_id",
     "store_runtime_event",
 ]

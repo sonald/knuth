@@ -43,6 +43,18 @@ class TapePosition(KnuthModel):
     ] | None = None
 
 
+def ledger_message_id(seq: int) -> str:
+    return f"m:{seq}"
+
+
+def rewrite_id_for_begin_seq(seq: int) -> str:
+    return f"rw:{seq}"
+
+
+def rewrite_message_id(rewrite_id: str, ordinal: int) -> str:
+    return f"{rewrite_id}#{ordinal}"
+
+
 class RuntimeEventDraftBase(KnuthModel):
     type: str
     durability: EventDurability = EventDurability.DURABLE
@@ -218,7 +230,6 @@ class VerificationFailedDraft(RuntimeEventDraftBase):
 
 class MessageRewriteAnchorDraft(RuntimeEventDraftBase):
     type: Literal["message.rewrite_anchor"] = "message.rewrite_anchor"
-    rewrite_id: str
     kind: Literal["begin", "end"]
     middleware: str
     operation: Literal["insert", "replace"]
@@ -229,10 +240,7 @@ class MessageRewriteAnchorDraft(RuntimeEventDraftBase):
 
 class MessageRewriteMessageDraft(RuntimeEventDraftBase):
     type: Literal["message.rewrite_message"] = "message.rewrite_message"
-    rewrite_id: str
-    index: int
     message: InferenceMessage
-    message_id: str
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -448,11 +456,12 @@ class VerificationFailed(VerificationFailedDraft, StoredRuntimeEventBase):
 
 
 class MessageRewriteAnchor(MessageRewriteAnchorDraft, StoredRuntimeEventBase):
-    pass
+    rewrite_id: str
 
 
 class MessageRewriteMessage(MessageRewriteMessageDraft, StoredRuntimeEventBase):
-    pass
+    rewrite_id: str
+    message_id: str
 
 
 class ModelReasoningDelta(ModelReasoningDeltaDraft, TransientRuntimeEventBase):

@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import sqlite3
 from pathlib import Path
 
 import anyio
@@ -57,6 +58,11 @@ from knuth_runtime import (
     MemoryRunLedger,
     AgentsMDMiddleware,
     ContextCompactionMiddleware,
+    InsertPatch,
+    MessageMiddleware,
+    MessageMiddlewareCheckpoint,
+    MessageMiddlewareContext,
+    MessageMiddlewareRunner,
     RegexSecretRedactor,
     SQLiteRunLedger,
     build_memory_runtime,
@@ -64,9 +70,10 @@ from knuth_runtime import (
 )
 from knuth_runtime.context import (
     StaticSectionProvider,
+    TapeMessage,
     assemble_preamble,
     project_messages_from_events,
-    reconstruct_messages_from_events,
+    raw_ledger_messages_from_events,
 )
 from knuth_runtime.loop import EMPTY_ANSWER_FEEDBACK, OBSERVATION_INLINE_LIMIT
 from knuth_runtime.observation import RuntimeEventInterest, RuntimeObservationError
@@ -138,7 +145,6 @@ class RunLedgerTests(unittest.TestCase):
                 run.id,
                 [
                     MessageRewriteAnchorDraft(
-                        rewrite_id="rewrite-1",
                         kind="begin",
                         middleware="context_compaction",
                         operation="replace",
@@ -146,16 +152,12 @@ class RunLedgerTests(unittest.TestCase):
                         metadata={"reason": "test"},
                     ),
                     MessageRewriteMessageDraft(
-                        rewrite_id="rewrite-1",
-                        index=0,
-                        message_id="mw:rewrite-1:0",
                         message=InferenceMessage(
                             role=InferenceRole.USER,
                             content="Earlier context summary: raw message",
                         ),
                     ),
                     MessageRewriteAnchorDraft(
-                        rewrite_id="rewrite-1",
                         kind="end",
                         middleware="context_compaction",
                         operation="replace",
@@ -181,6 +183,46 @@ class RunLedgerTests(unittest.TestCase):
                 "message.rewrite_anchor",
             ],
         )
+        self.assertEqual(events_after_refold[-3].rewrite_id, "rw:3")
+        self.assertEqual(events_after_refold[-2].rewrite_id, "rw:3")
+        self.assertEqual(events_after_refold[-2].message_id, "rw:3#0")
+
+    def test_message_rewrite_preserves_inference_message_name(self) -> None:
+        ledger = MemoryRunLedger()
+
+        async def scenario():
+            run = await ledger.create_run("hello")
+            await ledger.apply(run.id, UserMessageDraft(content="raw message"))
+            await ledger.apply_many(
+                run.id,
+                [
+                    MessageRewriteAnchorDraft(
+                        kind="begin",
+                        middleware="context_compaction",
+                        operation="replace",
+                        suppresses=["m:2"],
+                    ),
+                    MessageRewriteMessageDraft(
+                        message=InferenceMessage(
+                            role=InferenceRole.USER,
+                            content="named replacement",
+                            name="context_compaction",
+                        ),
+                    ),
+                    MessageRewriteAnchorDraft(
+                        kind="end",
+                        middleware="context_compaction",
+                        operation="replace",
+                    ),
+                ],
+            )
+            return await project_messages_from_events(
+                await ledger.list_events(run.id), ledger.get_artifact_text
+            )
+
+        messages = anyio.run(scenario)
+        self.assertEqual(messages[0].content, "named replacement")
+        self.assertEqual(messages[0].name, "context_compaction")
 
     def test_message_rewrite_rejects_conflicting_replace(self) -> None:
         ledger = MemoryRunLedger()
@@ -190,23 +232,18 @@ class RunLedgerTests(unittest.TestCase):
             await ledger.apply(run.id, UserMessageDraft(content="raw message"))
             patch = [
                 MessageRewriteAnchorDraft(
-                    rewrite_id="rewrite-1",
                     kind="begin",
                     middleware="context_compaction",
                     operation="replace",
                     suppresses=["m:2"],
                 ),
                 MessageRewriteMessageDraft(
-                    rewrite_id="rewrite-1",
-                    index=0,
-                    message_id="mw:rewrite-1:0",
                     message=InferenceMessage(
                         role=InferenceRole.USER,
                         content="summary",
                     ),
                 ),
                 MessageRewriteAnchorDraft(
-                    rewrite_id="rewrite-1",
                     kind="end",
                     middleware="context_compaction",
                     operation="replace",
@@ -218,23 +255,18 @@ class RunLedgerTests(unittest.TestCase):
                     run.id,
                     [
                         MessageRewriteAnchorDraft(
-                            rewrite_id="rewrite-2",
                             kind="begin",
                             middleware="context_compaction",
                             operation="replace",
                             suppresses=["m:2"],
                         ),
                         MessageRewriteMessageDraft(
-                            rewrite_id="rewrite-2",
-                            index=0,
-                            message_id="mw:rewrite-2:0",
                             message=InferenceMessage(
                                 role=InferenceRole.USER,
                                 content="other summary",
                             ),
                         ),
                         MessageRewriteAnchorDraft(
-                            rewrite_id="rewrite-2",
                             kind="end",
                             middleware="context_compaction",
                             operation="replace",
@@ -254,22 +286,17 @@ class RunLedgerTests(unittest.TestCase):
                 run.id,
                 [
                     MessageRewriteAnchorDraft(
-                        rewrite_id="insert-1",
                         kind="begin",
                         middleware="agents_md",
                         operation="insert",
                         position=TapePosition(kind="before", target_id="m:3"),
                     ),
                     MessageRewriteMessageDraft(
-                        rewrite_id="insert-1",
-                        index=0,
-                        message_id="mw:insert-1:0",
                         message=InferenceMessage(
                             role=InferenceRole.USER, content="middle"
                         ),
                     ),
                     MessageRewriteAnchorDraft(
-                        rewrite_id="insert-1",
                         kind="end",
                         middleware="agents_md",
                         operation="insert",
@@ -283,22 +310,17 @@ class RunLedgerTests(unittest.TestCase):
                     run.id,
                     [
                         MessageRewriteAnchorDraft(
-                            rewrite_id="replace-1",
                             kind="begin",
                             middleware="context_compaction",
                             operation="replace",
                             suppresses=["m:2", "m:3"],
                         ),
                         MessageRewriteMessageDraft(
-                            rewrite_id="replace-1",
-                            index=0,
-                            message_id="mw:replace-1:0",
                             message=InferenceMessage(
                                 role=InferenceRole.USER, content="summary"
                             ),
                         ),
                         MessageRewriteAnchorDraft(
-                            rewrite_id="replace-1",
                             kind="end",
                             middleware="context_compaction",
                             operation="replace",
@@ -318,7 +340,6 @@ class RunLedgerTests(unittest.TestCase):
                 await ledger.apply(
                     run.id,
                     MessageRewriteAnchorDraft(
-                        rewrite_id="rewrite-1",
                         kind="begin",
                         middleware="context_compaction",
                         operation="replace",
@@ -343,6 +364,21 @@ class RunLedgerTests(unittest.TestCase):
         self.assertEqual([event.type for event in events], ["run.created", "user.message"])
         self.assertEqual(state.run.last_seq, 2)
         self.assertIsNone(state.open_batch)
+
+    def test_sqlite_ledger_rejects_legacy_unversioned_database_with_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir, "knuth.db")
+            ledger = SQLiteRunLedger(db_path)
+
+            async def scenario():
+                await ledger.create_run("hello")
+
+            anyio.run(scenario)
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("pragma user_version = 0")
+
+            with self.assertRaisesRegex(RuntimeError, "breaking ledger schema"):
+                SQLiteRunLedger(db_path)
 
     def test_memory_and_sqlite_ledgers_project_the_same_state(self) -> None:
         # Both implementations share the apply orchestration in _LedgerMixin;
@@ -832,16 +868,12 @@ class RefoldTests(unittest.TestCase):
                 run_id,
                 [
                     MessageRewriteAnchorDraft(
-                        rewrite_id="redact-c1",
                         kind="begin",
                         middleware="tool_result_redaction",
                         operation="replace",
                         suppresses=[target_id],
                     ),
                     MessageRewriteMessageDraft(
-                        rewrite_id="redact-c1",
-                        index=0,
-                        message_id="mw:redact-c1:0",
                         message=InferenceMessage(
                             role=InferenceRole.TOOL_RESULT,
                             tool_call_id="c1",
@@ -850,7 +882,6 @@ class RefoldTests(unittest.TestCase):
                         ),
                     ),
                     MessageRewriteAnchorDraft(
-                        rewrite_id="redact-c1",
                         kind="end",
                         middleware="tool_result_redaction",
                         operation="replace",
@@ -888,16 +919,12 @@ class RefoldTests(unittest.TestCase):
                     run_id,
                     [
                         MessageRewriteAnchorDraft(
-                            rewrite_id="bad-redact",
                             kind="begin",
                             middleware="tool_result_redaction",
                             operation="replace",
                             suppresses=[f"m:{tool_event.seq}"],
                         ),
                         MessageRewriteMessageDraft(
-                            rewrite_id="bad-redact",
-                            index=0,
-                            message_id="mw:bad-redact:0",
                             message=InferenceMessage(
                                 role=InferenceRole.TOOL_RESULT,
                                 tool_call_id="other",
@@ -906,7 +933,6 @@ class RefoldTests(unittest.TestCase):
                             ),
                         ),
                         MessageRewriteAnchorDraft(
-                            rewrite_id="bad-redact",
                             kind="end",
                             middleware="tool_result_redaction",
                             operation="replace",
@@ -1073,7 +1099,7 @@ class EventDrivenRuntimeTests(unittest.TestCase):
 
             async def reconstruct():
                 ledger = runtime._services.ledger
-                return await reconstruct_messages_from_events(
+                return await raw_ledger_messages_from_events(
                     events, ledger.get_artifact_text
                 )
 
@@ -1384,6 +1410,106 @@ class EventDrivenRuntimeTests(unittest.TestCase):
         self.assertNotIn("message.rewrite_anchor", [event.type for event in events])
         step = next(event for event in events if event.type == "step.started")
         self.assertEqual(step.snapshot.message_count, len(client.captured_messages[0]))
+
+    def test_ephemeral_rewrites_from_same_named_middlewares_get_unique_ids(self) -> None:
+        class SameNamedMiddleware(MessageMiddleware):
+            name = "same_name"
+            checkpoints = {MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST}
+
+            def __init__(self, content: str, priority: int) -> None:
+                self.content = content
+                self.priority = priority
+
+            async def process(
+                self,
+                ctx: MessageMiddlewareContext,
+                tape,
+            ):
+                return [
+                    InsertPatch(
+                        position=TapePosition(
+                            kind="boundary",
+                            boundary="conversation_start",
+                        ),
+                        items=[
+                            InferenceMessage(
+                                role=InferenceRole.SYSTEM,
+                                content=self.content,
+                            )
+                        ],
+                        durable=False,
+                    )
+                ]
+
+        async def scenario():
+            ledger = MemoryRunLedger()
+            run = await ledger.create_run("hello")
+            await ledger.apply(run.id, UserMessageDraft(content="hello"))
+            runner = MessageMiddlewareRunner(
+                ledger,
+                [
+                    SameNamedMiddleware("first", priority=1),
+                    SameNamedMiddleware("second", priority=2),
+                ],
+            )
+            result = await runner.run_checkpoint(
+                run.id, MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST
+            )
+            return [
+                item.id
+                for record in result.ephemeral_records
+                for item in record.messages
+                if isinstance(item, TapeMessage)
+            ]
+
+        message_ids = anyio.run(scenario)
+        self.assertEqual(
+            message_ids,
+            [
+                "eph:before_model_request:0#0",
+                "eph:before_model_request:1#0",
+            ],
+        )
+
+    def test_patch_metadata_rejects_runtime_reserved_keys(self) -> None:
+        class BadMetadataMiddleware(MessageMiddleware):
+            name = "bad_metadata"
+            priority = 1
+            checkpoints = {MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST}
+
+            async def process(
+                self,
+                ctx: MessageMiddlewareContext,
+                tape,
+            ):
+                return [
+                    InsertPatch(
+                        position=TapePosition(
+                            kind="boundary",
+                            boundary="conversation_start",
+                        ),
+                        items=[
+                            InferenceMessage(
+                                role=InferenceRole.SYSTEM,
+                                content="bad",
+                            )
+                        ],
+                        durable=False,
+                        metadata={"rewrite_id": "spoof"},
+                    )
+                ]
+
+        async def scenario():
+            ledger = MemoryRunLedger()
+            run = await ledger.create_run("hello")
+            await ledger.apply(run.id, UserMessageDraft(content="hello"))
+            runner = MessageMiddlewareRunner(ledger, [BadMetadataMiddleware()])
+            await runner.run_checkpoint(
+                run.id, MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST
+            )
+
+        with self.assertRaisesRegex(ValueError, "runtime-reserved keys: rewrite_id"):
+            anyio.run(scenario)
 
     def test_model_context_messages_allows_open_tool_batch(self) -> None:
         async def scenario():
@@ -2017,7 +2143,7 @@ class StreamingRuntimeTests(unittest.TestCase):
                 second = await session.result()
             events = await runtime.events(first.run_id)
             ledger = runtime._services.ledger
-            messages = await reconstruct_messages_from_events(
+            messages = await raw_ledger_messages_from_events(
                 events, ledger.get_artifact_text
             )
             return first, second, messages

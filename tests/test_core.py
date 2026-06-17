@@ -120,7 +120,6 @@ class CoreModelTests(unittest.TestCase):
             "run-1",
             4,
             MessageRewriteAnchorDraft(
-                rewrite_id="rewrite-1",
                 kind="begin",
                 middleware="context_compaction",
                 operation="replace",
@@ -128,6 +127,7 @@ class CoreModelTests(unittest.TestCase):
             ),
             event_id="evt-rewrite",
             created_at="2026-06-16T00:00:00Z",
+            generated_fields={"rewrite_id": "rw:4"},
         )
 
         parsed = parse_stored_runtime_event_json(stored.model_dump_json())

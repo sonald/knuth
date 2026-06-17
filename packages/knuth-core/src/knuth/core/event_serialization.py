@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated, get_args
+from typing import Annotated, Any, get_args
 
 from pydantic import Field, TypeAdapter
 
@@ -44,10 +44,14 @@ def store_runtime_event(
     *,
     event_id: str,
     created_at: str,
+    generated_fields: dict[str, Any] | None = None,
 ) -> StoredRuntimeEvent:
     event_class = _STORED_EVENT_BY_TYPE[event.type]
+    payload = event.model_dump()
+    if generated_fields:
+        payload.update(generated_fields)
     return event_class(
-        **event.model_dump(),
+        **payload,
         id=event_id,
         run_id=run_id,
         seq=seq,

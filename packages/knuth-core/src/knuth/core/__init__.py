@@ -11,6 +11,9 @@ from knuth.core.events import (
     TapePosition,
     TransientRuntimeEvent,
     TransientRuntimeEventDraft,
+    ledger_message_id,
+    rewrite_id_for_begin_seq,
+    rewrite_message_id,
 )
 from knuth.core.invocations import (
     Approval,
@@ -69,4 +72,7 @@ __all__ = [
     "TransientRuntimeEventDraft",
     "approval_id_for",
     "args_hash_for",
+    "ledger_message_id",
+    "rewrite_id_for_begin_seq",
+    "rewrite_message_id",
 ]
