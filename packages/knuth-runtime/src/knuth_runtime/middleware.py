@@ -1,0 +1,518 @@
+from __future__ import annotations
+
+import hashlib
+from abc import ABC, abstractmethod
+from enum import StrEnum
+from pathlib import Path
+from typing import Any, Literal
+
+from pydantic import Field
+
+from knuth.core.messages import InferenceRole
+from knuth.core.runtime_events import (
+    MessageRewriteAnchorDraft,
+    MessageRewriteMessageDraft,
+    TapePosition,
+)
+from knuth.core.types import KnuthModel
+from knuth_runtime.context import (
+    MessageRewriteRecord,
+    MessageTape,
+    RunContext,
+    TapeMessage,
+    apply_rewrite_records_to_tape,
+    project_tape_messages,
+    reconstruct_message_tape_from_events,
+    validate_provider_messages,
+)
+from knuth_runtime.ledger import RunLedger
+
+
+class MessageMiddlewareCheckpoint(StrEnum):
+    AFTER_TOOL_RESULT_COMMITTED = "after_tool_result_committed"
+    AFTER_TURN_CLOSED = "after_turn_closed"
+    BEFORE_MODEL_REQUEST = "before_model_request"
+
+
+class ContextBudget(KnuthModel):
+    max_input_tokens: int
+    reserved_output_tokens: int
+    target_headroom_tokens: int
+
+
+class MessageMiddlewareContext(KnuthModel):
+    run_id: str
+    checkpoint: MessageMiddlewareCheckpoint
+    budget: ContextBudget | None = None
+
+
+class InsertPatch(KnuthModel):
+    operation: Literal["insert"] = "insert"
+    position: TapePosition
+    items: list[TapeMessage]
+    durable: bool = False
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReplacePatch(KnuthModel):
+    operation: Literal["replace"] = "replace"
+    target_ids: list[str]
+    replacement_items: list[TapeMessage]
+    durable: bool = True
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+MessageTapePatch = InsertPatch | ReplacePatch
+
+
+class MessageMiddleware(ABC):
+    name: str
+    priority: int = 100
+    checkpoints: set[MessageMiddlewareCheckpoint]
+
+    @abstractmethod
+    async def process(
+        self,
+        ctx: MessageMiddlewareContext,
+        tape: MessageTape,
+    ) -> list[MessageTapePatch]:
+        ...
+
+
+class MessageMiddlewareRunResult(KnuthModel):
+    ephemeral_records: list[MessageRewriteRecord] = Field(default_factory=list)
+
+
+class MessageMiddlewareRunner:
+    def __init__(
+        self,
+        ledger: RunLedger,
+        middlewares: list[MessageMiddleware] | None = None,
+    ) -> None:
+        self.ledger = ledger
+        self.middlewares = sorted(middlewares or [], key=lambda item: item.priority)
+
+    async def run_checkpoint(
+        self,
+        run_id: str,
+        checkpoint: MessageMiddlewareCheckpoint,
+        *,
+        budget: ContextBudget | None = None,
+    ) -> MessageMiddlewareRunResult:
+        result = MessageMiddlewareRunResult()
+        candidates = [
+            middleware
+            for middleware in self.middlewares
+            if checkpoint in middleware.checkpoints
+        ]
+        if not candidates:
+            return result
+
+        ctx = MessageMiddlewareContext(
+            run_id=run_id,
+            checkpoint=checkpoint,
+            budget=budget,
+        )
+        events = await self.ledger.list_events(run_id)
+        tape = await reconstruct_message_tape_from_events(
+            events, self.ledger.get_artifact_text
+        )
+        for middleware in candidates:
+            patches = await middleware.process(ctx, tape)
+            for patch in patches:
+                self._validate_patch_application(checkpoint, middleware, tape, patch)
+                if patch.durable:
+                    await self.ledger.apply_many(
+                        run_id, self._compile_durable_patch(middleware, patch)
+                    )
+                    events = await self.ledger.list_events(run_id)
+                    tape = await reconstruct_message_tape_from_events(
+                        events, self.ledger.get_artifact_text
+                    )
+                else:
+                    result.ephemeral_records.append(
+                        self._ephemeral_record(middleware, patch)
+                    )
+        if result.ephemeral_records:
+            self._validate_ephemeral_records(checkpoint, tape, result.ephemeral_records)
+        return result
+
+    async def assert_checkpoint_complete(
+        self,
+        run_id: str,
+        checkpoint: MessageMiddlewareCheckpoint,
+        *,
+        budget: ContextBudget | None = None,
+    ) -> None:
+        ctx = MessageMiddlewareContext(
+            run_id=run_id,
+            checkpoint=checkpoint,
+            budget=budget,
+        )
+        events = await self.ledger.list_events(run_id)
+        tape = await reconstruct_message_tape_from_events(
+            events, self.ledger.get_artifact_text
+        )
+        for middleware in self.middlewares:
+            ready = getattr(middleware, "assert_checkpoint_complete", None)
+            if ready is not None:
+                ready(ctx, tape)
+
+    def _validate_patch_application(
+        self,
+        checkpoint: MessageMiddlewareCheckpoint,
+        middleware: MessageMiddleware,
+        tape: MessageTape,
+        patch: MessageTapePatch,
+    ) -> None:
+        self._validate_patch_targets(tape, patch)
+        record = self._ephemeral_record(middleware, patch)
+        candidate = apply_rewrite_records_to_tape(tape, [record])
+        messages = project_tape_messages(candidate)
+        if checkpoint == MessageMiddlewareCheckpoint.AFTER_TOOL_RESULT_COMMITTED:
+            validate_provider_messages(messages, allow_open_tool_batch=True)
+        else:
+            validate_provider_messages(messages)
+
+    def _validate_ephemeral_records(
+        self,
+        checkpoint: MessageMiddlewareCheckpoint,
+        tape: MessageTape,
+        records: list[MessageRewriteRecord],
+    ) -> None:
+        candidate = apply_rewrite_records_to_tape(tape, records)
+        messages = project_tape_messages(candidate)
+        if checkpoint == MessageMiddlewareCheckpoint.AFTER_TOOL_RESULT_COMMITTED:
+            validate_provider_messages(messages, allow_open_tool_batch=True)
+        else:
+            validate_provider_messages(messages)
+
+    def _validate_patch_targets(
+        self,
+        tape: MessageTape,
+        patch: MessageTapePatch,
+    ) -> None:
+        if not isinstance(patch, ReplacePatch):
+            return
+        if not patch.target_ids:
+            raise ValueError("replace patch requires target_ids")
+        existing = {item.id for item in tape.items}
+        missing = [target_id for target_id in patch.target_ids if target_id not in existing]
+        if missing:
+            raise ValueError("replace patch target does not exist: " + ", ".join(missing))
+
+    def _compile_durable_patch(
+        self,
+        middleware: MessageMiddleware,
+        patch: MessageTapePatch,
+    ):
+        rewrite_id = patch.metadata.get("rewrite_id")
+        if not rewrite_id:
+            raise ValueError("durable message middleware patch requires rewrite_id")
+        if isinstance(patch, ReplacePatch):
+            begin = MessageRewriteAnchorDraft(
+                rewrite_id=rewrite_id,
+                kind="begin",
+                middleware=middleware.name,
+                operation="replace",
+                suppresses=list(patch.target_ids),
+                metadata=dict(patch.metadata),
+            )
+            messages = [
+                MessageRewriteMessageDraft(
+                    rewrite_id=rewrite_id,
+                    index=index,
+                    message_id=item.id,
+                    message=item.to_inference_message(),
+                    metadata=dict(item.metadata),
+                )
+                for index, item in enumerate(patch.replacement_items)
+            ]
+            end = MessageRewriteAnchorDraft(
+                rewrite_id=rewrite_id,
+                kind="end",
+                middleware=middleware.name,
+                operation="replace",
+                metadata={"message_count": len(messages)},
+            )
+            return [begin, *messages, end]
+        begin = MessageRewriteAnchorDraft(
+            rewrite_id=rewrite_id,
+            kind="begin",
+            middleware=middleware.name,
+            operation="insert",
+            position=patch.position,
+            metadata=dict(patch.metadata),
+        )
+        messages = [
+            MessageRewriteMessageDraft(
+                rewrite_id=rewrite_id,
+                index=index,
+                message_id=item.id,
+                message=item.to_inference_message(),
+                metadata=dict(item.metadata),
+            )
+            for index, item in enumerate(patch.items)
+        ]
+        end = MessageRewriteAnchorDraft(
+            rewrite_id=rewrite_id,
+            kind="end",
+            middleware=middleware.name,
+            operation="insert",
+            metadata={"message_count": len(messages)},
+        )
+        return [begin, *messages, end]
+
+    def _ephemeral_record(
+        self,
+        middleware: MessageMiddleware,
+        patch: MessageTapePatch,
+    ) -> MessageRewriteRecord:
+        if isinstance(patch, ReplacePatch):
+            rewrite_id = patch.metadata.get(
+                "rewrite_id", f"ephemeral:{middleware.name}"
+            )
+            return MessageRewriteRecord(
+                rewrite_id=rewrite_id,
+                operation="replace",
+                middleware=middleware.name,
+                suppresses=list(patch.target_ids),
+                messages=[
+                    TapeMessage(
+                        id=f"a:{rewrite_id}:begin",
+                        role="internal_anchor",
+                        origin="middleware",
+                        middleware_name=middleware.name,
+                        visibility="internal",
+                        metadata={
+                            "rewrite_id": rewrite_id,
+                            "operation": "replace",
+                            "suppresses": list(patch.target_ids),
+                        },
+                    ),
+                    *patch.replacement_items,
+                ],
+            )
+        return MessageRewriteRecord(
+            rewrite_id=patch.metadata.get("rewrite_id", f"ephemeral:{middleware.name}"),
+            operation="insert",
+            middleware=middleware.name,
+            position=patch.position,
+            messages=list(patch.items),
+        )
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _model_visible_items(tape: MessageTape) -> list[TapeMessage]:
+    suppressed = {
+        target_id
+        for item in tape.items
+        if item.visibility == "internal"
+        for target_id in item.metadata.get("suppresses", [])
+    }
+    return [
+        item
+        for item in tape.items
+        if item.visibility == "model" and item.id not in suppressed
+    ]
+
+
+class ToolResultRedactionMiddleware(MessageMiddleware):
+    name = "tool_result_redaction"
+    priority = 50
+    checkpoints = {
+        MessageMiddlewareCheckpoint.AFTER_TOOL_RESULT_COMMITTED,
+        MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST,
+    }
+
+    def __init__(self, *, max_chars: int = 4096, excerpt_chars: int = 1200) -> None:
+        self.max_chars = max_chars
+        self.excerpt_chars = excerpt_chars
+
+    async def process(
+        self,
+        ctx: MessageMiddlewareContext,
+        tape: MessageTape,
+    ) -> list[MessageTapePatch]:
+        patches: list[MessageTapePatch] = []
+        for item in _model_visible_items(tape):
+            if item.role != InferenceRole.TOOL_RESULT.value:
+                continue
+            content = item.content or ""
+            if len(content) <= self.max_chars:
+                continue
+            digest = _sha256(content)
+            rewrite_id = f"tool_result_redaction:{item.id}:{digest[:12]}"
+            replacement_content = (
+                "Result redacted for context headroom. Relevant excerpt:\n"
+                + content[: self.excerpt_chars]
+            )
+            patches.append(
+                ReplacePatch(
+                    target_ids=[item.id],
+                    replacement_items=[
+                        TapeMessage(
+                            id=f"mw:{rewrite_id}:0",
+                            role=InferenceRole.TOOL_RESULT.value,
+                            tool_call_id=item.tool_call_id,
+                            tool_name=item.tool_name,
+                            content=replacement_content,
+                            origin="middleware",
+                            middleware_name=self.name,
+                            metadata={"rewrite_id": rewrite_id},
+                        )
+                    ],
+                    durable=True,
+                    metadata={
+                        "rewrite_id": rewrite_id,
+                        "middleware": self.name,
+                        "algorithm": "headroom_excerpt_v1",
+                        "reason": "context_headroom",
+                        "original_sha256": digest,
+                        "original_chars": len(content),
+                        "replacement_chars": len(replacement_content),
+                    },
+                )
+            )
+        return patches
+
+    def assert_checkpoint_complete(
+        self,
+        ctx: MessageMiddlewareContext,
+        tape: MessageTape,
+    ) -> None:
+        if ctx.checkpoint != MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST:
+            return
+        remaining = [
+            item.id
+            for item in _model_visible_items(tape)
+            if item.role == InferenceRole.TOOL_RESULT.value
+            and len(item.content or "") > self.max_chars
+        ]
+        if remaining:
+            raise ValueError(
+                "tool result redaction incomplete before model request: "
+                + ", ".join(remaining)
+            )
+
+
+class ContextCompactionMiddleware(MessageMiddleware):
+    name = "context_compaction"
+    priority = 100
+    checkpoints = {
+        MessageMiddlewareCheckpoint.AFTER_TURN_CLOSED,
+        MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST,
+    }
+
+    def __init__(self, *, max_messages: int = 12, keep_last: int = 4) -> None:
+        self.max_messages = max_messages
+        self.keep_last = keep_last
+
+    async def process(
+        self,
+        ctx: MessageMiddlewareContext,
+        tape: MessageTape,
+    ) -> list[MessageTapePatch]:
+        # BEFORE_MODEL_REQUEST acts as the recovery fallback when the preferred
+        # AFTER_TURN_CLOSED write was missed by a crash.
+        visible = [
+            item for item in _model_visible_items(tape) if item.origin != "middleware"
+        ]
+        if len(visible) <= self.max_messages:
+            return []
+        candidate = visible[: max(0, len(visible) - self.keep_last)]
+        if any(
+            item.role == InferenceRole.TOOL_RESULT.value or item.tool_calls
+            for item in candidate
+        ):
+            return []
+        target_ids = [item.id for item in candidate]
+        original = "\n".join((item.content or "").strip() for item in candidate)
+        digest = _sha256(original)
+        rewrite_id = f"context_compaction:{target_ids[0]}:{target_ids[-1]}:{digest[:12]}"
+        summary = "Earlier context summary:\n" + original[:2000]
+        return [
+            ReplacePatch(
+                target_ids=target_ids,
+                replacement_items=[
+                    TapeMessage(
+                        id=f"mw:{rewrite_id}:0",
+                        role=InferenceRole.USER.value,
+                        content=summary,
+                        origin="middleware",
+                        middleware_name=self.name,
+                        metadata={"rewrite_id": rewrite_id},
+                    )
+                ],
+                durable=True,
+                metadata={
+                    "rewrite_id": rewrite_id,
+                    "middleware": self.name,
+                    "algorithm": "deterministic_prefix_summary_v1",
+                    "reason": "message_count",
+                    "original_hash": digest,
+                    "original_chars": len(original),
+                    "replacement_chars": len(summary),
+                },
+            )
+        ]
+
+
+class AgentsMDMiddleware(MessageMiddleware):
+    name = "agents_md"
+    priority = 10
+    checkpoints = {MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST}
+
+    def __init__(self, paths: list[Path | str]) -> None:
+        self.paths = [Path(path) for path in paths]
+
+    async def process(
+        self,
+        ctx: MessageMiddlewareContext,
+        tape: MessageTape,
+    ) -> list[MessageTapePatch]:
+        parts: list[str] = []
+        hashes: list[str] = []
+        for path in self.paths:
+            if not path.exists() or not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8")
+            if not text.strip():
+                continue
+            digest = _sha256(text)
+            hashes.append(digest)
+            parts.append(f"# {path.name}\n{text}")
+        if not parts:
+            return []
+        combined = "\n\n".join(parts)
+        content_hash = _sha256(combined)
+        return [
+            InsertPatch(
+                position=TapePosition(
+                    kind="boundary",
+                    boundary="conversation_start",
+                ),
+                items=[
+                    TapeMessage(
+                        id=f"ephemeral:agents_md:{content_hash[:16]}",
+                        role=InferenceRole.SYSTEM.value,
+                        content=combined,
+                        origin="middleware",
+                        middleware_name=self.name,
+                        metadata={
+                            "content_hash": content_hash,
+                            "source_hashes": hashes,
+                        },
+                    )
+                ],
+                durable=False,
+                metadata={
+                    "rewrite_id": f"ephemeral:agents_md:{content_hash[:16]}",
+                    "middleware": self.name,
+                    "content_hash": content_hash,
+                },
+            )
+        ]

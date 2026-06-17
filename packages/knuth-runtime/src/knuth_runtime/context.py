@@ -14,7 +14,7 @@ from knuth.core.messages import (
     SystemSection,
     SystemSectionSource,
 )
-from knuth.core.runtime_events import ContextSnapshot
+from knuth.core.runtime_events import ContextSnapshot, TapePosition
 from knuth.core.types import KnuthModel
 from knuth_toold import ToolBroker
 
@@ -46,6 +46,42 @@ class ContextView(KnuthModel):
     tools: list[dict[str, Any]]
     snapshot: ContextSnapshot | None = None
     diagnostics: dict[str, Any] = Field(default_factory=dict)
+
+
+class TapeMessage(KnuthModel):
+    id: str
+    role: str
+    content: str | None = None
+    tool_calls: list[Any] = Field(default_factory=list)
+    tool_call_id: str | None = None
+    tool_name: str | None = None
+    origin: str
+    source_event_seq: int | None = None
+    middleware_name: str | None = None
+    visibility: str = "model"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    def to_inference_message(self) -> InferenceMessage:
+        return InferenceMessage(
+            role=InferenceRole(self.role),
+            content=self.content,
+            tool_calls=list(self.tool_calls),
+            tool_call_id=self.tool_call_id,
+            tool_name=self.tool_name,
+        )
+
+
+class MessageTape(KnuthModel):
+    items: list[TapeMessage]
+
+
+class MessageRewriteRecord(KnuthModel):
+    rewrite_id: str
+    operation: str
+    middleware: str
+    position: TapePosition | None = None
+    suppresses: list[str] = Field(default_factory=list)
+    messages: list[TapeMessage] = Field(default_factory=list)
 
 
 class SystemSectionProvider(ABC):
@@ -82,43 +118,28 @@ class ContextRedactor(Protocol):
         ...
 
 
-class MessageMiddleware(ABC):
-    """Full-power view rewriter. Core-system use only — third parties extend
-    context through ``SystemSectionProvider``, never through middleware."""
-
-    name: str
-    priority: int = 100
-
-    @abstractmethod
-    async def process(self, ctx: RunContext, view: ContextView) -> ContextView:
-        ...
-
-
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 class ContextBuilder:
-    """Builds the model-facing view through fixed stages:
+    """Builds the model-facing view through fixed projection stages:
 
-    assemble -> redact -> compact -> tool_filter -> freeze
+    assemble -> redact -> tool_filter -> freeze
 
-    The stage order is load-bearing: redaction runs before compaction so no
-    summarizer ever sees a secret, and freeze computes the ContextSnapshot
-    after which the view must not change.
+    Durable and ephemeral message rewrites are prepared by the runtime
+    checkpoint runner before build(); this class only projects them.
     """
 
     def __init__(
         self,
         ledger: RunLedger,
         tool_broker: ToolBroker,
-        middlewares: list[MessageMiddleware] | None = None,
         section_providers: list[SystemSectionProvider] | None = None,
         redactor: ContextRedactor | None = None,
     ) -> None:
         self.ledger = ledger
         self.tool_broker = tool_broker
-        self.middlewares = sorted(middlewares or [], key=lambda item: item.priority)
         self.section_providers = list(section_providers or [])
         self.redactor = redactor
 
@@ -127,25 +148,34 @@ class ContextBuilder:
         ctx: RunContext,
         *,
         model_config_fingerprint: str = "",
+        ephemeral_rewrite_records: list[MessageRewriteRecord] | None = None,
     ) -> ContextView:
-        view = await self._assemble(ctx)
+        view = await self._assemble(ctx, ephemeral_rewrite_records or [])
         if self.redactor is not None:
             view = await self.redactor.redact(ctx, view)
-        view = await self._compact(ctx, view)
         view = await self._tool_filter(ctx, view)
         return self._freeze(view, model_config_fingerprint)
 
-    async def _assemble(self, ctx: RunContext) -> ContextView:
+    async def _assemble(
+        self,
+        ctx: RunContext,
+        ephemeral_rewrite_records: list[MessageRewriteRecord],
+    ) -> ContextView:
         events = await self.ledger.list_events(ctx.run_id)
-        messages = await reconstruct_messages_from_events(
+        tape = await reconstruct_message_tape_from_events(
             events, self.ledger.get_artifact_text
         )
+        if ephemeral_rewrite_records:
+            tape = apply_rewrite_records_to_tape(tape, ephemeral_rewrite_records)
+        messages = project_tape_messages(tape)
         preamble = await self._preamble(ctx)
         if preamble:
             messages.insert(
                 0,
                 InferenceMessage(role=InferenceRole.SYSTEM, content=preamble),
             )
+        messages = _merge_leading_system_messages(messages)
+        validate_provider_messages(messages)
         return ContextView(run_id=ctx.run_id, messages=messages, tools=[])
 
     async def _preamble(self, ctx: RunContext) -> str | None:
@@ -153,11 +183,6 @@ class ContextBuilder:
         for provider in self.section_providers:
             sections.extend(await provider.sections(ctx))
         return assemble_preamble(sections)
-
-    async def _compact(self, ctx: RunContext, view: ContextView) -> ContextView:
-        for middleware in self.middlewares:
-            view = await middleware.process(ctx, view)
-        return view
 
     async def _tool_filter(self, ctx: RunContext, view: ContextView) -> ContextView:
         tools = await self.tool_broker.list_visible_tools(ctx.run_id)
@@ -184,9 +209,6 @@ async def reconstruct_messages_from_events(
     events: list[RuntimeEvent],
     resolve_artifact_text,
 ) -> list[InferenceMessage]:
-    """Conversation fold: a closed, typed mapping from decision events to the
-    message sequence. Aggregate invariants guarantee the result is always a
-    provider-valid sequence, so no defensive repair happens here."""
     messages: list[InferenceMessage] = []
     for event in events:
         if event.type == "user.message":
@@ -214,9 +236,6 @@ async def reconstruct_messages_from_events(
                 )
             )
         elif event.type == "conversation.notice":
-            # A synthetic runtime notice is not human-authored, but every
-            # provider must see it through the ordinary conversation channel, so
-            # it projects as a user-role message at this (batch-closed) boundary.
             messages.append(
                 InferenceMessage(role=InferenceRole.USER, content=event.content)
             )
@@ -225,3 +244,247 @@ async def reconstruct_messages_from_events(
                 InferenceMessage(role=InferenceRole.USER, content=event.feedback)
             )
     return messages
+
+
+async def project_messages_from_events(
+    events: list[RuntimeEvent],
+    resolve_artifact_text,
+    *,
+    allow_open_tool_batch: bool = False,
+) -> list[InferenceMessage]:
+    tape = await reconstruct_message_tape_from_events(events, resolve_artifact_text)
+    messages = project_tape_messages(tape)
+    validate_provider_messages(messages, allow_open_tool_batch=allow_open_tool_batch)
+    return messages
+
+
+async def reconstruct_message_tape_from_events(
+    events: list[RuntimeEvent],
+    resolve_artifact_text,
+) -> MessageTape:
+    """Conversation fold: a closed, typed mapping from decision events to the
+    message sequence. Aggregate invariants guarantee the result is always a
+    provider-valid sequence, so no defensive repair happens here."""
+    items: list[TapeMessage] = []
+    rewrite_records: list[MessageRewriteRecord] = []
+    open_rewrites: dict[str, MessageRewriteRecord] = {}
+    for event in events:
+        if event.type == "user.message":
+            items.append(
+                TapeMessage(
+                    id=f"m:{event.seq}",
+                    role=InferenceRole.USER.value,
+                    content=event.content,
+                    origin="ledger",
+                    source_event_seq=event.seq,
+                )
+            )
+        elif event.type == "model.completed":
+            items.append(
+                TapeMessage(
+                    id=f"m:{event.seq}",
+                    role=InferenceRole.ASSISTANT.value,
+                    content=event.content,
+                    tool_calls=list(event.tool_calls),
+                    origin="ledger",
+                    source_event_seq=event.seq,
+                )
+            )
+        elif event.type == "tool.invocation_completed":
+            observation = event.observation
+            if observation is None and event.artifact_ref is not None:
+                observation = await resolve_artifact_text(event.artifact_ref)
+            items.append(
+                TapeMessage(
+                    id=f"m:{event.seq}",
+                    role=InferenceRole.TOOL_RESULT.value,
+                    tool_call_id=event.tool_call_id,
+                    tool_name=event.tool_name,
+                    content=observation or "",
+                    origin="ledger",
+                    source_event_seq=event.seq,
+                )
+            )
+        elif event.type == "conversation.notice":
+            # A synthetic runtime notice is not human-authored, but every
+            # provider must see it through the ordinary conversation channel, so
+            # it projects as a user-role message at this (batch-closed) boundary.
+            items.append(
+                TapeMessage(
+                    id=f"m:{event.seq}",
+                    role=InferenceRole.USER.value,
+                    content=event.content,
+                    origin="ledger",
+                    source_event_seq=event.seq,
+                )
+            )
+        elif event.type == "verification.failed":
+            items.append(
+                TapeMessage(
+                    id=f"m:{event.seq}",
+                    role=InferenceRole.USER.value,
+                    content=event.feedback,
+                    origin="ledger",
+                    source_event_seq=event.seq,
+                )
+            )
+        elif event.type == "message.rewrite_anchor":
+            anchor = TapeMessage(
+                id=f"a:{event.seq}",
+                role="internal_anchor",
+                origin="middleware",
+                source_event_seq=event.seq,
+                middleware_name=event.middleware,
+                visibility="internal",
+                metadata={
+                    **event.metadata,
+                    "rewrite_id": event.rewrite_id,
+                    "kind": event.kind,
+                    "operation": event.operation,
+                    "suppresses": list(event.suppresses),
+                    "position": event.position.model_dump()
+                    if event.position is not None
+                    else None,
+                },
+            )
+            if event.kind == "begin":
+                open_rewrites[event.rewrite_id] = MessageRewriteRecord(
+                    rewrite_id=event.rewrite_id,
+                    operation=event.operation,
+                    middleware=event.middleware,
+                    position=event.position,
+                    suppresses=list(event.suppresses),
+                    messages=[anchor],
+                )
+            else:
+                record = open_rewrites.pop(event.rewrite_id, None)
+                if record is not None:
+                    record.messages.append(anchor)
+                    rewrite_records.append(record)
+        elif event.type == "message.rewrite_message":
+            record = open_rewrites.get(event.rewrite_id)
+            if record is not None:
+                record.messages.append(
+                    TapeMessage(
+                        id=event.message_id,
+                        role=event.message.role.value,
+                        content=event.message.content,
+                        tool_calls=list(event.message.tool_calls),
+                        tool_call_id=event.message.tool_call_id,
+                        tool_name=event.message.tool_name,
+                        origin="middleware",
+                        source_event_seq=event.seq,
+                        middleware_name=record.middleware,
+                        metadata={**event.metadata, "rewrite_id": event.rewrite_id},
+                    )
+                )
+    return MessageTape(items=_apply_rewrite_records(items, rewrite_records))
+
+
+def project_tape_messages(tape: MessageTape) -> list[InferenceMessage]:
+    suppressed = {
+        target_id
+        for item in tape.items
+        if item.visibility == "internal"
+        for target_id in item.metadata.get("suppresses", [])
+    }
+    return [
+        item.to_inference_message()
+        for item in tape.items
+        if item.visibility == "model" and item.id not in suppressed
+    ]
+
+
+def validate_provider_messages(
+    messages: list[InferenceMessage],
+    *,
+    allow_open_tool_batch: bool = False,
+) -> None:
+    pending_tool_results: list[str] = []
+    seen_non_system = False
+    for message in messages:
+        if message.role == InferenceRole.SYSTEM:
+            if seen_non_system:
+                raise ValueError("system message must be leading")
+            continue
+        seen_non_system = True
+        if pending_tool_results and message.role != InferenceRole.TOOL_RESULT:
+            raise ValueError("assistant tool calls must be followed by tool results")
+        if message.role == InferenceRole.ASSISTANT:
+            pending_tool_results.extend(call.effective_id for call in message.tool_calls)
+        elif message.role == InferenceRole.TOOL_RESULT:
+            if message.tool_call_id not in pending_tool_results:
+                raise ValueError(
+                    f"dangling tool result for tool_call_id={message.tool_call_id}"
+                )
+            pending_tool_results.remove(message.tool_call_id)
+    if pending_tool_results and not allow_open_tool_batch:
+        raise ValueError(
+            "missing tool results for tool calls: " + ", ".join(pending_tool_results)
+        )
+
+
+def _merge_leading_system_messages(
+    messages: list[InferenceMessage],
+) -> list[InferenceMessage]:
+    leading: list[InferenceMessage] = []
+    rest_start = 0
+    for idx, message in enumerate(messages):
+        if message.role != InferenceRole.SYSTEM:
+            rest_start = idx
+            break
+        leading.append(message)
+    else:
+        rest_start = len(messages)
+    if len(leading) <= 1:
+        return messages
+    merged = assemble_preamble(
+        [
+            SystemSection(source=SystemSectionSource.BASE, text=message.content or "")
+            for message in leading
+        ]
+    )
+    return [
+        InferenceMessage(role=InferenceRole.SYSTEM, content=merged),
+        *messages[rest_start:],
+    ]
+
+
+def _apply_rewrite_records(
+    base_items: list[TapeMessage],
+    records: list[MessageRewriteRecord],
+) -> list[TapeMessage]:
+    items = list(base_items)
+    for record in records:
+        if record.operation == "replace":
+            target_indexes = [
+                idx for idx, item in enumerate(items) if item.id in set(record.suppresses)
+            ]
+            if not target_indexes:
+                continue
+            insert_at = min(target_indexes)
+            items[insert_at:insert_at] = list(record.messages)
+        else:
+            insert_at = _position_index(items, record.position)
+            items[insert_at:insert_at] = list(record.messages)
+    return items
+
+
+def apply_rewrite_records_to_tape(
+    tape: MessageTape,
+    records: list[MessageRewriteRecord],
+) -> MessageTape:
+    return MessageTape(items=_apply_rewrite_records(tape.items, records))
+
+
+def _position_index(items: list[TapeMessage], position: TapePosition | None) -> int:
+    if position is None:
+        return len(items)
+    if position.kind == "boundary":
+        if position.boundary == "conversation_start":
+            return 0
+        return len(items)
+    for idx, item in enumerate(items):
+        if item.id == position.target_id:
+            return idx if position.kind == "before" else idx + 1
+    return len(items)

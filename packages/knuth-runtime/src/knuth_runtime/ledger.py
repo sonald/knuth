@@ -32,6 +32,8 @@ from knuth.core.runtime_events import (
     ApprovalRequestedDraft,
     ApprovalResolvedDraft,
     ConversationNoticeDraft,
+    MessageRewriteAnchorDraft,
+    MessageRewriteMessageDraft,
     ModelAbortedDraft,
     ModelCompletedDraft,
     ModelFailedDraft,
@@ -53,6 +55,7 @@ from knuth.core.runtime_events import (
     UserMessageDraft,
     VerificationFailedDraft,
 )
+from knuth.core.messages import InferenceMessage, InferenceRole
 from knuth.core.types import RunStatus
 
 type SQLiteParam = str | int | float | bytes | None
@@ -168,6 +171,26 @@ RESUMABLE_STATUSES = frozenset(
 
 
 @dataclass
+class _RewriteRecord:
+    rewrite_id: str
+    operation: str
+    suppresses: tuple[str, ...]
+    message_ids: tuple[str, ...] = ()
+    position: TapePosition | None = None
+
+
+@dataclass
+class _RewriteValidationState:
+    rewrites: dict[str, _RewriteRecord] = field(default_factory=dict)
+    open_rewrites: dict[str, MessageRewriteAnchorDraft] = field(default_factory=dict)
+    open_message_ids: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    message_ids: set[str] = field(default_factory=set)
+    projected_messages: dict[str, InferenceMessage] = field(default_factory=dict)
+    projected_order: tuple[str, ...] = ()
+    suppressed_ids: set[str] = field(default_factory=set)
+
+
+@dataclass
 class _AggregateView:
     """Everything the reducer needs to validate one append, loaded in-transaction."""
 
@@ -175,6 +198,9 @@ class _AggregateView:
     invocations: dict[str, ToolInvocation] = field(default_factory=dict)
     approvals: dict[str, Approval] = field(default_factory=dict)
     last_model_tool_call_ids: tuple[str, ...] = ()
+    message_rewrites: _RewriteValidationState = field(
+        default_factory=_RewriteValidationState
+    )
 
 
 @dataclass
@@ -187,6 +213,161 @@ class _Mutations:
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise LedgerError(message)
+
+
+def _event_message_id(event: StoredRuntimeEvent) -> str | None:
+    if event.type in {
+        "user.message",
+        "model.completed",
+        "tool.invocation_completed",
+        "conversation.notice",
+        "verification.failed",
+    }:
+        return f"m:{event.seq}"
+    return None
+
+
+def _event_message(event: StoredRuntimeEvent) -> InferenceMessage | None:
+    if event.type == "user.message":
+        return InferenceMessage(role=InferenceRole.USER, content=event.content)
+    if event.type == "model.completed":
+        return InferenceMessage(
+            role=InferenceRole.ASSISTANT,
+            content=event.content,
+            tool_calls=list(event.tool_calls),
+        )
+    if event.type == "tool.invocation_completed":
+        return InferenceMessage(
+            role=InferenceRole.TOOL_RESULT,
+            tool_call_id=event.tool_call_id,
+            tool_name=event.tool_name,
+            content=event.observation or "",
+        )
+    if event.type == "conversation.notice":
+        return InferenceMessage(role=InferenceRole.USER, content=event.content)
+    if event.type == "verification.failed":
+        return InferenceMessage(role=InferenceRole.USER, content=event.feedback)
+    return None
+
+
+def _projected_ids_after_rewrites(
+    base_order: list[str],
+    records: list[_RewriteRecord],
+) -> tuple[str, ...]:
+    order = list(base_order)
+    suppressed: set[str] = set()
+    for record in records:
+        if record.operation == "replace":
+            indexes = [order.index(message_id) for message_id in record.suppresses]
+            insert_at = min(indexes)
+            suppressed.update(record.suppresses)
+            order[insert_at:insert_at] = list(record.message_ids)
+        else:
+            insert_at = _rewrite_insert_index(order, record.position)
+            order[insert_at:insert_at] = list(record.message_ids)
+    return tuple(message_id for message_id in order if message_id not in suppressed)
+
+
+def _rewrite_insert_index(order: list[str], position: TapePosition | None) -> int:
+    if position is None:
+        return len(order)
+    if position.kind == "boundary":
+        if position.boundary == "conversation_start":
+            return 0
+        return len(order)
+    if position.target_id in order:
+        index = order.index(position.target_id)
+        return index if position.kind == "before" else index + 1
+    return len(order)
+
+
+def _fold_message_rewrite_state(
+    events: Iterable[StoredRuntimeEvent],
+) -> _RewriteValidationState:
+    state = _RewriteValidationState()
+    base_order: list[str] = []
+    records: list[_RewriteRecord] = []
+    pending_messages: dict[str, list[str]] = {}
+    for event in events:
+        message_id = _event_message_id(event)
+        if message_id is not None:
+            state.message_ids.add(message_id)
+            base_order.append(message_id)
+            message = _event_message(event)
+            if message is not None:
+                state.projected_messages[message_id] = message
+        elif event.type == "message.rewrite_anchor":
+            if event.kind == "begin":
+                state.open_rewrites[event.rewrite_id] = event
+                pending_messages[event.rewrite_id] = []
+            else:
+                begin = state.open_rewrites.pop(event.rewrite_id, None)
+                if begin is None:
+                    continue
+                message_ids = tuple(pending_messages.pop(event.rewrite_id, []))
+                record = _RewriteRecord(
+                    rewrite_id=event.rewrite_id,
+                    operation=begin.operation,
+                    suppresses=tuple(begin.suppresses),
+                    message_ids=message_ids,
+                    position=begin.position,
+                )
+                state.rewrites[event.rewrite_id] = record
+                state.suppressed_ids.update(record.suppresses)
+                records.append(record)
+                state.open_message_ids.pop(event.rewrite_id, None)
+        elif event.type == "message.rewrite_message":
+            state.message_ids.add(event.message_id)
+            state.projected_messages[event.message_id] = event.message
+            pending_messages.setdefault(event.rewrite_id, []).append(event.message_id)
+            state.open_message_ids[event.rewrite_id] = tuple(
+                pending_messages[event.rewrite_id]
+            )
+    state.projected_order = _projected_ids_after_rewrites(base_order, records)
+    return state
+
+
+def _validate_rewrite_draft_batch(drafts: list[DurableRuntimeEventDraft]) -> None:
+    rewrite_drafts = [
+        draft
+        for draft in drafts
+        if isinstance(draft, MessageRewriteAnchorDraft | MessageRewriteMessageDraft)
+    ]
+    if not rewrite_drafts:
+        return
+    grouped: dict[str, list[DurableRuntimeEventDraft]] = {}
+    for draft in rewrite_drafts:
+        grouped.setdefault(draft.rewrite_id, []).append(draft)
+    for rewrite_id, group in grouped.items():
+        anchors = [
+            draft for draft in group if isinstance(draft, MessageRewriteAnchorDraft)
+        ]
+        begins = [draft for draft in anchors if draft.kind == "begin"]
+        ends = [draft for draft in anchors if draft.kind == "end"]
+        _require(len(begins) == 1, f"rewrite {rewrite_id} requires one begin anchor")
+        _require(len(ends) == 1, f"rewrite {rewrite_id} requires one end anchor")
+        begin_index = next(
+            index for index, draft in enumerate(drafts) if draft is begins[0]
+        )
+        end_index = next(
+            index for index, draft in enumerate(drafts) if draft is ends[0]
+        )
+        _require(
+            begin_index < end_index,
+            f"rewrite {rewrite_id} begin anchor must precede end anchor",
+        )
+        for draft in group:
+            index = next(
+                idx for idx, candidate in enumerate(drafts) if candidate is draft
+            )
+            _require(
+                begin_index <= index <= end_index,
+                f"rewrite {rewrite_id} events must be contiguous in apply_many",
+            )
+        _require(
+            end_index - begin_index + 1 == len(group),
+            f"rewrite {rewrite_id} events must be a contiguous apply_many block",
+        )
 
 
 @dataclass
@@ -769,6 +950,118 @@ def _reduce_verification_failed(
     return ctx.mutations
 
 
+@_reduces(MessageRewriteAnchorDraft)
+def _reduce_message_rewrite_anchor(
+    ctx: _ReduceContext, draft: MessageRewriteAnchorDraft
+) -> _Mutations:
+    _require(
+        ctx.run.status not in {RunStatus.FAILED, RunStatus.CANCELLED},
+        f"message rewrite not allowed from status {ctx.run.status}",
+    )
+    rewrites = ctx.view.message_rewrites
+    if draft.kind == "begin":
+        _require(
+            draft.rewrite_id not in rewrites.rewrites
+            and draft.rewrite_id not in rewrites.open_rewrites,
+            f"duplicate rewrite_id: {draft.rewrite_id}",
+        )
+        _require(bool(draft.middleware), "message rewrite requires middleware")
+        if draft.operation == "replace":
+            _require(
+                bool(draft.suppresses),
+                "replace rewrite requires suppresses target ids",
+            )
+            for target_id in draft.suppresses:
+                _require(
+                    target_id in rewrites.message_ids,
+                    f"replace target does not exist: {target_id}",
+                )
+                _require(
+                    target_id not in rewrites.suppressed_ids,
+                    f"replace target is already suppressed: {target_id}",
+                )
+            positions = [
+                rewrites.projected_order.index(target_id)
+                for target_id in draft.suppresses
+                if target_id in rewrites.projected_order
+            ]
+            _require(
+                len(positions) == len(draft.suppresses),
+                "replace target must be present in current projection",
+            )
+            _require(
+                sorted(positions)
+                == list(range(min(positions), min(positions) + len(positions))),
+                "replace target ids must be a contiguous projected span",
+            )
+        else:
+            _require(draft.position is not None, "insert rewrite requires position")
+            if draft.position.kind in {"before", "after"}:
+                _require(
+                    draft.position.target_id in rewrites.message_ids,
+                    f"insert target does not exist: {draft.position.target_id}",
+                )
+            else:
+                _require(
+                    draft.position.boundary
+                    in {
+                        "conversation_start",
+                        "conversation_end",
+                        "before_model_request",
+                    },
+                    "insert boundary is required for boundary position",
+                )
+        return ctx.mutations
+
+    begin = rewrites.open_rewrites.get(draft.rewrite_id)
+    _require(begin is not None, f"rewrite end without begin: {draft.rewrite_id}")
+    _require(
+        begin.middleware == draft.middleware,
+        f"rewrite {draft.rewrite_id} middleware mismatch",
+    )
+    _require(
+        begin.operation == draft.operation,
+        f"rewrite {draft.rewrite_id} operation mismatch",
+    )
+    if begin.operation == "replace":
+        replacement_ids = rewrites.open_message_ids.get(draft.rewrite_id, ())
+        _require(
+            bool(replacement_ids),
+            f"replace rewrite {draft.rewrite_id} requires replacement messages",
+        )
+    return ctx.mutations
+
+
+@_reduces(MessageRewriteMessageDraft)
+def _reduce_message_rewrite_message(
+    ctx: _ReduceContext, draft: MessageRewriteMessageDraft
+) -> _Mutations:
+    rewrites = ctx.view.message_rewrites
+    begin = rewrites.open_rewrites.get(draft.rewrite_id)
+    _require(begin is not None, f"rewrite message without begin: {draft.rewrite_id}")
+    _require(draft.message_id, "rewrite message requires message_id")
+    _require(
+        draft.message_id not in rewrites.message_ids,
+        f"duplicate message id: {draft.message_id}",
+    )
+    if begin.operation == "replace" and len(begin.suppresses) == 1:
+        target = rewrites.projected_messages.get(begin.suppresses[0])
+        if target is not None and target.role == InferenceRole.TOOL_RESULT:
+            _require(
+                draft.message.role == InferenceRole.TOOL_RESULT,
+                "tool result replacement must remain a tool_result message",
+            )
+            _require(
+                draft.message.tool_call_id == target.tool_call_id,
+                "tool result replacement must preserve tool_call_id",
+            )
+            _require(
+                draft.message.tool_name == target.tool_name,
+                "tool result replacement must preserve tool_name",
+            )
+    return ctx.mutations
+
+
 def fold_stored_events(
     run_id: str, events: Iterable[StoredRuntimeEvent]
 ) -> _AggregateView:
@@ -779,7 +1072,9 @@ def fold_stored_events(
     ``LedgerError`` here means the stored stream violates its own invariants.
     """
     view = _AggregateView(run=None)
+    seen_events: list[StoredRuntimeEvent] = []
     for event in events:
+        view.message_rewrites = _fold_message_rewrite_state(seen_events)
         mutations = reduce_run_event(
             view, event, run_id=run_id, seq=event.seq, now=event.created_at
         )
@@ -792,6 +1087,8 @@ def fold_stored_events(
             view.last_model_tool_call_ids = tuple(
                 call.effective_id for call in event.tool_calls
             )
+        seen_events.append(event)
+    view.message_rewrites = _fold_message_rewrite_state(seen_events)
     return view
 
 
@@ -831,6 +1128,8 @@ class _LedgerMixin[TxnT]:
     async def apply(
         self, run_id: str, draft: DurableRuntimeEventDraft
     ) -> StoredRuntimeEvent:
+        if isinstance(draft, MessageRewriteAnchorDraft | MessageRewriteMessageDraft):
+            raise LedgerError("message rewrite events must be written with apply_many")
         draft = self._redact(draft)
         return await self._transact(run_id, draft)
 
@@ -846,6 +1145,7 @@ class _LedgerMixin[TxnT]:
         running view so ordering invariants still hold within the batch.
         """
         redacted = [self._redact(draft) for draft in drafts]
+        _validate_rewrite_draft_batch(redacted)
         return await self._transact_many(run_id, redacted)
 
     async def create_run(self, query: str, run_id: str | None = None) -> AgentRun:
@@ -972,6 +1272,9 @@ class MemoryRunLedger(_LedgerMixin[None]):
             last_model_tool_call_ids=self._last_model_tool_call_ids(run_id)
             if with_last_tool_call_ids
             else (),
+            message_rewrites=_fold_message_rewrite_state(
+                self._events.get(run_id, [])
+            ),
         )
 
     def _persist(
@@ -1105,7 +1408,9 @@ class SQLiteRunLedger(_LedgerMixin[sqlite3.Connection]):
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=5.0)
+        conn.execute("pragma busy_timeout = 5000")
+        return conn
 
     def _init_db(self) -> None:
         with self._connect() as conn:
@@ -1191,6 +1496,7 @@ class SQLiteRunLedger(_LedgerMixin[sqlite3.Connection]):
         self, run_id: str, draft: DurableRuntimeEventDraft
     ) -> StoredRuntimeEvent:
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             return self._apply_in_txn(conn, run_id, draft)
 
     @_threaded
@@ -1200,6 +1506,7 @@ class SQLiteRunLedger(_LedgerMixin[sqlite3.Connection]):
         # The connection context manager commits on success and rolls back on
         # any exception, so the whole draft sequence is one atomic durable fact.
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             return self._apply_many_in_txn(conn, run_id, drafts)
 
     def _load_view(
@@ -1224,6 +1531,9 @@ class SQLiteRunLedger(_LedgerMixin[sqlite3.Connection]):
             last_model_tool_call_ids=self._load_last_model_tool_call_ids(txn, run_id)
             if with_last_tool_call_ids
             else (),
+            message_rewrites=_fold_message_rewrite_state(
+                self._load_events(txn, run_id)
+            ),
         )
 
     def _persist(

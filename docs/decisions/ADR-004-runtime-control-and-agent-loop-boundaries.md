@@ -3,6 +3,13 @@
 ## 状态
 Proposed
 
+> 注：本文关于 runtime control、live observation、blocking hook 的边界仍有效；
+> 其中 `MessageMiddleware` 的能力描述已由
+> [MessageMiddleware 需求与设计](../message-middleware-requirements-and-design.md)
+> 修订。新的 `MessageMiddleware` 是生命周期 checkpoint 上的
+> `MessageTape` rewrite 组件，middleware 通过 patches / anchors 表达消息改写，
+> 不通过 hook 直接 mutate context。
+
 ## 日期
 2026-06-09
 
@@ -43,7 +50,7 @@ listener queue 收尾时，`RunSession` 先关闭 send side，让 listener drain
 
 `run_agent_loop(...)` 不接受 `on_event` / `live_event_sink` 参数。`RunSession` 创建 invocation-scoped live observation hub，并把它作为 `RuntimeInvocation` 的一部分交给 agent loop。agent loop 通过 invocation 发射 runtime events；它不认识 listener、queue、renderer 或 WebSocket。
 
-`BlockingHook` 是控制 seam，不是数据 mutation seam。v0 hooks 只允许 `continue / pause / terminate`，不允许改写 context、messages、tools、tool intent、proposal 或 inference config。需要注入 preamble 走 `SystemSectionProvider`；需要改写 context view 走 `MessageMiddleware`；需要改变工具提案和策略走 `ToolBroker` / `PolicyEngine`。
+`BlockingHook` 是控制 seam，不是数据 mutation seam。v0 hooks 只允许 `continue / pause / terminate`，不允许改写 context、messages、tools、tool intent、proposal 或 inference config。需要贡献稳定 preamble fragment 走 `SystemSectionProvider`；需要在安全 checkpoint 上做消息注入、遮蔽、替换、压缩或 tool result redaction，走 `MessageMiddleware` / `MessageTape` rewrite pipeline；需要改变工具提案和策略走 `ToolBroker` / `PolicyEngine`。
 
 第一版 `HookPoint` 只放在状态边界或外部副作用前，不铺满所有内部步骤。`run.before_turn` 放在 context build 之前。Hook point 不自动对应 RuntimeEvent；只有 hook 导致的状态结果才形成 timeline fact。
 
@@ -90,7 +97,7 @@ clarification / ask-user 类能力不属于当前 v0 边界。当前实现删除
 
 ### v0 hook 支持 mutate
 
-拒绝。mutation 需要定义目标、持久化、resume replay、冲突合并和审计语义。v0 先把 hook 限制为控制决策，数据变化使用已有的 provider、middleware、broker 和 policy 边界。
+拒绝。mutation 需要定义目标、持久化、resume replay、冲突合并和审计语义。v0 先把 hook 限制为控制决策。消息层数据变化使用 `SystemSectionProvider` 或 `MessageMiddleware` 的 tape rewrite 边界；工具和策略变化使用 broker / policy 边界。
 
 ### 保留 `knuth.ask_user` 作为内置控制工具
 

@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from knuth.core.messages import SystemSectionSource
-from knuth_runtime import StaticSectionProvider
+from knuth_runtime import (
+    AgentsMDMiddleware,
+    ContextCompactionMiddleware,
+    MessageMiddleware,
+    StaticSectionProvider,
+    ToolResultRedactionMiddleware,
+)
 
 
 KNUTH_CLI_ROLE_PROMPT = """# ROLE
@@ -19,3 +27,14 @@ def build_cli_system_sections(user_prompt: str | None = None) -> list[StaticSect
     if user_prompt:
         sections.append(StaticSectionProvider(SystemSectionSource.USER, user_prompt))
     return sections
+
+
+def build_cli_message_middlewares(
+    workspace: Path | str | None = None,
+) -> list[MessageMiddleware]:
+    root = Path(workspace) if workspace is not None else Path.cwd()
+    return [
+        AgentsMDMiddleware([root / "AGENTS.md"]),
+        ToolResultRedactionMiddleware(),
+        ContextCompactionMiddleware(),
+    ]

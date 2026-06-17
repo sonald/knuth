@@ -10,7 +10,7 @@ from knuth.core.invocations import (
     ToolEffect,
     ToolRisk,
 )
-from knuth.core.messages import ToolCall
+from knuth.core.messages import InferenceMessage, ToolCall
 from knuth.core.types import ErrorInfo, EventDurability, KnuthModel, RunStatus
 
 
@@ -33,6 +33,14 @@ class PlannedToolCall(KnuthModel):
     name: str
     args: dict[str, Any] = Field(default_factory=dict)
     args_hash: str
+
+
+class TapePosition(KnuthModel):
+    kind: Literal["before", "after", "boundary"]
+    target_id: str | None = None
+    boundary: Literal[
+        "conversation_start", "conversation_end", "before_model_request"
+    ] | None = None
 
 
 class RuntimeEventDraftBase(KnuthModel):
@@ -208,6 +216,26 @@ class VerificationFailedDraft(RuntimeEventDraftBase):
     feedback: str
 
 
+class MessageRewriteAnchorDraft(RuntimeEventDraftBase):
+    type: Literal["message.rewrite_anchor"] = "message.rewrite_anchor"
+    rewrite_id: str
+    kind: Literal["begin", "end"]
+    middleware: str
+    operation: Literal["insert", "replace"]
+    position: TapePosition | None = None
+    suppresses: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MessageRewriteMessageDraft(RuntimeEventDraftBase):
+    type: Literal["message.rewrite_message"] = "message.rewrite_message"
+    rewrite_id: str
+    index: int
+    message: InferenceMessage
+    message_id: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 DurableRuntimeEventDraft = (
     RunCreatedDraft
     | UserMessageDraft
@@ -232,6 +260,8 @@ DurableRuntimeEventDraft = (
     | ToolInvocationMarkedUnknownDraft
     | ToolBatchClosedDraft
     | VerificationFailedDraft
+    | MessageRewriteAnchorDraft
+    | MessageRewriteMessageDraft
 )
 
 
@@ -417,6 +447,14 @@ class VerificationFailed(VerificationFailedDraft, StoredRuntimeEventBase):
     pass
 
 
+class MessageRewriteAnchor(MessageRewriteAnchorDraft, StoredRuntimeEventBase):
+    pass
+
+
+class MessageRewriteMessage(MessageRewriteMessageDraft, StoredRuntimeEventBase):
+    pass
+
+
 class ModelReasoningDelta(ModelReasoningDeltaDraft, TransientRuntimeEventBase):
     pass
 
@@ -473,6 +511,8 @@ StoredRuntimeEvent = (
     | ToolInvocationMarkedUnknown
     | ToolBatchClosed
     | VerificationFailed
+    | MessageRewriteAnchor
+    | MessageRewriteMessage
 )
 
 TransientRuntimeEvent = (

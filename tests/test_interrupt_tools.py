@@ -49,9 +49,15 @@ def _invocation(name: str, args: dict | None = None) -> ToolInvocation:
 class _LongRunningTool:
     """Polls the signal and returns interrupted when it fires."""
 
-    def __init__(self, name: str = "long", effect: ToolEffect = ToolEffect.LOCAL_WRITE):
+    def __init__(
+        self,
+        name: str = "long",
+        effect: ToolEffect = ToolEffect.LOCAL_WRITE,
+        interrupted_message: str = "long tool stopped cooperatively at a safe point",
+    ):
         self._name = name
         self._effect = effect
+        self._interrupted_message = interrupted_message
 
     @property
     def manifest(self) -> ToolManifest:
@@ -67,9 +73,7 @@ class _LongRunningTool:
         signal = ctx.interrupt_signal
         for _ in range(1000):
             if signal is not None and signal.interrupted:
-                return ToolExecutionResult.interrupted(
-                    "long tool stopped cooperatively at a safe point"
-                )
+                return ToolExecutionResult.interrupted(self._interrupted_message)
             await anyio.sleep(0.005)
         return ToolResult.success(content="finished")
 
@@ -335,6 +339,36 @@ class LoopToolInterruptTests(unittest.TestCase):
         completed = [e for e in events if e.type == "tool.invocation_completed"]
         self.assertTrue(completed)
         self.assertEqual(completed[-1].outcome, "interrupted")
+
+    def test_active_tool_interrupt_runs_redaction_checkpoint(self) -> None:
+        big = "interrupted observation " + ("x" * 5000)
+
+        async def scenario():
+            runtime = self._build(
+                _LongRunningTool(effect=ToolEffect.READ, interrupted_message=big)
+            )
+            async with runtime.start("go") as session:
+                await anyio.sleep(0.03)
+                session.interrupt("user_stop")
+                result = await session.result()
+                events = await runtime.events(session.run_id)
+                context = await runtime.model_context_messages(session.run_id)
+            return result, events, context
+
+        result, events, context = anyio.run(scenario)
+        self.assertEqual(result.status, RunStatus.INTERRUPTED)
+        self.assertIn("message.rewrite_anchor", [e.type for e in events])
+        tool_results = [
+            message
+            for message in context
+            if message.role == InferenceRole.TOOL_RESULT
+        ]
+        self.assertTrue(
+            (tool_results[0].content or "").startswith(
+                "Result redacted for context headroom."
+            )
+        )
+        self.assertNotIn(big, tool_results[0].content or "")
 
     def test_unstarted_calls_are_abandoned_on_interrupt(self) -> None:
         async def scenario():

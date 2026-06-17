@@ -61,6 +61,7 @@ from knuth_runtime.context import RunContext
 from knuth_runtime.interrupts import shielded_ledger_writes
 from knuth_runtime.invocation import RuntimeInvocation
 from knuth_runtime.ledger import OpenToolBatch, RunLedgerState
+from knuth_runtime.middleware import MessageMiddlewareCheckpoint
 
 # Reasons that mean active work was deliberately stopped, so the abandoned
 # attempt collapses to a durable INTERRUPTED fact rather than a resumable pause.
@@ -225,11 +226,24 @@ async def _run_step(
     ctx = RunContext(
         run_id=run_id,
     )
+    middleware_result = None
+    if services.message_middleware_runner is not None:
+        middleware_result = await services.message_middleware_runner.run_checkpoint(
+            run_id,
+            MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST,
+        )
+        await services.message_middleware_runner.assert_checkpoint_complete(
+            run_id,
+            MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST,
+        )
     view = await services.context_builder.build(
         ctx,
         model_config_fingerprint=inference_config.model_dump_json(
             exclude={"run_id", "trace_id"}
         ),
+        ephemeral_rewrite_records=middleware_result.ephemeral_records
+        if middleware_result is not None
+        else None,
     )
     assert view.snapshot is not None
     await invocation.emit(
@@ -379,6 +393,7 @@ async def _run_step(
                 turns=state.run.steps + 1,
             )
         )
+        await _run_after_turn_closed(invocation)
         return RunStatus.SUCCEEDED
 
     # Verification failure must carry feedback the model will see next turn;
@@ -395,6 +410,7 @@ async def _run_step(
 async def settle_crashed_invocations(
     emit: Callable[..., Awaitable[object]],
     batch: OpenToolBatch,
+    after_completion: Callable[[], Awaitable[object]] | None = None,
 ) -> tuple[int, int]:
     """Crash recovery, split by effect (design §5.2): retryable effects fail
     loudly so the model can retry; external writes may have happened and
@@ -424,6 +440,8 @@ async def settle_crashed_invocations(
                     tool_status="crashed",
                 )
             )
+            if after_completion is not None:
+                await after_completion()
             failed += 1
     return failed, unknown
 
@@ -439,7 +457,11 @@ async def _drive_open_batch(
     batch = state.open_batch
     assert batch is not None
 
-    await settle_crashed_invocations(invocation.emit, batch)
+    await settle_crashed_invocations(
+        invocation.emit,
+        batch,
+        lambda: _run_after_tool_result_committed(invocation),
+    )
 
     # Propose: pure decision, safe to repeat after a crash.
     for inv in batch.by_status(ToolInvocationStatus.PROPOSED):
@@ -494,6 +516,7 @@ async def _drive_open_batch(
                     ),
                 )
             )
+            await _run_after_tool_result_committed(invocation)
 
     # Awaiting approval gates the run. Crash recovery: re-request a missing
     # approval record with a generic title; policy facts are already frozen.
@@ -550,6 +573,7 @@ async def _drive_open_batch(
             await _collapse_tool_interrupt(
                 invocation, batch, abandoned=approved[position:]
             )
+            await _run_after_tool_result_committed(invocation)
             return RunStatus.INTERRUPTED
 
         await invocation.emit(
@@ -588,8 +612,10 @@ async def _drive_open_batch(
                 abandoned=approved[position + 1 :],
                 active=completion,
             )
+            await _run_after_tool_result_committed(invocation)
             return RunStatus.INTERRUPTED
         await invocation.emit(completion)
+        await _run_after_tool_result_committed(invocation)
 
     # Re-read: a tool may have become UNKNOWN above and now gates the batch.
     state = await services.ledger.run_state(run_id)
@@ -605,6 +631,26 @@ async def _drive_open_batch(
 
     await invocation.emit(ToolBatchClosedDraft(batch_id=batch.batch_id))
     return None
+
+
+async def _run_after_tool_result_committed(invocation: RuntimeInvocation) -> None:
+    runner = invocation.services.message_middleware_runner
+    if runner is None:
+        return
+    await runner.run_checkpoint(
+        invocation.run_id,
+        MessageMiddlewareCheckpoint.AFTER_TOOL_RESULT_COMMITTED,
+    )
+
+
+async def _run_after_turn_closed(invocation: RuntimeInvocation) -> None:
+    runner = invocation.services.message_middleware_runner
+    if runner is None:
+        return
+    await runner.run_checkpoint(
+        invocation.run_id,
+        MessageMiddlewareCheckpoint.AFTER_TURN_CLOSED,
+    )
 
 
 async def _completion_for(
@@ -668,6 +714,7 @@ async def _abandon_unstarted(
     """
     for inv in unstarted:
         await invocation.emit(_abandon_draft(inv))
+        await _run_after_tool_result_committed(invocation)
 
 
 async def _collapse_tool_interrupt(

@@ -2,6 +2,8 @@ import unittest
 from typing import get_args
 
 from knuth.core.events import (
+    MessageRewriteAnchor,
+    MessageRewriteAnchorDraft,
     RunCancelled,
     RunCreated,
     RunInvocationEndedDraft,
@@ -111,6 +113,26 @@ class CoreModelTests(unittest.TestCase):
         parsed = parse_stored_runtime_event_json(stored.model_dump_json())
 
         self.assertIsInstance(parsed, RunCancelled)
+        self.assertEqual(parsed, stored)
+
+    def test_message_rewrite_event_round_trips_to_its_own_class(self) -> None:
+        stored = store_runtime_event(
+            "run-1",
+            4,
+            MessageRewriteAnchorDraft(
+                rewrite_id="rewrite-1",
+                kind="begin",
+                middleware="context_compaction",
+                operation="replace",
+                suppresses=["m:2"],
+            ),
+            event_id="evt-rewrite",
+            created_at="2026-06-16T00:00:00Z",
+        )
+
+        parsed = parse_stored_runtime_event_json(stored.model_dump_json())
+
+        self.assertIsInstance(parsed, MessageRewriteAnchor)
         self.assertEqual(parsed, stored)
 
     def test_every_union_member_declares_a_unique_type_tag(self) -> None:

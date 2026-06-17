@@ -25,6 +25,7 @@ from knuth_runtime.context import (
     ContextBuilder,
     ContextRedactor,
     SystemSectionProvider,
+    project_messages_from_events,
     reconstruct_messages_from_events,
 )
 from knuth_runtime.ledger import (
@@ -33,6 +34,13 @@ from knuth_runtime.ledger import (
     RefoldStats,
     RunLedger,
     SQLiteRunLedger,
+)
+from knuth_runtime.middleware import (
+    ContextCompactionMiddleware,
+    MessageMiddleware,
+    MessageMiddlewareCheckpoint,
+    MessageMiddlewareRunner,
+    ToolResultRedactionMiddleware,
 )
 from knuth_runtime.debug import DebugEventSink
 from knuth_runtime.loop import settle_crashed_invocations
@@ -162,6 +170,7 @@ class AgentRuntime:
                 tool_status="resolved_by_user",
             ),
         )
+        await self._run_after_tool_result_committed(invocation.run_id)
         return await ledger.get_invocation(tool_call_id)
 
     async def submit_tool_result(
@@ -194,7 +203,17 @@ class AgentRuntime:
                 tool_status=tool_status,
             ),
         )
+        await self._run_after_tool_result_committed(run_id)
         return await ledger.get_invocation(tool_call_id)
+
+    async def _run_after_tool_result_committed(self, run_id: str) -> None:
+        runner = self._services.message_middleware_runner
+        if runner is None:
+            return
+        await runner.run_checkpoint(
+            run_id,
+            MessageMiddlewareCheckpoint.AFTER_TOOL_RESULT_COMMITTED,
+        )
 
     async def status(self, run_id: str) -> RunStatus:
         return (await self._services.ledger.get_run(run_id)).status
@@ -227,6 +246,57 @@ class AgentRuntime:
         return await reconstruct_messages_from_events(
             events, self._services.ledger.get_artifact_text
         )
+
+    async def model_context_messages(self, run_id: str) -> list[InferenceMessage]:
+        events = await self._services.ledger.list_events(run_id)
+        state = await self._services.ledger.run_state(run_id)
+        return await project_messages_from_events(
+            events,
+            self._services.ledger.get_artifact_text,
+            allow_open_tool_batch=state.open_batch is not None,
+        )
+
+    async def rewrite_audit(self, run_id: str) -> list[dict]:
+        events = await self._services.ledger.list_events(run_id)
+        audit: list[dict] = []
+        active: dict[str, dict] = {}
+        for event in events:
+            if event.type == "message.rewrite_anchor" and event.kind == "begin":
+                record = {
+                    "rewrite_id": event.rewrite_id,
+                    "middleware": event.middleware,
+                    "operation": event.operation,
+                    "position": event.position.model_dump()
+                    if event.position is not None
+                    else None,
+                    "suppresses": list(event.suppresses),
+                    "metadata": dict(event.metadata),
+                    "replacement_messages": [],
+                    "begin_seq": event.seq,
+                    "end_seq": None,
+                }
+                active[event.rewrite_id] = record
+                audit.append(record)
+            elif event.type == "message.rewrite_message":
+                record = active.get(event.rewrite_id)
+                if record is not None:
+                    record["replacement_messages"].append(
+                        {
+                            "message_id": event.message_id,
+                            "index": event.index,
+                            "role": event.message.role.value,
+                            "content": event.message.content,
+                            "tool_call_id": event.message.tool_call_id,
+                            "tool_name": event.message.tool_name,
+                            "metadata": dict(event.metadata),
+                            "seq": event.seq,
+                        }
+                    )
+            elif event.type == "message.rewrite_anchor" and event.kind == "end":
+                record = active.pop(event.rewrite_id, None)
+                if record is not None:
+                    record["end_seq"] = event.seq
+        return audit
 
     async def tools(self) -> list[dict]:
         return await self._services.tool_broker.list_visible_tools("cli")
@@ -281,11 +351,19 @@ class AgentRuntime:
             failed = unknown = 0
             if state.open_batch is not None:
                 failed, unknown = await settle_crashed_invocations(
-                    apply_event, state.open_batch
+                    apply_event,
+                    state.open_batch,
+                    lambda _run_id=run.id: self._run_after_tool_result_committed(
+                        _run_id
+                    ),
                 )
                 if abandon_unstarted:
                     await self._abandon_unstarted_in_batch(
-                        apply_event, state.open_batch
+                        apply_event,
+                        state.open_batch,
+                        lambda _run_id=run.id: self._run_after_tool_result_committed(
+                            _run_id
+                        ),
                     )
             await ledger.apply(
                 run.id,
@@ -297,7 +375,9 @@ class AgentRuntime:
         return reports
 
     @staticmethod
-    async def _abandon_unstarted_in_batch(apply_event, batch) -> None:
+    async def _abandon_unstarted_in_batch(
+        apply_event, batch, after_completion=None
+    ) -> None:
         from knuth.core.invocations import ToolInvocationStatus
 
         unstarted = batch.by_status(
@@ -320,6 +400,8 @@ class AgentRuntime:
                     tool_status="abandoned",
                 )
             )
+            if after_completion is not None:
+                await after_completion()
 
 
 class _DemoInferenceClient:
@@ -347,12 +429,20 @@ def _build_tool_registry(
     return ToolRegistry(enable_entry_point_discovery=enable_plugins)
 
 
+def _default_message_middlewares() -> list[MessageMiddleware]:
+    return [
+        ToolResultRedactionMiddleware(),
+        ContextCompactionMiddleware(),
+    ]
+
+
 def build_sqlite_runtime(
     *,
     inference_client,
     inference_config: InferenceConfig,
     db_path: Path | str | None = None,
     section_providers: list[SystemSectionProvider] | None = None,
+    message_middlewares: list[MessageMiddleware] | None = None,
     tool_providers: Iterable[ToolProvider] = (),
     include_default_tools: bool = True,
     redactor: EventRedactor | None = None,
@@ -371,10 +461,17 @@ def build_sqlite_runtime(
     for provider in tool_providers:
         registry.add_provider(provider)
     broker = ToolBroker(registry, policy_engine=PolicyEngine())
+    message_middleware_runner = MessageMiddlewareRunner(
+        ledger,
+        message_middlewares
+        if message_middlewares is not None
+        else _default_message_middlewares(),
+    )
     services = RuntimeServices(
         inference_client=inference_client,
         tool_broker=broker,
         ledger=ledger,
+        message_middleware_runner=message_middleware_runner,
         context_builder=ContextBuilder(
             ledger,
             broker,
@@ -407,6 +504,7 @@ def build_memory_runtime(
     ledger: RunLedger | None = None,
     tool_broker: ToolBroker | None = None,
     section_providers: list[SystemSectionProvider] | None = None,
+    message_middlewares: list[MessageMiddleware] | None = None,
     tool_providers: Iterable[ToolProvider] = (),
     include_default_tools: bool = True,
 ) -> AgentRuntime:
@@ -421,10 +519,17 @@ def build_memory_runtime(
         tool_broker = ToolBroker(
             registry, policy_engine=PolicyEngine()
         )
+    message_middleware_runner = MessageMiddlewareRunner(
+        ledger,
+        message_middlewares
+        if message_middlewares is not None
+        else _default_message_middlewares(),
+    )
     services = RuntimeServices(
         inference_client=inference_client,
         tool_broker=tool_broker,
         ledger=ledger,
+        message_middleware_runner=message_middleware_runner,
         context_builder=ContextBuilder(
             ledger,
             tool_broker,

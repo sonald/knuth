@@ -3,6 +3,12 @@
 ## 状态
 Proposed
 
+> 注：本文的 `SystemPreamble` / `SystemSectionProvider` 决策仍有效；其中对
+> `MessageMiddleware` 的旧式描述已由
+> [MessageMiddleware 需求与设计](../message-middleware-requirements-and-design.md)
+> 修订。新的 `MessageMiddleware` 是生命周期 checkpoint 上的
+> `MessageTape` rewrite 组件，而不是一次性的 `ContextView` mutator。
+
 ## 日期
 2026-06-09
 
@@ -50,9 +56,9 @@ text: str
 async def sections(ctx: RunContext) -> list[SystemSection]
 ```
 
-它与 `MessageMiddleware` **正交**：`MessageMiddleware.process(ctx, view) -> view` 是改写整个 view 的重型、全权 seam（裁剪 / 压缩历史 / 注入诊断）；`SystemSectionProvider` 是 additive、最小权限的，只贡献片段，无权改动 messages / tools。一个**贡献**，一个**改写**。
+它与 `MessageMiddleware` **正交**：`SystemSectionProvider` 是 additive、最小权限的 preamble fragment 贡献者，只贡献片段，无权改动 conversation tape / messages / tools；`MessageMiddleware` 是绑定到 run 生命周期 checkpoint 的 `MessageTape` rewrite 组件，通过 internal anchors 和 replacement messages 表达注入、遮蔽、替换、压缩或 redaction。一个**贡献 preamble**，一个**改写 MessageTape**。
 
-provider 在**构造期由 agent 注入** `ContextBuilder`（与现有 `middlewares` 同一注入路径）。「用户级 prompt 从哪读」属于 agent 边缘的策略，由构造方决定（CLI flag / env / 文件均可），core 与 runtime **不预设配置格式**。现在唯一的 agent 是 knuth-cli，它在自己的 `build_runtime` 装配 `base` 与 `user` 两个 provider；runtime 的 `build_default_runtime` 只保留为 demo / 测试 helper，不承担 agent 配置策略。未来不同 agent、不同构造阶段可以分层叠加 provider。
+provider 在**构造期由 agent 注入** `ContextBuilder`。「用户级 prompt 从哪读」属于 agent 边缘的策略，由构造方决定（CLI flag / env / 文件均可），core 与 runtime **不预设配置格式**。现在唯一的 agent 是 knuth-cli，它在自己的 `build_runtime` 装配 `base` 与 `user` 两个 provider；runtime 的 `build_default_runtime` 只保留为 demo / 测试 helper，不承担 agent 配置策略。未来不同 agent、不同构造阶段可以分层叠加 provider。
 
 ### 装配流程
 
@@ -62,9 +68,9 @@ provider 在**构造期由 agent 注入** `ContextBuilder`（与现有 `middlewa
 2. 聚合所有 `SystemSectionProvider` 的 `SystemSection`；
 3. 按 **provider 注入顺序**（list 顺序，同 provider 内 list 顺序）用 `\n\n` 拼成一条 `InferenceMessage(role=SYSTEM)`；不引入显式 `priority` 数字，调顺序即调注入位置；core 不自动加 heading 文案；
 4. 把这条 system message **prepend 到 `messages[0]`**；若没有任何非空 section，则不加（绝不发空 system message）；
-5. 再跑 `MessageMiddleware`。
+5. 进入后续 MessageTape projection / rewrite pipeline。`SystemPreamble` 本身仍是 build-time projection；若后续 middleware 注入额外 system/context 内容，由 projection 层负责把 provider 需要的 leading system message 排列或合并为合法形态。
 
-`SystemPreamble` 的载体就是 `messages[0]`，因此 `loop` 与 `InferenceClient.stream` **零改动**，复用已有的 `InferenceRole.SYSTEM` 映射。
+在没有额外 tape rewrite 的情况下，`SystemPreamble` 的载体就是 `messages[0]`，因此 `loop` 与 `InferenceClient.stream` 复用已有的 `InferenceRole.SYSTEM` 映射。若引入 `MessageMiddleware` 注入 system/context 内容，最终仍由 projection 输出 provider-valid 的 `InferenceMessage` 列表。
 
 ## 后果
 
@@ -82,9 +88,9 @@ provider 在**构造期由 agent 注入** `ContextBuilder`（与现有 `middlewa
 
 拒绝。preamble 的来源天然动态（memory 召回、可用 skills、可编辑的用户级 prompt），事件化会让历史膨胀，并把「当前框架」误当「发生过的事实」。事件日志只保留对话与 coarse runtime 事实。
 
-### 复用 `MessageMiddleware` 贡献 preamble
+### 复用 `MessageMiddleware` 贡献用户级 preamble
 
-拒绝。middleware 的契约是改写整个 view，是重型、全权 seam。让它同时承担「贡献 section」会糊掉职责。贡献与改写应是两个正交 seam。
+拒绝。用户级系统提示、基础运行时指令这类稳定 preamble fragment 仍应走 `SystemSectionProvider`，避免为了一个字符串引入 tape rewrite。新的 `MessageMiddleware` 可以做 `AgentsMD` 这类与 tape、snapshot、future plugin 体系相关的 context injection，但这不改变本 ADR 的基本边界：`SystemSectionProvider` 负责贡献 preamble fragment，`MessageMiddleware` 负责结构化改写 MessageTape。
 
 ### 由 runtime 规定用户级 prompt 的配置文件契约
 

@@ -8,7 +8,7 @@ from knuth_runtime import AgentRuntime, build_sqlite_runtime
 from knuth_runtime.debug import DEFAULT_DEBUG_SINK_DIR
 
 from knuth_cli.config import load_config
-from knuth_cli.prompts import build_cli_system_sections
+from knuth_cli.prompts import build_cli_message_middlewares, build_cli_system_sections
 from knuth_cli.tools import create_cli_tool_provider
 
 
@@ -31,6 +31,7 @@ async def build_runtime(
         inference_config=InferenceConfig(timeout_s=config.timeout),
         db_path=db_path,
         section_providers=build_cli_system_sections(config.system_prompt),
+        message_middlewares=build_cli_message_middlewares(),
         tool_providers=[create_cli_tool_provider()],
         include_default_tools=True,
         enable_plugins=enable_plugins,

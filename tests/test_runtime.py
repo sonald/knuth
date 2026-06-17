@@ -31,11 +31,14 @@ from knuth.core.runtime_events import (
     ApprovalRequestedDraft,
     ApprovalResolvedDraft,
     ContextSnapshot,
+    MessageRewriteAnchorDraft,
+    MessageRewriteMessageDraft,
     ModelCompletedDraft,
     PlannedToolCall,
     RunResumedDraft,
     RunSucceededDraft,
     StepStartedDraft,
+    TapePosition,
     ToolBatchClosedDraft,
     ToolBatchPlannedDraft,
     ToolInvocationCompletedDraft,
@@ -52,6 +55,8 @@ from knuth_runtime import (
     DebugEventSink,
     LedgerError,
     MemoryRunLedger,
+    AgentsMDMiddleware,
+    ContextCompactionMiddleware,
     RegexSecretRedactor,
     SQLiteRunLedger,
     build_memory_runtime,
@@ -60,6 +65,7 @@ from knuth_runtime import (
 from knuth_runtime.context import (
     StaticSectionProvider,
     assemble_preamble,
+    project_messages_from_events,
     reconstruct_messages_from_events,
 )
 from knuth_runtime.loop import EMPTY_ANSWER_FEEDBACK, OBSERVATION_INLINE_LIMIT
@@ -121,6 +127,206 @@ class RunLedgerTests(unittest.TestCase):
         run, fetched = anyio.run(scenario)
         self.assertEqual(run.id, "run_manual")
         self.assertEqual(fetched.query, "hello")
+
+    def test_message_rewrite_replace_suppresses_target_on_replay(self) -> None:
+        ledger = MemoryRunLedger()
+
+        async def scenario():
+            run = await ledger.create_run("hello")
+            await ledger.apply(run.id, UserMessageDraft(content="raw message"))
+            await ledger.apply_many(
+                run.id,
+                [
+                    MessageRewriteAnchorDraft(
+                        rewrite_id="rewrite-1",
+                        kind="begin",
+                        middleware="context_compaction",
+                        operation="replace",
+                        suppresses=["m:2"],
+                        metadata={"reason": "test"},
+                    ),
+                    MessageRewriteMessageDraft(
+                        rewrite_id="rewrite-1",
+                        index=0,
+                        message_id="mw:rewrite-1:0",
+                        message=InferenceMessage(
+                            role=InferenceRole.USER,
+                            content="Earlier context summary: raw message",
+                        ),
+                    ),
+                    MessageRewriteAnchorDraft(
+                        rewrite_id="rewrite-1",
+                        kind="end",
+                        middleware="context_compaction",
+                        operation="replace",
+                    ),
+                ],
+            )
+            events = await ledger.list_events(run.id)
+            messages = await project_messages_from_events(
+                events, ledger.get_artifact_text
+            )
+            await ledger.refold()
+            return messages, await ledger.list_events(run.id)
+
+        messages, events_after_refold = anyio.run(scenario)
+        self.assertEqual([message.content for message in messages], [
+            "Earlier context summary: raw message"
+        ])
+        self.assertEqual(
+            [event.type for event in events_after_refold][-3:],
+            [
+                "message.rewrite_anchor",
+                "message.rewrite_message",
+                "message.rewrite_anchor",
+            ],
+        )
+
+    def test_message_rewrite_rejects_conflicting_replace(self) -> None:
+        ledger = MemoryRunLedger()
+
+        async def scenario():
+            run = await ledger.create_run("hello")
+            await ledger.apply(run.id, UserMessageDraft(content="raw message"))
+            patch = [
+                MessageRewriteAnchorDraft(
+                    rewrite_id="rewrite-1",
+                    kind="begin",
+                    middleware="context_compaction",
+                    operation="replace",
+                    suppresses=["m:2"],
+                ),
+                MessageRewriteMessageDraft(
+                    rewrite_id="rewrite-1",
+                    index=0,
+                    message_id="mw:rewrite-1:0",
+                    message=InferenceMessage(
+                        role=InferenceRole.USER,
+                        content="summary",
+                    ),
+                ),
+                MessageRewriteAnchorDraft(
+                    rewrite_id="rewrite-1",
+                    kind="end",
+                    middleware="context_compaction",
+                    operation="replace",
+                ),
+            ]
+            await ledger.apply_many(run.id, patch)
+            with self.assertRaises(LedgerError):
+                await ledger.apply_many(
+                    run.id,
+                    [
+                        MessageRewriteAnchorDraft(
+                            rewrite_id="rewrite-2",
+                            kind="begin",
+                            middleware="context_compaction",
+                            operation="replace",
+                            suppresses=["m:2"],
+                        ),
+                        MessageRewriteMessageDraft(
+                            rewrite_id="rewrite-2",
+                            index=0,
+                            message_id="mw:rewrite-2:0",
+                            message=InferenceMessage(
+                                role=InferenceRole.USER,
+                                content="other summary",
+                            ),
+                        ),
+                        MessageRewriteAnchorDraft(
+                            rewrite_id="rewrite-2",
+                            kind="end",
+                            middleware="context_compaction",
+                            operation="replace",
+                        ),
+                    ],
+                )
+
+            anyio.run(scenario)
+
+    def test_message_rewrite_insert_position_affects_later_span_validation(self) -> None:
+        async def scenario():
+            ledger = MemoryRunLedger()
+            run = await ledger.create_run("hello")
+            await ledger.apply(run.id, UserMessageDraft(content="left"))
+            await ledger.apply(run.id, UserMessageDraft(content="right"))
+            await ledger.apply_many(
+                run.id,
+                [
+                    MessageRewriteAnchorDraft(
+                        rewrite_id="insert-1",
+                        kind="begin",
+                        middleware="agents_md",
+                        operation="insert",
+                        position=TapePosition(kind="before", target_id="m:3"),
+                    ),
+                    MessageRewriteMessageDraft(
+                        rewrite_id="insert-1",
+                        index=0,
+                        message_id="mw:insert-1:0",
+                        message=InferenceMessage(
+                            role=InferenceRole.USER, content="middle"
+                        ),
+                    ),
+                    MessageRewriteAnchorDraft(
+                        rewrite_id="insert-1",
+                        kind="end",
+                        middleware="agents_md",
+                        operation="insert",
+                    ),
+                ],
+            )
+            with self.assertRaisesRegex(
+                LedgerError, "replace target ids must be a contiguous projected span"
+            ):
+                await ledger.apply_many(
+                    run.id,
+                    [
+                        MessageRewriteAnchorDraft(
+                            rewrite_id="replace-1",
+                            kind="begin",
+                            middleware="context_compaction",
+                            operation="replace",
+                            suppresses=["m:2", "m:3"],
+                        ),
+                        MessageRewriteMessageDraft(
+                            rewrite_id="replace-1",
+                            index=0,
+                            message_id="mw:replace-1:0",
+                            message=InferenceMessage(
+                                role=InferenceRole.USER, content="summary"
+                            ),
+                        ),
+                        MessageRewriteAnchorDraft(
+                            rewrite_id="replace-1",
+                            kind="end",
+                            middleware="context_compaction",
+                            operation="replace",
+                        ),
+                    ],
+                )
+
+        anyio.run(scenario)
+
+    def test_message_rewrite_events_must_be_atomic(self) -> None:
+        ledger = MemoryRunLedger()
+
+        async def scenario():
+            run = await ledger.create_run("hello")
+            await ledger.apply(run.id, UserMessageDraft(content="raw message"))
+            with self.assertRaises(LedgerError):
+                await ledger.apply(
+                    run.id,
+                    MessageRewriteAnchorDraft(
+                        rewrite_id="rewrite-1",
+                        kind="begin",
+                        middleware="context_compaction",
+                        operation="replace",
+                        suppresses=["m:2"],
+                    ),
+                )
+
+        anyio.run(scenario)
 
     def test_sqlite_ledger_round_trips_events_and_projections(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -612,6 +818,104 @@ class RefoldTests(unittest.TestCase):
             self.assertEqual(run.status, RunStatus.SUCCEEDED)
             self.assertEqual(invocation.status, ToolInvocationStatus.SUCCEEDED)
 
+    def test_tool_result_rewrite_preserves_tool_call_shape(self) -> None:
+        ledger = MemoryRunLedger()
+
+        async def scenario():
+            run_id = await _drive_full_run(ledger)
+            events = await ledger.list_events(run_id)
+            tool_event = next(
+                event for event in events if event.type == "tool.invocation_completed"
+            )
+            target_id = f"m:{tool_event.seq}"
+            await ledger.apply_many(
+                run_id,
+                [
+                    MessageRewriteAnchorDraft(
+                        rewrite_id="redact-c1",
+                        kind="begin",
+                        middleware="tool_result_redaction",
+                        operation="replace",
+                        suppresses=[target_id],
+                    ),
+                    MessageRewriteMessageDraft(
+                        rewrite_id="redact-c1",
+                        index=0,
+                        message_id="mw:redact-c1:0",
+                        message=InferenceMessage(
+                            role=InferenceRole.TOOL_RESULT,
+                            tool_call_id="c1",
+                            tool_name="write_file",
+                            content="Result redacted for context headroom.",
+                        ),
+                    ),
+                    MessageRewriteAnchorDraft(
+                        rewrite_id="redact-c1",
+                        kind="end",
+                        middleware="tool_result_redaction",
+                        operation="replace",
+                    ),
+                ],
+            )
+            messages = await project_messages_from_events(
+                await ledger.list_events(run_id), ledger.get_artifact_text
+            )
+            return messages
+
+        messages = anyio.run(scenario)
+        tool_messages = [
+            message
+            for message in messages
+            if message.role == InferenceRole.TOOL_RESULT
+        ]
+        self.assertEqual(len(tool_messages), 1)
+        self.assertEqual(tool_messages[0].tool_call_id, "c1")
+        self.assertEqual(
+            tool_messages[0].content, "Result redacted for context headroom."
+        )
+
+    def test_tool_result_rewrite_rejects_different_tool_call_id(self) -> None:
+        ledger = MemoryRunLedger()
+
+        async def scenario():
+            run_id = await _drive_full_run(ledger)
+            events = await ledger.list_events(run_id)
+            tool_event = next(
+                event for event in events if event.type == "tool.invocation_completed"
+            )
+            with self.assertRaises(LedgerError):
+                await ledger.apply_many(
+                    run_id,
+                    [
+                        MessageRewriteAnchorDraft(
+                            rewrite_id="bad-redact",
+                            kind="begin",
+                            middleware="tool_result_redaction",
+                            operation="replace",
+                            suppresses=[f"m:{tool_event.seq}"],
+                        ),
+                        MessageRewriteMessageDraft(
+                            rewrite_id="bad-redact",
+                            index=0,
+                            message_id="mw:bad-redact:0",
+                            message=InferenceMessage(
+                                role=InferenceRole.TOOL_RESULT,
+                                tool_call_id="other",
+                                tool_name="write_file",
+                                content="bad",
+                            ),
+                        ),
+                        MessageRewriteAnchorDraft(
+                            rewrite_id="bad-redact",
+                            kind="end",
+                            middleware="tool_result_redaction",
+                            operation="replace",
+                        ),
+                    ],
+                )
+
+        anyio.run(scenario)
+
 
 async def _setup_proposed_batch(
     ledger,
@@ -713,7 +1017,7 @@ class CapturingScriptedClient(ScriptedInferenceClient):
             yield event
 
 
-def _build_runtime(client, section_providers=None):
+def _build_runtime(client, section_providers=None, message_middlewares=None):
     registry = create_default_registry()
     broker = ToolBroker(registry, PolicyEngine())
     return build_memory_runtime(
@@ -722,6 +1026,7 @@ def _build_runtime(client, section_providers=None):
         ledger=MemoryRunLedger(),
         tool_broker=broker,
         section_providers=section_providers,
+        message_middlewares=message_middlewares,
     )
 
 
@@ -1022,14 +1327,193 @@ class EventDrivenRuntimeTests(unittest.TestCase):
         self.assertIsNone(completed[0].observation)
         self.assertIsNotNone(completed[0].artifact_ref)
         self.assertTrue(completed[0].observation_preview)
-        # The model still sees the full tool result through the conversation fold.
+        raw_messages = anyio.run(runtime.messages, turn.run_id)
+        raw_tool_results = [
+            message
+            for message in raw_messages
+            if message.role == InferenceRole.TOOL_RESULT
+        ]
+        self.assertIn(big, raw_tool_results[0].content or "")
+        model_context = anyio.run(runtime.model_context_messages, turn.run_id)
+        model_tool_results = [
+            message
+            for message in model_context
+            if message.role == InferenceRole.TOOL_RESULT
+        ]
+        self.assertTrue(
+            (model_tool_results[0].content or "").startswith(
+                "Result redacted for context headroom."
+            )
+        )
+        audit = anyio.run(runtime.rewrite_audit, turn.run_id)
+        self.assertEqual(audit[0]["operation"], "replace")
+        self.assertEqual(audit[0]["middleware"], "tool_result_redaction")
+        self.assertEqual(len(audit[0]["replacement_messages"]), 1)
+
+        # The next model request sees the projection-redacted replacement.
         final_turn = client.captured_messages[-1]
         tool_results = [
             message
             for message in final_turn
             if message.role == InferenceRole.TOOL_RESULT
         ]
-        self.assertIn(big, tool_results[0].content or "")
+        self.assertTrue(
+            (tool_results[0].content or "").startswith(
+                "Result redacted for context headroom."
+            )
+        )
+        self.assertNotIn(big, tool_results[0].content or "")
+
+    def test_agents_md_injection_is_ephemeral_and_affects_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            agents_path = Path(workspace, "AGENTS.md")
+            agents_path.write_text("Always answer with repo context.", encoding="utf-8")
+            client = CapturingScriptedClient(
+                [InferenceMessage(role=InferenceRole.ASSISTANT, content="done")]
+            )
+            runtime = _build_runtime(
+                client,
+                message_middlewares=[AgentsMDMiddleware([agents_path])],
+            )
+
+            turn = anyio.run(runtime.run_once, "hello")
+            events = anyio.run(runtime.events, turn.run_id)
+
+        self.assertIn("Always answer with repo context.", client.captured_messages[0][0].content)
+        self.assertEqual(client.captured_messages[0][0].role, InferenceRole.SYSTEM)
+        self.assertNotIn("message.rewrite_anchor", [event.type for event in events])
+        step = next(event for event in events if event.type == "step.started")
+        self.assertEqual(step.snapshot.message_count, len(client.captured_messages[0]))
+
+    def test_model_context_messages_allows_open_tool_batch(self) -> None:
+        async def scenario():
+            ledger = MemoryRunLedger()
+            run_id = await _setup_awaiting_approval(ledger)
+            runtime = build_memory_runtime(
+                inference_client=ScriptedInferenceClient([]),
+                inference_config=InferenceConfig(),
+                ledger=ledger,
+                include_default_tools=False,
+            )
+            status = await runtime.status(run_id)
+            messages = await runtime.model_context_messages(run_id)
+            return status, messages
+
+        status, messages = anyio.run(scenario)
+
+        self.assertEqual(status, RunStatus.WAITING_APPROVAL)
+        assistant = [m for m in messages if m.role == InferenceRole.ASSISTANT][-1]
+        self.assertEqual(assistant.tool_calls[0].effective_id, "c1")
+
+    def test_turn_closed_compaction_is_durable_and_used_on_continue(self) -> None:
+        client = CapturingScriptedClient(
+            [
+                InferenceMessage(role=InferenceRole.ASSISTANT, content="first answer"),
+                InferenceMessage(role=InferenceRole.ASSISTANT, content="second answer"),
+            ]
+        )
+        runtime = _build_runtime(
+            client,
+            message_middlewares=[
+                ContextCompactionMiddleware(max_messages=1, keep_last=1)
+            ],
+        )
+
+        first = anyio.run(runtime.run_once, "first question")
+
+        async def continue_once():
+            async with runtime.continue_run(first.run_id, "second question") as session:
+                return await session.result()
+
+        anyio.run(continue_once)
+        events = anyio.run(runtime.events, first.run_id)
+
+        self.assertIn("message.rewrite_anchor", [event.type for event in events])
+        second_call_contents = [
+            message.content for message in client.captured_messages[1]
+        ]
+        self.assertIn(
+            "Earlier context summary:\nfirst question",
+            second_call_contents,
+        )
+
+    def test_compaction_can_process_later_uncompacted_messages(self) -> None:
+        client = CapturingScriptedClient(
+            [
+                InferenceMessage(role=InferenceRole.ASSISTANT, content="first answer"),
+                InferenceMessage(role=InferenceRole.ASSISTANT, content="second answer"),
+            ]
+        )
+        runtime = _build_runtime(
+            client,
+            message_middlewares=[
+                ContextCompactionMiddleware(max_messages=1, keep_last=1)
+            ],
+        )
+
+        first = anyio.run(runtime.run_once, "first question")
+
+        async def continue_once():
+            async with runtime.continue_run(first.run_id, "second question") as session:
+                return await session.result()
+
+        anyio.run(continue_once)
+        events = anyio.run(runtime.events, first.run_id)
+        compaction_begins = [
+            event
+            for event in events
+            if event.type == "message.rewrite_anchor"
+            and event.kind == "begin"
+            and event.middleware == "context_compaction"
+        ]
+
+        self.assertGreaterEqual(len(compaction_begins), 2)
+
+    def test_before_model_request_compaction_recovers_missed_turn_closed_write(self) -> None:
+        ledger = MemoryRunLedger()
+        first_client = CapturingScriptedClient(
+            [InferenceMessage(role=InferenceRole.ASSISTANT, content="first answer")]
+        )
+        first_runtime = build_memory_runtime(
+            inference_client=first_client,
+            inference_config=InferenceConfig(),
+            ledger=ledger,
+            message_middlewares=[],
+            include_default_tools=False,
+        )
+        first = anyio.run(first_runtime.run_once, "first question")
+        self.assertNotIn(
+            "message.rewrite_anchor",
+            [event.type for event in anyio.run(first_runtime.events, first.run_id)],
+        )
+
+        second_client = CapturingScriptedClient(
+            [InferenceMessage(role=InferenceRole.ASSISTANT, content="second answer")]
+        )
+        second_runtime = build_memory_runtime(
+            inference_client=second_client,
+            inference_config=InferenceConfig(),
+            ledger=ledger,
+            message_middlewares=[
+                ContextCompactionMiddleware(max_messages=1, keep_last=1)
+            ],
+            include_default_tools=False,
+        )
+
+        async def continue_once():
+            async with second_runtime.continue_run(
+                first.run_id, "second question"
+            ) as session:
+                return await session.result()
+
+        anyio.run(continue_once)
+        events = anyio.run(second_runtime.events, first.run_id)
+
+        self.assertIn("message.rewrite_anchor", [event.type for event in events])
+        self.assertIn(
+            "Earlier context summary:\nfirst question\nfirst answer",
+            [message.content for message in second_client.captured_messages[0]],
+        )
 
 
 class CrashRecoveryTests(unittest.TestCase):
