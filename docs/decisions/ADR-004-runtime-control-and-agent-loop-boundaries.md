@@ -1,7 +1,7 @@
 # ADR-004: RuntimeControl 与 AgentLoop 边界
 
 ## 状态
-Proposed
+Accepted
 
 > 注：本文关于 runtime control、live observation、blocking hook 的边界仍有效；
 > 其中 `MessageMiddleware` 的能力描述已由

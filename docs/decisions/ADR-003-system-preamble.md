@@ -1,7 +1,7 @@
 # ADR-003: SystemPreamble 装配与不持久化
 
 ## 状态
-Proposed
+Accepted
 
 > 注：本文的 `SystemPreamble` / `SystemSectionProvider` 决策仍有效；其中对
 > `MessageMiddleware` 的旧式描述已由

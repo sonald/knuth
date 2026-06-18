@@ -159,3 +159,27 @@ _Avoid_: failed, retryable error, timeout, denial, interrupted-by-user
 **AGUITransport**:
 The boundary that adapts an already-constructed `AgentRuntime` to a Web (AG-UI / CopilotKit) frontend, as knuth-cli adapts one to a terminal. It never builds a runtime and never decides server-side tools, prompt, or policy — those are agent policy and belong to the knuth-im host/runtime factory. It may own the AG-UI client-tool provider type because that is protocol adaptation, but the host explicitly registers that provider in the runtime and passes the same provider to `create_app(runtime, client_tool_provider=...)`. It observes runtime events and translates them to the AG-UI event vocabulary, routes explicit control intent to `RuntimeControl` or live `RunSession` operations, and answers read-only ledger queries. Its streaming response is only a subscription: passive SSE disconnects unsubscribe and do not interrupt or pause a run. A transport or host live manager, not `AgentRuntime`, owns routing to the active `RunSession`; UI stop sends an `InterruptSignal`, and re-opening the same run attaches to the live invocation or restores the latest actionable state rather than starting a duplicate invocation. When `RUNNING` is removed from resumable statuses, this live manager owns the replacement attach/reentry path so RUNNING runs do not fall through to ordinary resume errors. If the live manager force-cancels an invocation after deadline, it must call runtime recovery/control to complete a conservative durable outcome instead of dropping a zombie RUNNING session. It owns no agent policy, holds no durable run state of its own, and leaks no HTTP/AG-UI concept back into the runtime; the runtime may grow only additive, audience-neutral seams to serve it. Its concrete adapters and protocol mapping live in the knuth-agui package and ADR-006, not in this glossary.
 _Avoid_: runtime extension, agent policy owner, runtime factory, control authority, server tool provider owner, CopilotKit/HTTP concept inside runtime, Node CopilotRuntime
+
+**Observation**:
+The model-visible text of a finished tool invocation — what the next model request reads as the `tool_result`. It is mandatory and self-contained; an `Artifact` may hold the full raw output behind it, but the observation is never a rehydration of that raw blob.
+_Avoid_: raw tool output, observation preview, rehydrated content, offloaded result
+
+**ObservationCondensation**:
+Shrinking an `Observation` for context economy while keeping the tool-call / tool-result structure valid. It is purely a context-size concern and never a path for clearing secrets. Either a `SelfCondensingTool` condenses its own observation (and is then exempt), or a pluggable middleware backend condenses observations that arrived un-condensed; the runtime never re-condenses a self-condensed observation.
+_Avoid_: redaction, secret masking, conversation compaction, generic truncation
+
+**Redaction**:
+Masking secrets — keys, tokens, credentials — before anything durable or model-visible is produced. It runs on event append and on artifact write and is irreversible by design. Distinct from `ObservationCondensation`, which only trims size and must never be relied on to clean secrets.
+_Avoid_: context trimming, observation condensation, size limit, headroom excerpt
+
+**SelfCondensingTool**:
+A tool that archives its full output to the `ArtifactStore` and returns an already-condensed `Observation`, embedding the artifact's local filesystem path so the model can query it with ordinary shell tools. It marks the result so `ObservationCondensation` skips it; the runtime trusts the tool to know the best shape for its own data and applies no per-result fallback.
+_Avoid_: streaming tool, raw-output tool, offload-only tool, preview tool
+
+**Artifact**:
+An immutable blob of a tool's full output, always materializable as a local filesystem path so the model can inspect it with `grep`, `jq`, `find`. Events reference it by id only; its bytes live in the `ArtifactStore`, never inline in the ledger, and secrets are masked on write.
+_Avoid_: ledger side blob, SQL row, inline tool output, rehydration source
+
+**ArtifactStore**:
+The standalone, runtime-independent store that owns artifact bytes. Filesystem-backed today (a future general storage protocol may put the bytes on remote storage), but it must always resolve a `(run_id, artifact id)` pair to a local filesystem path so generic shell tools keep working — a per-run manifest maps ids to files, because an id alone does not encode its run or extension. It is not part of the ledger; the ledger — SQL or in-memory — only references artifacts by id.
+_Avoid_: ledger side store, blob column, runtime-owned storage, database table
