@@ -53,6 +53,7 @@ from knuth.core.tools import ToolResult
 from knuth.core.types import RunStatus
 from knuth_llmd import InferenceConfig
 from knuth_runtime import (
+    AgentRuntime,
     CrashRecoveryReport,
     DebugEventSink,
     LedgerError,
@@ -74,6 +75,7 @@ from knuth_runtime import (
     build_sqlite_runtime,
 )
 from knuth_runtime.context import (
+    ContextBuilder,
     StaticSectionProvider,
     TapeMessage,
     assemble_preamble,
@@ -83,6 +85,7 @@ from knuth_runtime.context import (
 from knuth_runtime.loop import EMPTY_ANSWER_FEEDBACK, OBSERVATION_INLINE_LIMIT
 from knuth_runtime.observation import RuntimeEventInterest, RuntimeObservationError
 from knuth_runtime.policy import PolicyEngine
+from knuth_runtime.services import RuntimeServices
 from knuth_toold import ToolBroker, create_default_registry
 from knuth_toold.base import ToolManifest, ToolRuntimeContext
 from knuth_toold.skills import SkillManager, SkillRoot
@@ -2430,6 +2433,69 @@ class StreamingRuntimeTests(unittest.TestCase):
         self.assertTrue(all(not event.type.startswith("inference.") for event in collected))
         deltas = [event.delta for event in collected if event.type == "model.content.delta"]
         self.assertEqual(deltas, ["Hello there"])
+
+    def test_run_session_emits_system_preamble_before_step_started(self) -> None:
+        async def scenario():
+            collector = _Collector()
+            client = CapturingInferenceClient(["Hello"])
+            runtime = _build_runtime(
+                client,
+                [StaticSectionProvider(SystemSectionSource.BASE, "BASE")],
+            )
+            async with runtime.start("hi", listeners=[collector]) as session:
+                result = await session.result()
+            durable_events = await runtime.events(result.run_id)
+            return result, collector.events, durable_events, client.captured_messages
+
+        result, collected, durable_events, captured_messages = anyio.run(scenario)
+
+        self.assertEqual(result.status, RunStatus.SUCCEEDED)
+        types = [event.type for event in collected]
+        preamble_index = types.index("context.system_preamble.built")
+        step_index = types.index("step.started")
+        self.assertLess(preamble_index, step_index)
+        preamble = collected[preamble_index]
+        self.assertTrue((preamble.content or "").startswith("BASE"))
+        self.assertIn("## Skill", preamble.content or "")
+        self.assertEqual(preamble.content, captured_messages[0][0].content)
+        self.assertNotIn(
+            "context.system_preamble.built",
+            [event.type for event in durable_events],
+        )
+
+    def test_run_session_emits_empty_system_preamble_when_none_exists(self) -> None:
+        async def scenario():
+            collector = _Collector()
+            client = CapturingInferenceClient(["Hello"])
+            ledger = MemoryRunLedger()
+            registry = create_default_registry()
+            broker = ToolBroker(registry, PolicyEngine())
+            runtime = AgentRuntime(
+                RuntimeServices(
+                    inference_client=client,
+                    tool_broker=broker,
+                    ledger=ledger,
+                    context_builder=ContextBuilder(ledger, broker),
+                    message_middleware_runner=None,
+                    skill_hot_reload_service=None,
+                ),
+                InferenceConfig(),
+            )
+            async with runtime.start("hi", listeners=[collector]) as session:
+                result = await session.result()
+            return result, collector.events, client.captured_messages
+
+        result, collected, captured_messages = anyio.run(scenario)
+
+        self.assertEqual(result.status, RunStatus.SUCCEEDED)
+        preamble_events = [
+            event
+            for event in collected
+            if event.type == "context.system_preamble.built"
+        ]
+        self.assertEqual(len(preamble_events), 1)
+        self.assertIsNone(preamble_events[0].content)
+        self.assertEqual(captured_messages[0][0].role, InferenceRole.USER)
 
     def test_start_accepts_caller_supplied_run_id(self) -> None:
         async def scenario():

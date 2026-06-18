@@ -22,11 +22,12 @@ from knuth.core.invocations import (
     approval_id_for,
     args_hash_for,
 )
-from knuth.core.messages import InferenceMessage, ToolCall
+from knuth.core.messages import InferenceMessage, InferenceRole, ToolCall
 from knuth.core.tools import ToolExecutionOutcome
 from knuth.core.runtime_events import (
     ApprovalRequestedDraft,
     ConversationNoticeDraft,
+    ContextSystemPreambleBuiltDraft,
     DurableRuntimeEventDraft,
     InterruptActivePhase,
     InterruptReason,
@@ -246,6 +247,10 @@ async def _run_step(
         else None,
     )
     assert view.snapshot is not None
+    preamble = None
+    if view.messages and view.messages[0].role == InferenceRole.SYSTEM:
+        preamble = view.messages[0].content
+    await invocation.emit(ContextSystemPreambleBuiltDraft(content=preamble))
     await invocation.emit(
         StepStartedDraft(
             step_id=step_id,

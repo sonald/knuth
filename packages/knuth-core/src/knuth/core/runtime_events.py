@@ -277,6 +277,13 @@ class TransientRuntimeEventDraftBase(RuntimeEventDraftBase):
     durability: EventDurability = EventDurability.TRANSIENT
 
 
+class ContextSystemPreambleBuiltDraft(TransientRuntimeEventDraftBase):
+    type: Literal["context.system_preamble.built"] = (
+        "context.system_preamble.built"
+    )
+    content: str | None
+
+
 class ModelReasoningDeltaDraft(TransientRuntimeEventDraftBase):
     type: Literal["model.reasoning.delta"] = "model.reasoning.delta"
     delta: str
@@ -324,7 +331,8 @@ class RunInvocationEndedDraft(TransientRuntimeEventDraftBase):
 
 
 TransientRuntimeEventDraft = (
-    ModelReasoningDeltaDraft
+    ContextSystemPreambleBuiltDraft
+    | ModelReasoningDeltaDraft
     | ModelReasoningCompletedDraft
     | ModelContentDeltaDraft
     | ModelToolCallStartedDraft
@@ -464,6 +472,12 @@ class MessageRewriteMessage(MessageRewriteMessageDraft, StoredRuntimeEventBase):
     message_id: str
 
 
+class ContextSystemPreambleBuilt(
+    ContextSystemPreambleBuiltDraft, TransientRuntimeEventBase
+):
+    pass
+
+
 class ModelReasoningDelta(ModelReasoningDeltaDraft, TransientRuntimeEventBase):
     pass
 
@@ -525,7 +539,8 @@ StoredRuntimeEvent = (
 )
 
 TransientRuntimeEvent = (
-    ModelReasoningDelta
+    ContextSystemPreambleBuilt
+    | ModelReasoningDelta
     | ModelReasoningCompleted
     | ModelContentDelta
     | ModelToolCallStarted

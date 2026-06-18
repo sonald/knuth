@@ -2,6 +2,8 @@ import unittest
 from typing import get_args
 
 from knuth.core.events import (
+    ContextSystemPreambleBuilt,
+    ContextSystemPreambleBuiltDraft,
     MessageRewriteAnchor,
     MessageRewriteAnchorDraft,
     RunCancelled,
@@ -93,6 +95,22 @@ class CoreModelTests(unittest.TestCase):
         self.assertFalse(hasattr(started, "seq"))
         self.assertEqual(ended.type, "run.invocation.ended")
         self.assertEqual(ended.status, "succeeded")
+
+    def test_context_system_preamble_built_is_transient_runtime_event(self) -> None:
+        event = emit_transient_runtime_event(
+            "run-1",
+            ContextSystemPreambleBuiltDraft(content="SYSTEM"),
+            event_id="evt-preamble",
+            created_at="2026-06-18T00:00:00Z",
+        )
+
+        self.assertIsInstance(event, ContextSystemPreambleBuilt)
+        self.assertEqual(event.id, "evt-preamble")
+        self.assertEqual(event.run_id, "run-1")
+        self.assertEqual(event.type, "context.system_preamble.built")
+        self.assertEqual(event.content, "SYSTEM")
+        self.assertEqual(event.durability, EventDurability.TRANSIENT)
+        self.assertFalse(hasattr(event, "seq"))
 
     def test_tool_call_effective_id_falls_back_to_position(self) -> None:
         self.assertEqual(ToolCall(tool_call_id="call-1", name="t").effective_id, "call-1")
