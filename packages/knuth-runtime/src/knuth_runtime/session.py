@@ -77,6 +77,10 @@ class RunSession:
                 anyio.create_task_group()
             )
             self._observation = LiveRuntimeObservation(self._task_group)
+            if self._services.skill_hot_reload_service is not None:
+                self._task_group.start_soon(
+                    self._services.skill_hot_reload_service.run
+                )
             for listener in self._initial_listeners:
                 await self._observation.add_listener(listener)
             await self._prepare_run_id()
@@ -108,6 +112,8 @@ class RunSession:
             self._task_group.cancel_scope.cancel()
         elif self._observation is not None:
             await self._observation.aclose()
+        if self._done.is_set():
+            self._task_group.cancel_scope.cancel()
         await self._exit_stack.__aexit__(exc_type, exc, tb)
 
     def interrupt(self, reason: str = "user_stop") -> bool:

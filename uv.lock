@@ -795,6 +795,7 @@ dependencies = [
     { name = "knuth-core" },
     { name = "knuth-llmd" },
     { name = "knuth-runtime" },
+    { name = "knuth-toold" },
     { name = "platformdirs" },
     { name = "pyyaml" },
 ]
@@ -805,6 +806,7 @@ requires-dist = [
     { name = "knuth-core", editable = "packages/knuth-core" },
     { name = "knuth-llmd", editable = "packages/knuth-llmd" },
     { name = "knuth-runtime", editable = "packages/knuth-runtime" },
+    { name = "knuth-toold", editable = "packages/knuth-toold" },
     { name = "platformdirs", specifier = ">=4.0.0" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]
@@ -890,6 +892,7 @@ dependencies = [
     { name = "jsonschema" },
     { name = "knuth-core" },
     { name = "pydantic" },
+    { name = "pyyaml" },
 ]
 
 [package.metadata]
@@ -898,6 +901,7 @@ requires-dist = [
     { name = "jsonschema", specifier = ">=4.0.0" },
     { name = "knuth-core", editable = "packages/knuth-core" },
     { name = "pydantic", specifier = ">=2.13.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
 ]
 
 [[package]]

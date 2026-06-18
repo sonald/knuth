@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from knuth_llmd import InferenceClient
-from knuth_toold import ToolBroker
+from knuth_toold import SkillHotReloadService, ToolBroker
 
 from knuth_runtime.context import ContextBuilder
 from knuth_runtime.ledger import RunLedger
@@ -17,3 +17,4 @@ class RuntimeServices:
     ledger: RunLedger
     context_builder: ContextBuilder
     message_middleware_runner: MessageMiddlewareRunner | None = None
+    skill_hot_reload_service: SkillHotReloadService | None = None

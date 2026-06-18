@@ -21,6 +21,7 @@ class SystemSectionSource(StrEnum):
 
     BASE = "base"
     USER = "user"
+    SKILL = "skill"
 
 
 class SystemSection(KnuthModel):

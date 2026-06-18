@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import io
+import os
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from knuth.core.events import (
     emit_transient_runtime_event,
 )
 from knuth.core.messages import InferenceMessage, InferenceRole, SystemSectionSource
+from knuth.core.skills import SkillSource
 from knuth.core.types import RunStatus
 from knuth_cli.cli import main
 from knuth_cli.config import AgentConfig, default_config_path, load_config
@@ -213,6 +215,83 @@ class AgentConfigTests(unittest.TestCase):
             self.assertEqual(config.model, "default-model")
             self.assertIsNone(config.system_prompt)
 
+    def test_load_config_enables_skills_with_project_and_user_roots_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir, "knuth.yaml")
+            _write_yaml(
+                config_path,
+                {
+                    "api_key": "test-key",
+                    "base_url": "https://example.test/v1",
+                    "model": "test-model",
+                },
+            )
+
+            config = anyio.run(load_config, config_path, {})
+
+        self.assertTrue(config.skill_hot_reload)
+        self.assertEqual(config.skill_hot_reload_debounce_ms, 1000)
+        self.assertEqual(
+            [(root.source, Path(root.path)) for root in config.skill_roots],
+            [
+                (SkillSource.PROJECT, Path.cwd() / ".knuth" / "skills"),
+                (SkillSource.USER, Path.home() / ".agents" / "skills"),
+            ],
+        )
+
+    def test_skill_environment_overrides_skill_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir, "knuth.yaml")
+            host_one = Path(temp_dir, "one")
+            host_two = Path(temp_dir, "two")
+            _write_yaml(
+                config_path,
+                {
+                    "api_key": "test-key",
+                    "base_url": "https://example.test/v1",
+                    "model": "test-model",
+                },
+            )
+
+            config = anyio.run(
+                load_config,
+                config_path,
+                {
+                    "KNUTH_SKILL_ROOTS": os.pathsep.join(
+                        [str(host_one), str(host_two)]
+                    ),
+                    "KNUTH_SKILL_HOT_RELOAD": "0",
+                    "KNUTH_SKILL_HOT_RELOAD_DEBOUNCE_MS": "250",
+                },
+            )
+
+        self.assertFalse(config.skill_hot_reload)
+        self.assertEqual(config.skill_hot_reload_debounce_ms, 250)
+        self.assertEqual(
+            [(root.source, Path(root.path)) for root in config.skill_roots],
+            [
+                (SkillSource.HOST, host_one),
+                (SkillSource.HOST, host_two),
+            ],
+        )
+
+    def test_skill_hot_reload_debounce_zero_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir, "knuth.yaml")
+            _write_yaml(
+                config_path,
+                {
+                    "api_key": "test-key",
+                    "base_url": "https://example.test/v1",
+                    "model": "test-model",
+                    "skill_hot_reload_debounce_ms": 0,
+                },
+            )
+
+            config = anyio.run(load_config, config_path, {})
+
+        self.assertEqual(config.skill_hot_reload_debounce_ms, 0)
+
 
 class CliRuntimeFactoryTests(unittest.TestCase):
     def test_cli_prompt_sections_keep_base_role_before_user_prompt(self) -> None:
@@ -288,6 +367,7 @@ class CliRuntimeFactoryTests(unittest.TestCase):
         self.assertIn("edit_file", by_name)
         self.assertIn("glob", by_name)
         self.assertIn("grep", by_name)
+        self.assertIn("skill", by_name)
         self.assertIn("offset and line limit", by_name["read_file"]["description"])
         self.assertIn("glob pattern", by_name["glob"]["description"])
         self.assertIn("ripgrep regex syntax", by_name["grep"]["description"])

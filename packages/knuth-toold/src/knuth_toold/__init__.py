@@ -27,6 +27,15 @@ from knuth_toold.builtins import (
 )
 from knuth_toold.providers import ToolProvider
 from knuth_toold.registry import ToolRegistry
+from knuth_toold.skills import (
+    Skill,
+    SkillHotReloadService,
+    SkillManager,
+    SkillRoot,
+    SkillSnapshot,
+    SkillToolProvider,
+    SkillValidationError,
+)
 
 __all__ = [
     "AllowAllPolicy",
@@ -37,6 +46,13 @@ __all__ = [
     "PythonTool",
     "ReadFileTool",
     "ShellTool",
+    "Skill",
+    "SkillHotReloadService",
+    "SkillManager",
+    "SkillRoot",
+    "SkillSnapshot",
+    "SkillToolProvider",
+    "SkillValidationError",
     "Tool",
     "ToolBroker",
     "ToolEffect",

@@ -34,6 +34,7 @@ from knuth.core.messages import (
     ToolCall,
 )
 from knuth.core.runs import AgentRun, Artifact
+from knuth.core.skills import SkillInfo, SkillMetadata, SkillSource
 from knuth.core.tools import ToolResult, ToolResultStatus
 from knuth.core.types import ErrorInfo, EventDurability, KnuthModel, RunStatus
 
@@ -57,6 +58,9 @@ __all__ = [
     "RuntimeEvent",
     "RuntimeEventDraft",
     "StoredRuntimeEvent",
+    "SkillInfo",
+    "SkillMetadata",
+    "SkillSource",
     "SystemSection",
     "SystemSectionSource",
     "TapePosition",

@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Mapping
 
 from knuth_llmd import InferenceConfig, LiteLLMInferenceClient
-from knuth_runtime import AgentRuntime, build_sqlite_runtime
+from knuth_runtime import AgentRuntime, SkillRuntimeConfig, build_sqlite_runtime
 from knuth_runtime.debug import DEFAULT_DEBUG_SINK_DIR
 
 from knuth_cli.config import load_config
@@ -36,4 +36,9 @@ async def build_runtime(
         include_default_tools=True,
         enable_plugins=enable_plugins,
         debug_sink_dir=DEFAULT_DEBUG_SINK_DIR if debug else None,
+        skill_config=SkillRuntimeConfig(
+            roots=config.skill_roots or [],
+            hot_reload=config.skill_hot_reload,
+            hot_reload_debounce_ms=config.skill_hot_reload_debounce_ms,
+        ),
     )

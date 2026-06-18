@@ -20,6 +20,7 @@ from knuth.core.runtime_events import (
 from knuth.core.types import RunStatus
 from knuth_llmd import InferenceConfig
 from knuth_toold import ToolBroker, ToolProvider, ToolRegistry, create_default_registry
+from knuth_toold.skills import SkillHotReloadService, SkillManager, SkillToolProvider
 
 from knuth_runtime.context import (
     ContextBuilder,
@@ -41,6 +42,13 @@ from knuth_runtime.middleware import (
     MessageMiddlewareCheckpoint,
     MessageMiddlewareRunner,
     ToolResultRedactionMiddleware,
+)
+from knuth_runtime.skills import (
+    SkillChangeNoticeMiddleware,
+    SkillNoticeState,
+    SkillReminderMiddleware,
+    SkillRuntimeConfig,
+    SkillSystemSectionProvider,
 )
 from knuth_runtime.debug import DebugEventSink
 from knuth_runtime.loop import settle_crashed_invocations
@@ -435,6 +443,56 @@ def _default_message_middlewares() -> list[MessageMiddleware]:
     ]
 
 
+def _skill_manager(skill_config: SkillRuntimeConfig | None) -> SkillManager:
+    config = skill_config or SkillRuntimeConfig()
+    manager = SkillManager(config.roots)
+    manager.refresh_if_dirty()
+    return manager
+
+
+def _compose_section_providers(
+    section_providers: list[SystemSectionProvider] | None,
+    skill_manager: SkillManager | None,
+) -> list[SystemSectionProvider] | None:
+    sections = list(section_providers or [])
+    if skill_manager is not None:
+        sections.append(SkillSystemSectionProvider())
+    return sections or None
+
+
+def _compose_message_middlewares(
+    message_middlewares: list[MessageMiddleware] | None,
+    skill_manager: SkillManager | None,
+) -> list[MessageMiddleware]:
+    middlewares = (
+        list(message_middlewares)
+        if message_middlewares is not None
+        else _default_message_middlewares()
+    )
+    if skill_manager is not None:
+        notice_state = SkillNoticeState()
+        middlewares.extend(
+            [
+                SkillReminderMiddleware(skill_manager, notice_state),
+                SkillChangeNoticeMiddleware(skill_manager, notice_state),
+            ]
+        )
+    return middlewares
+
+
+def _skill_hot_reload_service(
+    skill_config: SkillRuntimeConfig | None,
+    skill_manager: SkillManager,
+) -> SkillHotReloadService | None:
+    config = skill_config or SkillRuntimeConfig()
+    if not config.hot_reload:
+        return None
+    return SkillHotReloadService(
+        skill_manager,
+        debounce_ms=config.hot_reload_debounce_ms,
+    )
+
+
 def build_sqlite_runtime(
     *,
     inference_client,
@@ -447,6 +505,7 @@ def build_sqlite_runtime(
     redactor: EventRedactor | None = None,
     enable_plugins: bool = False,
     debug_sink_dir: Path | str | None = None,
+    skill_config: SkillRuntimeConfig | None = None,
 ) -> AgentRuntime:
     # Redaction is a v0 security floor (design §8): the ledger is append-only,
     # so secrets must be stripped before apply. Default on; pass a custom
@@ -457,24 +516,28 @@ def build_sqlite_runtime(
         include_default_tools=include_default_tools,
         enable_plugins=enable_plugins,
     )
+    skill_manager = _skill_manager(skill_config)
+    skill_hot_reload_service = _skill_hot_reload_service(skill_config, skill_manager)
+    registry.add_provider(SkillToolProvider(skill_manager))
     for provider in tool_providers:
         registry.add_provider(provider)
     broker = ToolBroker(registry, policy_engine=PolicyEngine())
     message_middleware_runner = MessageMiddlewareRunner(
         ledger,
-        message_middlewares
-        if message_middlewares is not None
-        else _default_message_middlewares(),
+        _compose_message_middlewares(message_middlewares, skill_manager),
     )
     services = RuntimeServices(
         inference_client=inference_client,
         tool_broker=broker,
         ledger=ledger,
         message_middleware_runner=message_middleware_runner,
+        skill_hot_reload_service=skill_hot_reload_service,
         context_builder=ContextBuilder(
             ledger,
             broker,
-            section_providers=section_providers,
+            section_providers=_compose_section_providers(
+                section_providers, skill_manager
+            ),
             redactor=redactor if isinstance(redactor, ContextRedactor) else None,
         ),
     )
@@ -506,33 +569,40 @@ def build_memory_runtime(
     message_middlewares: list[MessageMiddleware] | None = None,
     tool_providers: Iterable[ToolProvider] = (),
     include_default_tools: bool = True,
+    skill_config: SkillRuntimeConfig | None = None,
 ) -> AgentRuntime:
     ledger = ledger or MemoryRunLedger()
+    skill_manager = _skill_manager(skill_config)
+    skill_hot_reload_service = _skill_hot_reload_service(skill_config, skill_manager)
     if tool_broker is None:
         registry = _build_tool_registry(
             include_default_tools=include_default_tools,
             enable_plugins=False,
         )
+        registry.add_provider(SkillToolProvider(skill_manager))
         for provider in tool_providers:
             registry.add_provider(provider)
         tool_broker = ToolBroker(
             registry, policy_engine=PolicyEngine()
         )
+    else:
+        tool_broker.registry.add_provider(SkillToolProvider(skill_manager))
     message_middleware_runner = MessageMiddlewareRunner(
         ledger,
-        message_middlewares
-        if message_middlewares is not None
-        else _default_message_middlewares(),
+        _compose_message_middlewares(message_middlewares, skill_manager),
     )
     services = RuntimeServices(
         inference_client=inference_client,
         tool_broker=tool_broker,
         ledger=ledger,
         message_middleware_runner=message_middleware_runner,
+        skill_hot_reload_service=skill_hot_reload_service,
         context_builder=ContextBuilder(
             ledger,
             tool_broker,
-            section_providers=section_providers,
+            section_providers=_compose_section_providers(
+                section_providers, skill_manager
+            ),
         ),
     )
     return AgentRuntime(services=services, inference_config=inference_config)

@@ -48,6 +48,7 @@ from knuth.core.runtime_events import (
     UserMessageDraft,
     VerificationFailedDraft,
 )
+from knuth.core.skills import SkillSource
 from knuth.core.tools import ToolResult
 from knuth.core.types import RunStatus
 from knuth_llmd import InferenceConfig
@@ -64,6 +65,10 @@ from knuth_runtime import (
     MessageMiddlewareContext,
     MessageMiddlewareRunner,
     RegexSecretRedactor,
+    SkillChangeNoticeMiddleware,
+    SkillNoticeState,
+    SkillReminderMiddleware,
+    SkillRuntimeConfig,
     SQLiteRunLedger,
     build_memory_runtime,
     build_sqlite_runtime,
@@ -80,6 +85,7 @@ from knuth_runtime.observation import RuntimeEventInterest, RuntimeObservationEr
 from knuth_runtime.policy import PolicyEngine
 from knuth_toold import ToolBroker, create_default_registry
 from knuth_toold.base import ToolManifest, ToolRuntimeContext
+from knuth_toold.skills import SkillManager, SkillRoot
 
 
 def _snapshot() -> ContextSnapshot:
@@ -1057,6 +1063,309 @@ def _build_runtime(client, section_providers=None, message_middlewares=None):
 
 
 class EventDrivenRuntimeTests(unittest.TestCase):
+    def test_skill_invocation_records_loaded_content_as_tool_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir, "skills")
+            skill_dir = root / "example-skill"
+            skill_dir.mkdir(parents=True)
+            skill_file = skill_dir / "SKILL.md"
+            skill_file.write_text(
+                "\n".join(
+                    [
+                        "---",
+                        "name: example-skill",
+                        "description: Use when an example skill is needed.",
+                        "---",
+                        "",
+                        "Original skill body.",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            client = CapturingScriptedClient(
+                [
+                    InferenceMessage(
+                        role=InferenceRole.ASSISTANT,
+                        content="",
+                        tool_calls=[
+                            CoreToolCall(
+                                tool_call_id="call-skill",
+                                name="skill",
+                                arguments={
+                                    "skill_name": "example-skill",
+                                    "args": "topic=demo",
+                                },
+                            )
+                        ],
+                    ),
+                    InferenceMessage(role=InferenceRole.ASSISTANT, content="done"),
+                ]
+            )
+            runtime = build_memory_runtime(
+                inference_client=client,
+                inference_config=InferenceConfig(),
+                include_default_tools=False,
+                skill_config=SkillRuntimeConfig(
+                    roots=[SkillRoot(source=SkillSource.PROJECT, path=str(root))],
+                ),
+            )
+
+            turn = anyio.run(runtime.run_once, "use the example skill")
+            skill_file.write_text(
+                "\n".join(
+                    [
+                        "---",
+                        "name: example-skill",
+                        "description: Use when an example skill is needed.",
+                        "---",
+                        "",
+                        "Modified skill body.",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            raw_messages = anyio.run(runtime.messages, turn.run_id)
+
+        tool_results = [
+            message
+            for message in raw_messages
+            if message.role == InferenceRole.TOOL_RESULT
+            and message.tool_name == "skill"
+        ]
+        self.assertEqual(len(tool_results), 1)
+        self.assertIn("Original skill body.", tool_results[0].content or "")
+        self.assertNotIn("Modified skill body.", tool_results[0].content or "")
+        second_turn_tool_results = [
+            message
+            for message in client.captured_messages[1]
+            if message.role == InferenceRole.TOOL_RESULT
+        ]
+        self.assertIn(
+            "Skill arguments: topic=demo",
+            second_turn_tool_results[0].content or "",
+        )
+
+    def test_skill_invocation_rejects_body_that_would_be_redacted(self) -> None:
+        large_body = "x" * 5000
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir, "skills")
+            skill_dir = root / "large-skill"
+            skill_dir.mkdir(parents=True)
+            skill_dir.joinpath("SKILL.md").write_text(
+                "\n".join(
+                    [
+                        "---",
+                        "name: large-skill",
+                        "description: Use when a large skill is needed.",
+                        "---",
+                        "",
+                        large_body,
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            client = CapturingScriptedClient(
+                [
+                    InferenceMessage(
+                        role=InferenceRole.ASSISTANT,
+                        content="",
+                        tool_calls=[
+                            CoreToolCall(
+                                tool_call_id="call-skill",
+                                name="skill",
+                                arguments={"skill_name": "large-skill"},
+                            )
+                        ],
+                    ),
+                    InferenceMessage(role=InferenceRole.ASSISTANT, content="done"),
+                ]
+            )
+            runtime = build_memory_runtime(
+                inference_client=client,
+                inference_config=InferenceConfig(),
+                include_default_tools=False,
+                skill_config=SkillRuntimeConfig(
+                    roots=[SkillRoot(source=SkillSource.PROJECT, path=str(root))],
+                ),
+            )
+
+            turn = anyio.run(runtime.run_once, "use the large skill")
+            raw_messages = anyio.run(runtime.messages, turn.run_id)
+
+        tool_results = [
+            message
+            for message in raw_messages
+            if message.role == InferenceRole.TOOL_RESULT
+            and message.tool_name == "skill"
+        ]
+        self.assertEqual(len(tool_results), 1)
+        self.assertIn("Tool error:", tool_results[0].content or "")
+        self.assertIn("exceeding the v1 tool-result limit", tool_results[0].content or "")
+        self.assertNotIn(large_body, tool_results[0].content or "")
+        self.assertFalse(
+            (tool_results[0].content or "").startswith(
+                "Result redacted for context headroom."
+            )
+        )
+
+    def test_skill_catalog_change_notice_is_durable_and_deduplicated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir, "skills")
+            skill_dir = root / "example-skill"
+            skill_dir.mkdir(parents=True)
+            skill_file = skill_dir / "SKILL.md"
+            skill_file.write_text(
+                "\n".join(
+                    [
+                        "---",
+                        "name: example-skill",
+                        "description: Use v1.",
+                        "---",
+                        "",
+                        "Body.",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            manager = SkillManager(
+                [SkillRoot(source=SkillSource.PROJECT, path=str(root))]
+            )
+
+            async def scenario():
+                ledger = MemoryRunLedger()
+                run = await ledger.create_run("hello")
+                await ledger.apply(run.id, UserMessageDraft(content="hello"))
+                notice_state = SkillNoticeState()
+                runner = MessageMiddlewareRunner(
+                    ledger,
+                    [
+                        SkillReminderMiddleware(manager, notice_state),
+                        SkillChangeNoticeMiddleware(manager, notice_state),
+                    ],
+                )
+                await runner.run_checkpoint(
+                    run.id, MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST
+                )
+                skill_file.write_text(
+                    "\n".join(
+                        [
+                            "---",
+                            "name: example-skill",
+                            "description: Use v2.",
+                            "---",
+                            "",
+                            "Body.",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                manager.invalidate("frontmatter changed")
+                await runner.run_checkpoint(
+                    run.id, MessageMiddlewareCheckpoint.AFTER_TURN_CLOSED
+                )
+                await runner.run_checkpoint(
+                    run.id, MessageMiddlewareCheckpoint.AFTER_TURN_CLOSED
+                )
+                return await ledger.list_events(run.id)
+
+            events = anyio.run(scenario)
+
+        notices = [
+            event.message.content
+            for event in events
+            if event.type == "message.rewrite_message"
+            and event.message.content
+            and "<knuth-skill-notice" in event.message.content
+        ]
+        self.assertEqual(len(notices), 1)
+        self.assertIn("- example-skill: Use v2.", notices[0])
+
+    def test_skill_catalog_change_notice_is_per_run_not_globally_consumed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir, "skills")
+            skill_dir = root / "example-skill"
+            skill_dir.mkdir(parents=True)
+            skill_file = skill_dir / "SKILL.md"
+            skill_file.write_text(
+                "\n".join(
+                    [
+                        "---",
+                        "name: example-skill",
+                        "description: Use v1.",
+                        "---",
+                        "",
+                        "Body.",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            manager = SkillManager(
+                [SkillRoot(source=SkillSource.PROJECT, path=str(root))]
+            )
+
+            async def scenario():
+                ledger = MemoryRunLedger()
+                first = await ledger.create_run("first")
+                second = await ledger.create_run("second")
+                await ledger.apply(first.id, UserMessageDraft(content="first"))
+                await ledger.apply(second.id, UserMessageDraft(content="second"))
+                notice_state = SkillNoticeState()
+                runner = MessageMiddlewareRunner(
+                    ledger,
+                    [
+                        SkillReminderMiddleware(manager, notice_state),
+                        SkillChangeNoticeMiddleware(manager, notice_state),
+                    ],
+                )
+                await runner.run_checkpoint(
+                    first.id, MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST
+                )
+                await runner.run_checkpoint(
+                    second.id, MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST
+                )
+                skill_file.write_text(
+                    "\n".join(
+                        [
+                            "---",
+                            "name: example-skill",
+                            "description: Use v2.",
+                            "---",
+                            "",
+                            "Body.",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                manager.invalidate("frontmatter changed")
+                await runner.run_checkpoint(
+                    first.id, MessageMiddlewareCheckpoint.AFTER_TURN_CLOSED
+                )
+                await runner.run_checkpoint(
+                    second.id, MessageMiddlewareCheckpoint.AFTER_TURN_CLOSED
+                )
+                return await ledger.list_events(first.id), await ledger.list_events(second.id)
+
+            first_events, second_events = anyio.run(scenario)
+
+        first_notices = [
+            event.message.content
+            for event in first_events
+            if event.type == "message.rewrite_message"
+            and event.message.content
+            and "<knuth-skill-notice" in event.message.content
+        ]
+        second_notices = [
+            event.message.content
+            for event in second_events
+            if event.type == "message.rewrite_message"
+            and event.message.content
+            and "<knuth-skill-notice" in event.message.content
+        ]
+        self.assertEqual(len(first_notices), 1)
+        self.assertEqual(len(second_notices), 1)
+        self.assertIn("- example-skill: Use v2.", first_notices[0])
+        self.assertIn("- example-skill: Use v2.", second_notices[0])
+
     def test_runtime_executes_tool_then_succeeds(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
             fact_path = Path(workspace, "fact.txt")
@@ -1118,7 +1427,7 @@ class EventDrivenRuntimeTests(unittest.TestCase):
         step_events = [event for event in events if event.type == "step.started"]
         self.assertEqual(len(step_events), 1)
         snapshot = step_events[0].snapshot
-        self.assertEqual(snapshot.message_count, 1)
+        self.assertEqual(snapshot.message_count, 3)
         self.assertTrue(snapshot.messages_hash)
         self.assertTrue(snapshot.model_config_hash)
 
@@ -1910,6 +2219,79 @@ class CapturingInferenceClient:
 
 
 class SystemPreambleTests(unittest.TestCase):
+    def test_skill_runtime_is_builtin_without_explicit_config(self) -> None:
+        client = CapturingInferenceClient(["Hello"])
+        runtime = build_memory_runtime(
+            inference_client=client,
+            inference_config=InferenceConfig(),
+            include_default_tools=False,
+        )
+
+        anyio.run(runtime.run_once, "hi")
+        tools = anyio.run(runtime.tools)
+
+        self.assertEqual(
+            [tool["function"]["name"] for tool in tools],
+            ["skill"],
+        )
+        self.assertIn("## Skill", client.captured_messages[0][0].content or "")
+        reminders = [
+            message
+            for message in client.captured_messages[0]
+            if message.role == InferenceRole.USER
+            and "<system-reminder>" in (message.content or "")
+        ]
+        self.assertEqual(len(reminders), 1)
+        self.assertIn(
+            "- none: No skills available",
+            reminders[0].content or "",
+        )
+
+    def test_skill_runtime_adds_system_section_and_current_reminder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir, "skills")
+            skill_dir = root / "example-skill"
+            skill_dir.mkdir(parents=True)
+            skill_dir.joinpath("SKILL.md").write_text(
+                "\n".join(
+                    [
+                        "---",
+                        "name: example-skill",
+                        "description: Use when an example skill is needed.",
+                        "---",
+                        "",
+                        "Follow the example workflow.",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            client = CapturingInferenceClient(["Hello"])
+            runtime = build_memory_runtime(
+                inference_client=client,
+                inference_config=InferenceConfig(),
+                include_default_tools=False,
+                skill_config=SkillRuntimeConfig(
+                    roots=[SkillRoot(source=SkillSource.PROJECT, path=str(root))],
+                ),
+            )
+
+            anyio.run(runtime.run_once, "hi")
+
+        first_turn_messages = client.captured_messages[0]
+        self.assertEqual(first_turn_messages[0].role, InferenceRole.SYSTEM)
+        self.assertIn("## Skill", first_turn_messages[0].content or "")
+        reminders = [
+            message
+            for message in first_turn_messages
+            if message.role == InferenceRole.USER
+            and "<system-reminder>" in (message.content or "")
+        ]
+        self.assertEqual(len(reminders), 1)
+        self.assertIn(
+            "- example-skill: Use when an example skill is needed.",
+            reminders[0].content or "",
+        )
+
     def test_base_identity_delivered_as_leading_system_message(self) -> None:
         client = CapturingInferenceClient(["Hello"])
         runtime = _build_runtime(
@@ -1920,7 +2302,8 @@ class SystemPreambleTests(unittest.TestCase):
 
         first_turn_messages = client.captured_messages[0]
         self.assertEqual(first_turn_messages[0].role, InferenceRole.SYSTEM)
-        self.assertEqual(first_turn_messages[0].content, "BASE")
+        self.assertTrue((first_turn_messages[0].content or "").startswith("BASE"))
+        self.assertIn("## Skill", first_turn_messages[0].content or "")
 
     def test_sections_composed_in_provider_injection_order(self) -> None:
         client = CapturingInferenceClient(["Hello"])
@@ -1935,13 +2318,16 @@ class SystemPreambleTests(unittest.TestCase):
 
         first_turn_messages = client.captured_messages[0]
         self.assertEqual(first_turn_messages[0].role, InferenceRole.SYSTEM)
-        self.assertEqual(first_turn_messages[0].content, "BASE\n\nUSER")
+        self.assertTrue(
+            (first_turn_messages[0].content or "").startswith("BASE\n\nUSER")
+        )
+        self.assertIn("## Skill", first_turn_messages[0].content or "")
         system_messages = [
             m for m in first_turn_messages if m.role == InferenceRole.SYSTEM
         ]
         self.assertEqual(len(system_messages), 1)
 
-    def test_no_system_message_when_all_sections_empty(self) -> None:
+    def test_builtin_skill_section_exists_when_all_host_sections_empty(self) -> None:
         client = CapturingInferenceClient(["Hello"])
         runtime = _build_runtime(
             client,
@@ -1950,9 +2336,8 @@ class SystemPreambleTests(unittest.TestCase):
         anyio.run(runtime.run_once, "hi")
 
         first_turn_messages = client.captured_messages[0]
-        self.assertTrue(
-            all(m.role != InferenceRole.SYSTEM for m in first_turn_messages)
-        )
+        self.assertEqual(first_turn_messages[0].role, InferenceRole.SYSTEM)
+        self.assertIn("## Skill", first_turn_messages[0].content or "")
 
     def test_preamble_present_on_every_turn(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
@@ -1983,7 +2368,8 @@ class SystemPreambleTests(unittest.TestCase):
         self.assertEqual(len(client.captured_messages), 2)
         for turn_messages in client.captured_messages:
             self.assertEqual(turn_messages[0].role, InferenceRole.SYSTEM)
-            self.assertEqual(turn_messages[0].content, "BASE")
+            self.assertTrue((turn_messages[0].content or "").startswith("BASE"))
+            self.assertIn("## Skill", turn_messages[0].content or "")
 
 
 class AssemblePreambleTests(unittest.TestCase):
