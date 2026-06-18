@@ -25,6 +25,13 @@ class AgentConfig:
     skill_hot_reload_debounce_ms: int = 1000
 
 
+@dataclass(frozen=True)
+class AgentSkillConfig:
+    roots: list[SkillRoot]
+    hot_reload: bool = True
+    hot_reload_debounce_ms: int = 1000
+
+
 def default_config_path() -> Path:
     return Path(platformdirs.user_data_dir("knuth")) / "knuth-cli" / "knuth.yaml"
 
@@ -51,23 +58,24 @@ async def load_config(
 
     timeout = float(values.get("timeout") or 60.0)
     system_prompt = values.get("system_prompt")
-    skill_roots = _parse_skill_roots(values)
-    skill_hot_reload_debounce_ms = _parse_non_negative_int(
-        values.get("skill_hot_reload_debounce_ms"),
-        default=1000,
-        field_name="skill_hot_reload_debounce_ms",
-    )
+    skill_config = parse_agent_skill_config(values)
     return AgentConfig(
         api_key=str(values["api_key"]),
         base_url=str(values["base_url"]),
         model=str(values["model"]),
         timeout=timeout,
         system_prompt=str(system_prompt) if system_prompt else None,
-        skill_roots=skill_roots,
-        skill_hot_reload=_parse_bool(values.get("skill_hot_reload", True)),
-        skill_hot_reload_debounce_ms=skill_hot_reload_debounce_ms,
+        skill_roots=skill_config.roots,
+        skill_hot_reload=skill_config.hot_reload,
+        skill_hot_reload_debounce_ms=skill_config.hot_reload_debounce_ms,
     )
 
+
+_SKILL_ENV_TO_CONFIG_KEY = {
+    "KNUTH_SKILL_ROOTS": "skill_roots",
+    "KNUTH_SKILL_HOT_RELOAD": "skill_hot_reload",
+    "KNUTH_SKILL_HOT_RELOAD_DEBOUNCE_MS": "skill_hot_reload_debounce_ms",
+}
 
 _ENV_TO_CONFIG_KEY = {
     "KNUTH_API_KEY": "api_key",
@@ -75,9 +83,7 @@ _ENV_TO_CONFIG_KEY = {
     "KNUTH_MODEL": "model",
     "KNUTH_TIMEOUT": "timeout",
     "KNUTH_SYSTEM_PROMPT": "system_prompt",
-    "KNUTH_SKILL_ROOTS": "skill_roots",
-    "KNUTH_SKILL_HOT_RELOAD": "skill_hot_reload",
-    "KNUTH_SKILL_HOT_RELOAD_DEBOUNCE_MS": "skill_hot_reload_debounce_ms",
+    **_SKILL_ENV_TO_CONFIG_KEY,
 }
 
 _OPTIONAL_CONFIG_KEYS = {
@@ -100,6 +106,34 @@ def _default_skill_roots() -> list[SkillRoot]:
             path=str(Path.home() / ".agents" / "skills"),
         ),
     ]
+
+
+def parse_agent_skill_config(
+    values: Mapping[str, Any] | None = None,
+) -> AgentSkillConfig:
+    raw_values = dict(values or {})
+    debounce_ms = _parse_non_negative_int(
+        raw_values.get("skill_hot_reload_debounce_ms"),
+        default=1000,
+        field_name="skill_hot_reload_debounce_ms",
+    )
+    return AgentSkillConfig(
+        roots=_parse_skill_roots(raw_values),
+        hot_reload=_parse_bool(raw_values.get("skill_hot_reload", True)),
+        hot_reload_debounce_ms=debounce_ms,
+    )
+
+
+def load_agent_skill_config_from_env(
+    environ: Mapping[str, str] | None = None,
+) -> AgentSkillConfig:
+    source = os.environ if environ is None else environ
+    values = {
+        config_key: source[env_key]
+        for env_key, config_key in _SKILL_ENV_TO_CONFIG_KEY.items()
+        if env_key in source
+    }
+    return parse_agent_skill_config(values)
 
 
 def _parse_skill_roots(values: dict[str, Any]) -> list[SkillRoot]:
