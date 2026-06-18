@@ -4,6 +4,7 @@ import {
   AlertTriangle,
   ArrowUp,
   Brain,
+  Bug,
   Check,
   ChevronRight,
   CircleStop,
@@ -551,6 +552,16 @@ export function KnuthIMApp() {
     activeThread?.status === "waiting_approval" ||
     activeThread?.status === "waiting_tool_result" ||
     activeThread?.status === "paused";
+
+  // In the desktop app this opens a dedicated event-viewer window (main
+  // process). In the browser it falls back to the /debug route.
+  const openEventViewer = useCallback(() => {
+    if (window.knuthDesktop?.openEventViewer) {
+      void window.knuthDesktop.openEventViewer();
+      return;
+    }
+    window.open("/debug", "_blank", "noopener");
+  }, []);
 
   const connectionLabel = useMemo(() => {
     if (backendNeedsSettings) {
@@ -1619,6 +1630,14 @@ export function KnuthIMApp() {
             </div>
           </div>
           <div className="chatActions">
+            <button
+              className="iconBtn"
+              type="button"
+              title="Event viewer (⌘⇧E)"
+              onClick={openEventViewer}
+            >
+              <Bug size={16} />
+            </button>
             <button
               className="iconBtn"
               type="button"

@@ -9,8 +9,11 @@ export const metadata: Metadata = {
 export default function RootLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {
+  // suppressHydrationWarning on <html>: browser extensions (e.g. Immersive
+  // Translate) inject attributes before hydration. This only suppresses the
+  // one-level attribute mismatch they cause, not mismatches inside the app.
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
       <head>
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link

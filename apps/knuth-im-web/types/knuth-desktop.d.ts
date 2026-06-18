@@ -39,6 +39,7 @@ declare global {
         settings: KnuthDesktopSettingsInput,
       ) => Promise<{ settings: KnuthDesktopSettings; backend: AgentConnection }>;
       chooseWorkspace?: () => Promise<string | null>;
+      openEventViewer?: () => Promise<void>;
     };
   }
 }

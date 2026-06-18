@@ -21,6 +21,7 @@ from knuth_runtime import AgentRuntime, LedgerError
 from knuth_runtime.session import RunSession
 
 from knuth_agui.client_tools import AGUIClientToolProvider
+from knuth_agui.debug_routes import register_debug_routes
 from knuth_agui.events import (
     AGUIEvent,
     content_type,
@@ -478,5 +479,11 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="approval not found") from exc
         return approval.model_dump(mode="json", by_alias=True)
+
+    # Raw, untranslated event channel for the debug viewer. Kept separate from
+    # the translated /agent stream: this one is full-fidelity observation only.
+    register_debug_routes(
+        app, runtime, manager, canonical_thread_id=_canonical_thread_id
+    )
 
     return app

@@ -12,4 +12,5 @@ contextBridge.exposeInMainWorld("knuthDesktop", {
   getSettings: () => ipcRenderer.invoke("knuth:settings:get"),
   saveSettings: (settings) => ipcRenderer.invoke("knuth:settings:save", settings),
   chooseWorkspace: () => ipcRenderer.invoke("knuth:settings:chooseWorkspace"),
+  openEventViewer: () => ipcRenderer.invoke("knuth:open-event-viewer"),
 });

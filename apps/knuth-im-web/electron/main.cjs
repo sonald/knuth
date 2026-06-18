@@ -29,6 +29,7 @@ const backendManager = new BackendManager({
   settingsStore,
 });
 let backendReady = null;
+let debugWindow = null;
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -71,6 +72,43 @@ async function registerStaticProtocol() {
   });
 }
 
+// Per-environment URL for an in-app route. Dev serves Next routes directly;
+// the packaged build serves the static export via the knuth:// protocol, where
+// extensionless routes resolve to their exported ``<route>.html`` file.
+function appRouteUrl(route) {
+  const useDevServer = !app.isPackaged && process.env.ELECTRON_START_URL;
+  if (useDevServer) {
+    return route === "/" ? DEV_SERVER_URL : `${DEV_SERVER_URL}${route}`;
+  }
+  const file = route === "/" ? "index.html" : `${route.replace(/^\//, "")}.html`;
+  return `${APP_SCHEME}://app/${file}`;
+}
+
+// Keep navigation inside the app; bounce anything else to the system browser.
+function attachWindowGuards(window) {
+  window.webContents.setWindowOpenHandler(({ url }) => {
+    void shell.openExternal(url);
+    return { action: "deny" };
+  });
+  window.webContents.on("will-navigate", (event, url) => {
+    const allowed =
+      url.startsWith(`${APP_SCHEME}://app`) || url.startsWith(DEV_SERVER_URL);
+    if (!allowed) {
+      event.preventDefault();
+      void shell.openExternal(url);
+    }
+  });
+  // CmdOrCtrl+Shift+E opens the event viewer from any window. The app menu is
+  // disabled (setApplicationMenu(null)), so the accelerator lives here.
+  window.webContents.on("before-input-event", (event, input) => {
+    const mod = process.platform === "darwin" ? input.meta : input.control;
+    if (mod && input.shift && (input.key || "").toLowerCase() === "e") {
+      event.preventDefault();
+      openEventViewer();
+    }
+  });
+}
+
 function createWindow() {
   const window = new BrowserWindow({
     width: 1440,
@@ -89,19 +127,7 @@ function createWindow() {
     },
   });
 
-  window.webContents.setWindowOpenHandler(({ url }) => {
-    void shell.openExternal(url);
-    return { action: "deny" };
-  });
-
-  window.webContents.on("will-navigate", (event, url) => {
-    const allowed =
-      url.startsWith(`${APP_SCHEME}://app`) || url.startsWith(DEV_SERVER_URL);
-    if (!allowed) {
-      event.preventDefault();
-      void shell.openExternal(url);
-    }
-  });
+  attachWindowGuards(window);
 
   if (!app.isPackaged && process.env.ELECTRON_START_URL) {
     void window.loadURL(DEV_SERVER_URL);
@@ -109,8 +135,44 @@ function createWindow() {
     return window;
   }
 
-  void window.loadURL(`${APP_SCHEME}://app/index.html`);
+  void window.loadURL(appRouteUrl("/"));
   return window;
+}
+
+// The event viewer is a separate, reusable debug window so it can sit beside
+// the chat. Calling again focuses the existing window instead of spawning more.
+function openEventViewer() {
+  if (debugWindow && !debugWindow.isDestroyed()) {
+    if (debugWindow.isMinimized()) debugWindow.restore();
+    debugWindow.focus();
+    return debugWindow;
+  }
+
+  debugWindow = new BrowserWindow({
+    width: 1180,
+    height: 820,
+    minWidth: 820,
+    minHeight: 560,
+    title: "Knuth · Event Viewer",
+    icon: WINDOW_ICON,
+    backgroundColor: "#f7f4ed",
+    webPreferences: {
+      preload: path.join(__dirname, "preload.cjs"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+
+  attachWindowGuards(debugWindow);
+  debugWindow.on("closed", () => {
+    debugWindow = null;
+  });
+  void debugWindow.loadURL(appRouteUrl("/debug"));
+  if (!app.isPackaged && process.env.ELECTRON_START_URL) {
+    debugWindow.webContents.openDevTools({ mode: "detach" });
+  }
+  return debugWindow;
 }
 
 app.whenReady().then(async () => {
@@ -121,6 +183,9 @@ app.whenReady().then(async () => {
       await backendReady;
     }
     return backendManager.connection();
+  });
+  ipcMain.handle("knuth:open-event-viewer", () => {
+    openEventViewer();
   });
   ipcMain.handle("knuth:backend:restart", async () => {
     backendReady = backendManager.restart();
