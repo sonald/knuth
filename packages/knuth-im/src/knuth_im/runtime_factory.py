@@ -6,10 +6,11 @@ import os
 from collections.abc import Iterable
 from pathlib import Path
 
+from knuth_cli.config import load_agent_skill_config_from_env
 from knuth_cli.prompts import build_cli_message_middlewares, build_cli_system_sections
 from knuth_cli.tools import create_cli_tool_provider
 from knuth_llmd import InferenceConfig, LiteLLMInferenceClient
-from knuth_runtime import AgentRuntime, build_sqlite_runtime
+from knuth_runtime import AgentRuntime, SkillRuntimeConfig, build_sqlite_runtime
 from knuth_toold import ToolProvider
 
 
@@ -41,6 +42,7 @@ def build_runtime(
         )
     timeout = float(os.environ.get("KNUTH_TIMEOUT") or 60.0)
     system_prompt = os.environ.get("KNUTH_SYSTEM_PROMPT")
+    skill_config = load_agent_skill_config_from_env()
     return build_sqlite_runtime(
         inference_client=LiteLLMInferenceClient(
             model=model,
@@ -54,4 +56,9 @@ def build_runtime(
         message_middlewares=build_cli_message_middlewares(),
         tool_providers=[create_cli_tool_provider(), *tool_providers],
         include_default_tools=True,
+        skill_config=SkillRuntimeConfig(
+            roots=skill_config.roots,
+            hot_reload=skill_config.hot_reload,
+            hot_reload_debounce_ms=skill_config.hot_reload_debounce_ms,
+        ),
     )
