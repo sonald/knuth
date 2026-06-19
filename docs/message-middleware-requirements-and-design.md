@@ -348,6 +348,8 @@ a:agents_md.end
 
 ### ToolResultRedaction
 
+> **⚠️ 部分被 [ADR-008](decisions/ADR-008-tool-owned-observation-condensation.md) / [ADR-009](decisions/ADR-009-standalone-filesystem-artifact-store.md) 取代。** 该中间件已更名为 `ObservationCondensationMiddleware`，并改为：跳过工具已自我压缩（`self_condensed`）的结果，只对未压缩的 observation 兜底；`artifact_ref` / `observation_preview` / 复水语义均已废弃（observation 现为必填、原文存入独立 `ArtifactStore`）。下文保留旧描述作历史。
+
 职责：为 context headroom 缩小过大的 tool result，同时保持工具对话结构合法。
 
 这里的 redaction 是 **context-size redaction / projection redaction**，不是 security redaction。原始 observation / artifact 已经作为 durable fact 保存，不能靠后续 rewrite 清除秘密。secret、token、credential 等安全脱敏必须发生在 append 之前，走 `EventRedactor`、工具输出预处理或 artifact pre-write redaction；`ToolResultRedaction` 只决定模型输入是否使用较短的 replacement。

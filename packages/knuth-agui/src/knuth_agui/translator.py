@@ -129,7 +129,7 @@ class AGUITranslator:
         return out
 
     def _on_tool_completed(self, event: ToolInvocationCompleted) -> list[ag.AGUIEvent]:
-        content = event.observation or event.observation_preview or ""
+        content = event.observation
         if event.outcome == "denied":
             content = content or "Tool call denied."
         return [

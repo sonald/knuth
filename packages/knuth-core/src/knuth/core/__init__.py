@@ -1,3 +1,4 @@
+from knuth.core.artifacts import ArtifactSink, ArtifactSinkProvider, StoredArtifact
 from knuth.core.events import (
     ContextSnapshot,
     DurableRuntimeEventDraft,
@@ -42,6 +43,8 @@ __all__ = [
     "AgentRun",
     "Approval",
     "ApprovalStatus",
+    "ArtifactSink",
+    "ArtifactSinkProvider",
     "Artifact",
     "ContextSnapshot",
     "DurableRuntimeEventDraft",
@@ -58,6 +61,7 @@ __all__ = [
     "RuntimeEvent",
     "RuntimeEventDraft",
     "StoredRuntimeEvent",
+    "StoredArtifact",
     "SkillInfo",
     "SkillMetadata",
     "SkillSource",

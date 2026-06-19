@@ -205,9 +205,9 @@ class ToolInvocationCompletedDraft(RuntimeEventDraftBase):
     tool_call_id: str
     tool_name: str
     outcome: Literal["succeeded", "failed", "denied", "interrupted"]
-    observation: str | None = None
-    artifact_ref: str | None = None
-    observation_preview: str | None = None
+    observation: str
+    raw_artifacts: list[str] = Field(default_factory=list)
+    self_condensed: bool = False
     tool_status: str | None = None
 
 

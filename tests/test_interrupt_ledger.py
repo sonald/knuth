@@ -173,7 +173,10 @@ class ToolInterruptOutcomeTests(unittest.TestCase):
             await ledger.apply(
                 run_id,
                 ToolInvocationCompletedDraft(
-                    tool_call_id="c1", tool_name="read_file", outcome="interrupted"
+                    tool_call_id="c1",
+                    tool_name="read_file",
+                    outcome="interrupted",
+                    observation="",
                 ),
             )
 
@@ -288,9 +291,7 @@ class ConversationNoticeTests(unittest.TestCase):
                 ConversationNoticeDraft(kind="interrupted", content="stopped by user"),
             )
             events = await ledger.list_events(run_id)
-            return await raw_ledger_messages_from_events(
-                events, ledger.get_artifact_text
-            )
+            return await raw_ledger_messages_from_events(events)
 
         messages = anyio.run(scenario)
         notice = [m for m in messages if m.content == "stopped by user"]

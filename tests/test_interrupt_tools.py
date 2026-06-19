@@ -365,7 +365,7 @@ class LoopToolInterruptTests(unittest.TestCase):
         ]
         self.assertTrue(
             (tool_results[0].content or "").startswith(
-                "Result redacted for context headroom."
+                "Observation condensed for context headroom."
             )
         )
         self.assertNotIn(big, tool_results[0].content or "")
@@ -452,13 +452,12 @@ class _TwoToolClient:
 class ShellInterruptTests(unittest.TestCase):
     def test_shell_interrupt_warns_about_partial_side_effects(self) -> None:
         import tempfile
-        from pathlib import Path
 
         from knuth_toold.builtins import ShellTool
 
-        async def scenario(offload_root):
+        async def scenario():
             controller = InterruptController()
-            tool = ShellTool(offload_root=offload_root, interrupt_grace_s=0.2)
+            tool = ShellTool(interrupt_grace_s=0.2)
             ctx = ToolRuntimeContext(
                 run_id="run-1",
                 tool_call_id="c1",
@@ -477,8 +476,8 @@ class ShellInterruptTests(unittest.TestCase):
                 controller.interrupt("user_stop")
             return result[0]
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            result = anyio.run(scenario, Path(temp_dir) / "offload")
+        with tempfile.TemporaryDirectory():
+            result = anyio.run(scenario)
 
         self.assertEqual(result.outcome, ToolExecutionOutcome.INTERRUPTED)
         self.assertIn("side effects", result.observation or "")

@@ -252,7 +252,7 @@ export function summarizeEvent(event: RawRuntimeEvent): string {
     case "tool.invocation_awaiting_external_result":
       return `${e.tool_name} ${str(e.tool_call_id)}`;
     case "tool.invocation_completed":
-      return `${e.tool_name} → ${e.outcome} · ${str(e.observation_preview ?? e.observation, 60)}`;
+      return `${e.tool_name} → ${e.outcome} · ${str(e.observation, 60)}`;
     case "tool.invocation_marked_unknown":
       return `${str(e.tool_call_id)} · ${e.reason}`;
     case "tool.batch_closed":

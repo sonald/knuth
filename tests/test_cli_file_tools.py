@@ -85,9 +85,13 @@ class CliReadFileToolTests(unittest.TestCase):
             result = anyio.run(scenario, Path(temp_dir))
 
         self.assertEqual(result.outcome, ToolExecutionOutcome.FAILED)
-        self.assertEqual(result.result.content, "")
+        self.assertIsNone(result.result.content)
         self.assertIn(
             "exceeds read_file max of 32768 bytes", result.result.error.message
+        )
+        self.assertIn(
+            "Tool error: Requested content exceeds read_file max of 32768 bytes",
+            result.result.to_observation_text(),
         )
         self.assertIn("no content returned", result.result.error.message)
 

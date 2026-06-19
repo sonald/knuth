@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
-import hashlib
-import json
 import os
 import signal as signalmod
 import sys
@@ -176,16 +173,13 @@ class ShellTool:
     def __init__(
         self,
         *,
-        offload_root: Path | str | None = None,
         threshold_bytes: int = 4096,
-        preview_bytes: int = 2048,
+        # Two streams previewed inline, so keep each well under the condensation
+        # middleware's per-result limit: a self-condensed result is exempt from
+        # that middleware, so its own preview must not blow the context budget.
+        preview_bytes: int = 1024,
         interrupt_grace_s: float = 2.0,
     ) -> None:
-        self._offload_root = (
-            Path.home() / ".knuth" / "offload" / "shell"
-            if offload_root is None
-            else Path(offload_root)
-        )
         self._threshold_bytes = threshold_bytes
         self._preview_bytes = preview_bytes
         # Grace after a gentle terminate before a force kill on user stop.
@@ -228,13 +222,11 @@ class ShellTool:
 
         stdout = stdout_bytes.decode(errors="replace")
         stderr = stderr_bytes.decode(errors="replace")
-        offload = await self._build_offload_payload(
+        offload, artifacts, condensed = await self._build_offload_payload(
             invocation=invocation,
             ctx=ctx,
-            command=command,
-            return_code=return_code,
-            stdout_bytes=stdout_bytes,
-            stderr_bytes=stderr_bytes,
+            stdout=stdout,
+            stderr=stderr,
         )
         if offload["status"] == "offloaded":
             stdout = self._preview(stdout_bytes)
@@ -253,6 +245,8 @@ class ShellTool:
         return ToolResult(
             status=status,
             content=content,
+            artifacts=artifacts,
+            condensed=condensed,
             error=None
             if return_code == 0
             else ToolResult.from_error(
@@ -361,13 +355,12 @@ class ShellTool:
         *,
         invocation: ToolInvocation,
         ctx: ToolRuntimeContext,
-        command: str,
-        return_code: int,
-        stdout_bytes: bytes,
-        stderr_bytes: bytes,
-    ) -> dict:
-        stdout_size = len(stdout_bytes)
-        stderr_size = len(stderr_bytes)
+        stdout: str,
+        stderr: str,
+    ) -> tuple[dict, list[str], bool]:
+        _ = invocation
+        stdout_size = len(stdout.encode("utf-8"))
+        stderr_size = len(stderr.encode("utf-8"))
         if (
             stdout_size <= self._threshold_bytes
             and stderr_size <= self._threshold_bytes
@@ -376,54 +369,35 @@ class ShellTool:
                 "status": "inline",
                 "threshold_bytes": self._threshold_bytes,
                 "preview_bytes": self._preview_bytes,
-            }
+            }, [], False
+        if ctx.artifacts is None:
+            return {
+                "status": "inline",
+                "reason": "artifact_sink_unavailable",
+                "threshold_bytes": self._threshold_bytes,
+                "preview_bytes": self._preview_bytes,
+            }, [], False
 
-        run_id = ctx.run_id or invocation.run_id
-        tool_call_id = ctx.tool_call_id or invocation.tool_call_id
-        offload_dir = self._offload_root / run_id / tool_call_id
-        await anyio.Path(offload_dir).mkdir(parents=True, exist_ok=True)
-        stdout_path = offload_dir / "stdout.txt"
-        stderr_path = offload_dir / "stderr.txt"
-        result_path = offload_dir / "result.json"
-        await anyio.Path(stdout_path).write_bytes(stdout_bytes)
-        await anyio.Path(stderr_path).write_bytes(stderr_bytes)
-
-        metadata = {
-            "version": 1,
-            "tool": "shell",
-            "run_id": run_id,
-            "tool_call_id": tool_call_id,
-            "timestamp_utc": datetime.now(UTC).isoformat(),
-            "cwd": str(Path.cwd()),
-            "return_code": return_code,
-            "command_sha256": hashlib.sha256(command.encode()).hexdigest(),
-            "threshold_bytes": self._threshold_bytes,
-            "preview_bytes": self._preview_bytes,
-            "stdout": self._file_metadata(stdout_path, stdout_bytes),
-            "stderr": self._file_metadata(stderr_path, stderr_bytes),
-        }
-        await anyio.Path(result_path).write_text(
-            json.dumps(metadata, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        stdout_art = await ctx.artifacts.put(stdout, kind="shell_stdout", ext=".txt")
+        stderr_art = await ctx.artifacts.put(stderr, kind="shell_stderr", ext=".txt")
         return {
             "status": "offloaded",
             "message": "Full output saved for inspection.",
-            "result_path": str(result_path),
             "threshold_bytes": self._threshold_bytes,
             "preview_bytes": self._preview_bytes,
-            "stdout": metadata["stdout"],
-            "stderr": metadata["stderr"],
-        }
+            "stdout": self._artifact_metadata(stdout_art),
+            "stderr": self._artifact_metadata(stderr_art),
+        }, [stdout_art.id, stderr_art.id], True
 
     def _preview(self, content: bytes) -> str:
         return content[: self._preview_bytes].decode(errors="replace")
 
-    def _file_metadata(self, path: Path, content: bytes) -> dict:
+    def _artifact_metadata(self, artifact) -> dict:
         return {
-            "path": str(path),
-            "bytes": len(content),
-            "sha256": hashlib.sha256(content).hexdigest(),
+            "id": artifact.id,
+            "path": artifact.path,
+            "bytes": artifact.bytes,
+            "sha256": artifact.sha256,
         }
 
 

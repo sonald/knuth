@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from knuth.core.invocations import ToolInvocation
-from knuth.core.tools import ToolResult
+from knuth.core.tools import ToolExecutionResult, ToolResult
 
 from knuth_toold.base import ToolManifest, ToolRuntimeContext
 
@@ -18,5 +18,5 @@ class ToolProvider(Protocol):
         self,
         invocation: ToolInvocation,
         ctx: ToolRuntimeContext,
-    ) -> ToolResult:
+    ) -> ToolResult | ToolExecutionResult:
         ...

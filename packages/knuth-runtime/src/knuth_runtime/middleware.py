@@ -141,9 +141,7 @@ class MessageMiddlewareRunner:
             budget=budget,
         )
         events = await self.ledger.list_events(run_id)
-        tape = await reconstruct_message_tape_from_events(
-            events, self.ledger.get_artifact_text
-        )
+        tape = await reconstruct_message_tape_from_events(events)
         patch_ordinal = 0
         for middleware in candidates:
             patches = await middleware.process(ctx, tape)
@@ -158,9 +156,7 @@ class MessageMiddlewareRunner:
                         run_id, self._compile_durable_patch(middleware, patch)
                     )
                     events = await self.ledger.list_events(run_id)
-                    tape = await reconstruct_message_tape_from_events(
-                        events, self.ledger.get_artifact_text
-                    )
+                    tape = await reconstruct_message_tape_from_events(events)
                 else:
                     result.ephemeral_records.append(record)
         if result.ephemeral_records:
@@ -180,9 +176,7 @@ class MessageMiddlewareRunner:
             budget=budget,
         )
         events = await self.ledger.list_events(run_id)
-        tape = await reconstruct_message_tape_from_events(
-            events, self.ledger.get_artifact_text
-        )
+        tape = await reconstruct_message_tape_from_events(events)
         for middleware in self.middlewares:
             ready = getattr(middleware, "assert_checkpoint_complete", None)
             if ready is not None:
@@ -330,8 +324,8 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-class ToolResultRedactionMiddleware(MessageMiddleware):
-    name = "tool_result_redaction"
+class ObservationCondensationMiddleware(MessageMiddleware):
+    name = "observation_condensation"
     priority = 50
     checkpoints = {
         MessageMiddlewareCheckpoint.AFTER_TOOL_RESULT_COMMITTED,
@@ -351,12 +345,14 @@ class ToolResultRedactionMiddleware(MessageMiddleware):
         for item in tape.model_visible():
             if item.role != InferenceRole.TOOL_RESULT.value:
                 continue
+            if item.metadata.get("self_condensed"):
+                continue
             content = item.content or ""
             if len(content) <= self.max_chars:
                 continue
             digest = _sha256(content)
             replacement_content = (
-                "Result redacted for context headroom. Relevant excerpt:\n"
+                "Observation condensed for context headroom. Relevant excerpt:\n"
                 + content[: self.excerpt_chars]
             )
             patches.append(
@@ -393,11 +389,12 @@ class ToolResultRedactionMiddleware(MessageMiddleware):
             item.id
             for item in tape.model_visible()
             if item.role == InferenceRole.TOOL_RESULT.value
+            and not item.metadata.get("self_condensed")
             and len(item.content or "") > self.max_chars
         ]
         if remaining:
             raise ValueError(
-                "tool result redaction incomplete before model request: "
+                "observation condensation incomplete before model request: "
                 + ", ".join(remaining)
             )
 

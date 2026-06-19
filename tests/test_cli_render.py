@@ -45,7 +45,6 @@ class EventRendererShellToolTests(unittest.TestCase):
                 tool_name="shell",
                 outcome="succeeded",
                 observation=observation,
-                observation_preview=None,
             ),
         )
 
@@ -66,9 +65,8 @@ class EventRendererShellToolTests(unittest.TestCase):
             return_code=0,
             offload={
                 "status": "offloaded",
-                "result_path": "/tmp/result.json",
-                "stdout": {"path": "/tmp/stdout.txt"},
-                "stderr": {"path": "/tmp/stderr.txt"},
+                "stdout": {"id": "art_stdout", "path": "/tmp/stdout.txt"},
+                "stderr": {"id": "art_stderr", "path": "/tmp/stderr.txt"},
             },
         )
 
@@ -79,7 +77,6 @@ class EventRendererShellToolTests(unittest.TestCase):
                 tool_name="shell",
                 outcome="succeeded",
                 observation=observation,
-                observation_preview=None,
             ),
         )
 
@@ -87,7 +84,8 @@ class EventRendererShellToolTests(unittest.TestCase):
         self.assertIn("offload:", rendered)
         self.assertIn("/tmp/stdout.txt", rendered)
         self.assertIn("/tmp/stderr.txt", rendered)
-        self.assertIn("/tmp/result.json", rendered)
+        self.assertIn("art_stdout", rendered)
+        self.assertIn("art_stderr", rendered)
 
     def test_shell_tool_completion_falls_back_on_unparseable_observation(self) -> None:
         output = io.StringIO()
@@ -101,7 +99,6 @@ class EventRendererShellToolTests(unittest.TestCase):
                 tool_name="shell",
                 outcome="succeeded",
                 observation="plain output",
-                observation_preview=None,
             ),
         )
 
@@ -131,7 +128,6 @@ class EventRendererShellToolTests(unittest.TestCase):
                         "   8: theta",
                     ]
                 ),
-                observation_preview=None,
             ),
         )
 

@@ -131,11 +131,6 @@ async def _interrupt_at_loop_boundary(invocation: RuntimeInvocation) -> None:
         notice=None,
     )
 
-# Observations above this size are offloaded to the artifact side store; the
-# event keeps an artifact_ref and an observation_preview (design §1.2).
-OBSERVATION_INLINE_LIMIT = 8 * 1024
-_OBSERVATION_PREVIEW_CHARS = 512
-
 EMPTY_ANSWER_FEEDBACK = (
     "Your previous answer was empty. Provide a concrete answer or call a tool."
 )
@@ -511,16 +506,16 @@ async def _drive_open_batch(
             inv.status == ToolInvocationStatus.DENIED
             and not inv.observation_recorded
         ):
-            await invocation.emit(
-                ToolInvocationCompletedDraft(
-                    tool_call_id=inv.tool_call_id,
-                    tool_name=inv.tool_name,
-                    outcome="denied",
-                    observation=(
-                        f"Tool call denied: {inv.denied_observation or 'denied'}"
-                    ),
-                )
+            completion = ToolInvocationCompletedDraft(
+                tool_call_id=inv.tool_call_id,
+                tool_name=inv.tool_name,
+                outcome="denied",
+                observation=(
+                    f"Tool call denied: {inv.denied_observation or 'denied'}"
+                ),
             )
+            await _commit_completion_artifacts(invocation, completion)
+            await invocation.emit(completion)
             await _run_after_tool_result_committed(invocation)
 
     # Awaiting approval gates the run. Crash recovery: re-request a missing
@@ -604,13 +599,16 @@ async def _drive_open_batch(
             await _abandon_unstarted(invocation, approved[position + 1 :])
             break
 
-        completion = await _completion_for(
-            services, run_id, inv, result
-        )
+        completion = _completion_for(inv, result)
         if result.outcome == ToolExecutionOutcome.INTERRUPTED:
             # The active tool stopped cooperatively. Its observation, the
             # abandoned observations, batch close, notice, and run.interrupted
             # are one atomic collapse.
+            # Commit artifacts to the store *before* the durable event that
+            # references them. A crash in this window then leaves a harmless
+            # committed-but-unreferenced artifact, never a durable event that
+            # points at a still-pending artifact orphan GC could later delete.
+            await _commit_completion_artifacts(invocation, completion)
             await _collapse_tool_interrupt(
                 invocation,
                 batch,
@@ -619,6 +617,7 @@ async def _drive_open_batch(
             )
             await _run_after_tool_result_committed(invocation)
             return RunStatus.INTERRUPTED
+        await _commit_completion_artifacts(invocation, completion)
         await invocation.emit(completion)
         await _run_after_tool_result_committed(invocation)
 
@@ -648,6 +647,25 @@ async def _run_after_tool_result_committed(invocation: RuntimeInvocation) -> Non
     )
 
 
+async def _commit_completion_artifacts(
+    invocation: RuntimeInvocation,
+    completion: ToolInvocationCompletedDraft,
+) -> None:
+    """Flip the tool's archived artifacts from ``pending`` to ``committed``.
+
+    Must run *before* the durable ``tool.invocation_completed`` that references
+    them, so a crash in the window fails safe: a committed-but-unreferenced
+    artifact (reclaimed only by ``reclaim_run``) rather than a durable event
+    pointing at a ``pending`` artifact that orphan GC could later delete.
+    """
+    if not completion.raw_artifacts:
+        return
+    await invocation.services.artifact_store.mark_committed(
+        invocation.run_id,
+        list(completion.raw_artifacts),
+    )
+
+
 async def _run_after_turn_closed(invocation: RuntimeInvocation) -> None:
     runner = invocation.services.message_middleware_runner
     if runner is None:
@@ -658,23 +676,12 @@ async def _run_after_turn_closed(invocation: RuntimeInvocation) -> None:
     )
 
 
-async def _completion_for(
-    services,
-    run_id: str,
+def _completion_for(
     inv: ToolInvocation,
     result,
 ) -> ToolInvocationCompletedDraft:
-    """Build the completion draft for a finished tool, offloading big text."""
+    """Build the durable completion for a finished tool."""
     observation = result.to_observation_text()
-    artifact_ref = None
-    observation_preview = None
-    if len(observation) > OBSERVATION_INLINE_LIMIT:
-        artifact = await services.ledger.put_artifact(
-            run_id, "tool_observation", observation
-        )
-        artifact_ref = artifact.id
-        observation_preview = observation[:_OBSERVATION_PREVIEW_CHARS]
-        observation = None
     outcome_tag = (
         "succeeded"
         if result.outcome == ToolExecutionOutcome.SUCCEEDED
@@ -682,6 +689,8 @@ async def _completion_for(
         if result.outcome == ToolExecutionOutcome.FAILED
         else "interrupted"
     )
+    raw_artifacts = list(result.result.artifacts) if result.result is not None else []
+    self_condensed = result.result.condensed if result.result is not None else False
     tool_status = result.tool_status or (
         result.result.status.value if result.result is not None else None
     )
@@ -690,8 +699,8 @@ async def _completion_for(
         tool_name=inv.tool_name,
         outcome=outcome_tag,
         observation=observation,
-        artifact_ref=artifact_ref,
-        observation_preview=observation_preview,
+        raw_artifacts=raw_artifacts,
+        self_condensed=self_condensed,
         tool_status=tool_status,
     )
 

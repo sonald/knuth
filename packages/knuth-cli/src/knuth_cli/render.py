@@ -245,7 +245,7 @@ class EventRenderer:
             self._console.print(Text(f"  ✘ {name} denied", style="red"))
             return
         ok = event.outcome == "succeeded"
-        body = event.observation or event.observation_preview or ""
+        body = event.observation
         if name == "shell":
             parsed = parse_tagged_process_output(str(body))
             if parsed is not None:
@@ -280,12 +280,11 @@ class EventRenderer:
             for label in ("stdout", "stderr"):
                 payload = output.offload.get(label)
                 if isinstance(payload, dict) and payload.get("path"):
+                    artifact_id = payload.get("id")
+                    suffix = f" ({artifact_id})" if artifact_id else ""
                     self._console.print(
-                        Text(f"      {label}: {payload['path']}", style="dim")
+                        Text(f"      {label}: {payload['path']}{suffix}", style="dim")
                     )
-            result_path = output.offload.get("result_path")
-            if result_path:
-                self._console.print(Text(f"      result: {result_path}", style="dim"))
 
 
 def _format_args(args: dict[str, Any]) -> str:

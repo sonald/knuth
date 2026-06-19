@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+import tempfile
 from typing import Literal
 
 from knuth.core.events import (
@@ -29,6 +30,7 @@ from knuth_runtime.context import (
     project_messages_from_events,
     raw_ledger_messages_from_events,
 )
+from knuth_runtime.artifacts import FilesystemArtifactStore
 from knuth_runtime.ledger import (
     EventRedactor,
     MemoryRunLedger,
@@ -41,7 +43,7 @@ from knuth_runtime.middleware import (
     MessageMiddleware,
     MessageMiddlewareCheckpoint,
     MessageMiddlewareRunner,
-    ToolResultRedactionMiddleware,
+    ObservationCondensationMiddleware,
 )
 from knuth_runtime.skills import (
     SkillChangeNoticeMiddleware,
@@ -251,16 +253,13 @@ class AgentRuntime:
 
     async def messages(self, run_id: str) -> list[InferenceMessage]:
         events = await self._services.ledger.list_events(run_id)
-        return await raw_ledger_messages_from_events(
-            events, self._services.ledger.get_artifact_text
-        )
+        return await raw_ledger_messages_from_events(events)
 
     async def model_context_messages(self, run_id: str) -> list[InferenceMessage]:
         events = await self._services.ledger.list_events(run_id)
         state = await self._services.ledger.run_state(run_id)
         return await project_messages_from_events(
             events,
-            self._services.ledger.get_artifact_text,
             allow_open_tool_batch=state.open_batch is not None,
         )
 
@@ -438,7 +437,7 @@ def _build_tool_registry(
 
 def _default_message_middlewares() -> list[MessageMiddleware]:
     return [
-        ToolResultRedactionMiddleware(),
+        ObservationCondensationMiddleware(),
         ContextCompactionMiddleware(),
     ]
 
@@ -506,12 +505,22 @@ def build_sqlite_runtime(
     enable_plugins: bool = False,
     debug_sink_dir: Path | str | None = None,
     skill_config: SkillRuntimeConfig | None = None,
+    artifact_root: Path | str | None = None,
 ) -> AgentRuntime:
     # Redaction is a v0 security floor (design §8): the ledger is append-only,
     # so secrets must be stripped before apply. Default on; pass a custom
     # redactor to change what counts as a secret.
     redactor = redactor or RegexSecretRedactor()
     ledger = SQLiteRunLedger(db_path or Path("~/.knuth/knuth.db"), redactor=redactor)
+    artifact_redactor = (
+        redactor if isinstance(redactor, RegexSecretRedactor) else RegexSecretRedactor()
+    )
+    store_root = (
+        Path(artifact_root)
+        if artifact_root is not None
+        else _default_artifact_root(db_path)
+    )
+    artifact_store = FilesystemArtifactStore(store_root, redactor=artifact_redactor)
     registry = _build_tool_registry(
         include_default_tools=include_default_tools,
         enable_plugins=enable_plugins,
@@ -521,7 +530,11 @@ def build_sqlite_runtime(
     registry.add_provider(SkillToolProvider(skill_manager))
     for provider in tool_providers:
         registry.add_provider(provider)
-    broker = ToolBroker(registry, policy_engine=PolicyEngine())
+    broker = ToolBroker(
+        registry,
+        policy_engine=PolicyEngine(),
+        artifact_sink_provider=artifact_store,
+    )
     message_middleware_runner = MessageMiddlewareRunner(
         ledger,
         _compose_message_middlewares(message_middlewares, skill_manager),
@@ -530,6 +543,7 @@ def build_sqlite_runtime(
         inference_client=inference_client,
         tool_broker=broker,
         ledger=ledger,
+        artifact_store=artifact_store,
         message_middleware_runner=message_middleware_runner,
         skill_hot_reload_service=skill_hot_reload_service,
         context_builder=ContextBuilder(
@@ -570,8 +584,15 @@ def build_memory_runtime(
     tool_providers: Iterable[ToolProvider] = (),
     include_default_tools: bool = True,
     skill_config: SkillRuntimeConfig | None = None,
+    artifact_root: Path | str | None = None,
 ) -> AgentRuntime:
     ledger = ledger or MemoryRunLedger()
+    artifact_store = FilesystemArtifactStore(
+        Path(artifact_root)
+        if artifact_root is not None
+        else Path(tempfile.mkdtemp(prefix="knuth-artifacts-")),
+        redactor=RegexSecretRedactor(),
+    )
     skill_manager = _skill_manager(skill_config)
     skill_hot_reload_service = _skill_hot_reload_service(skill_config, skill_manager)
     if tool_broker is None:
@@ -583,9 +604,13 @@ def build_memory_runtime(
         for provider in tool_providers:
             registry.add_provider(provider)
         tool_broker = ToolBroker(
-            registry, policy_engine=PolicyEngine()
+            registry,
+            policy_engine=PolicyEngine(),
+            artifact_sink_provider=artifact_store,
         )
     else:
+        if tool_broker.artifact_sink_provider is None:
+            tool_broker.artifact_sink_provider = artifact_store
         tool_broker.registry.add_provider(SkillToolProvider(skill_manager))
     message_middleware_runner = MessageMiddlewareRunner(
         ledger,
@@ -595,6 +620,7 @@ def build_memory_runtime(
         inference_client=inference_client,
         tool_broker=tool_broker,
         ledger=ledger,
+        artifact_store=artifact_store,
         message_middleware_runner=message_middleware_runner,
         skill_hot_reload_service=skill_hot_reload_service,
         context_builder=ContextBuilder(
@@ -606,3 +632,9 @@ def build_memory_runtime(
         ),
     )
     return AgentRuntime(services=services, inference_config=inference_config)
+
+
+def _default_artifact_root(db_path: Path | str | None) -> Path:
+    if db_path is None:
+        return Path("~/.knuth/artifacts")
+    return Path(db_path).expanduser().parent / "artifacts"

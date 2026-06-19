@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["knuth-cli", "knuth-agui", "knuth-im"]
+dev = ["httpx2", "knuth-cli", "knuth-agui", "knuth-im"]
 
 [tool.uv.workspace]
 members = ["packages/*"]

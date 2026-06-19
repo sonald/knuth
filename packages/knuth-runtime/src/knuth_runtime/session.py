@@ -110,8 +110,9 @@ class RunSession:
             return
         if not self._done.is_set():
             self._task_group.cancel_scope.cancel()
-        elif self._observation is not None:
-            await self._observation.aclose()
+        if self._observation is not None:
+            with anyio.CancelScope(shield=True):
+                await self._observation.aclose()
         if self._done.is_set():
             self._task_group.cancel_scope.cancel()
         await self._exit_stack.__aexit__(exc_type, exc, tb)

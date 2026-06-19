@@ -11,7 +11,7 @@ import json
 import tempfile
 import unittest
 
-from fastapi.testclient import TestClient
+from starlette.testclient import TestClient
 from knuth_llmd import InferenceConfig
 from knuth_runtime import MemoryRunLedger, build_memory_runtime
 from knuth_runtime.policy import PolicyEngine

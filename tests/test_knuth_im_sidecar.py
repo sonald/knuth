@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from fastapi.testclient import TestClient
+from starlette.testclient import TestClient
 
 from knuth_llmd import InferenceConfig
 from knuth_runtime import build_memory_runtime

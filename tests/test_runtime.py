@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 import sqlite3
@@ -56,6 +57,7 @@ from knuth_runtime import (
     AgentRuntime,
     CrashRecoveryReport,
     DebugEventSink,
+    FilesystemArtifactStore,
     LedgerError,
     MemoryRunLedger,
     AgentsMDMiddleware,
@@ -82,12 +84,13 @@ from knuth_runtime.context import (
     project_messages_from_events,
     raw_ledger_messages_from_events,
 )
-from knuth_runtime.loop import EMPTY_ANSWER_FEEDBACK, OBSERVATION_INLINE_LIMIT
+from knuth_runtime.loop import EMPTY_ANSWER_FEEDBACK
 from knuth_runtime.observation import RuntimeEventInterest, RuntimeObservationError
 from knuth_runtime.policy import PolicyEngine
 from knuth_runtime.services import RuntimeServices
 from knuth_toold import ToolBroker, create_default_registry
 from knuth_toold.base import ToolManifest, ToolRuntimeContext
+from knuth_toold.process_output import parse_tagged_process_output
 from knuth_toold.skills import SkillManager, SkillRoot
 
 
@@ -174,9 +177,7 @@ class RunLedgerTests(unittest.TestCase):
                 ],
             )
             events = await ledger.list_events(run.id)
-            messages = await project_messages_from_events(
-                events, ledger.get_artifact_text
-            )
+            messages = await project_messages_from_events(events)
             await ledger.refold()
             return messages, await ledger.list_events(run.id)
 
@@ -225,9 +226,7 @@ class RunLedgerTests(unittest.TestCase):
                     ),
                 ],
             )
-            return await project_messages_from_events(
-                await ledger.list_events(run.id), ledger.get_artifact_text
-            )
+            return await project_messages_from_events(await ledger.list_events(run.id))
 
         messages = anyio.run(scenario)
         self.assertEqual(messages[0].content, "named replacement")
@@ -755,10 +754,17 @@ class RedactionTests(unittest.TestCase):
 
         async def scenario():
             run = await ledger.create_run("q")
-            artifact = await ledger.put_artifact(
-                run.id, "tool_observation", "token sk-abcdefghijklmnopqrstuvwxyz123456"
+            store = FilesystemArtifactStore(
+                Path(tempfile.mkdtemp()),
+                redactor=RegexSecretRedactor(),
             )
-            return await ledger.get_artifact_text(artifact.id)
+            artifact = await store.put(
+                run.id,
+                "token sk-abcdefghijklmnopqrstuvwxyz123456",
+                kind="tool_observation",
+                ext=".txt",
+            )
+            return await store.read_text(run.id, artifact.id)
 
         text = anyio.run(scenario)
         self.assertEqual(text, "token [REDACTED:openai_key]")
@@ -878,7 +884,7 @@ class RefoldTests(unittest.TestCase):
                 [
                     MessageRewriteAnchorDraft(
                         kind="begin",
-                        middleware="tool_result_redaction",
+                        middleware="observation_condensation",
                         operation="replace",
                         suppresses=[target_id],
                     ),
@@ -887,18 +893,18 @@ class RefoldTests(unittest.TestCase):
                             role=InferenceRole.TOOL_RESULT,
                             tool_call_id="c1",
                             tool_name="write_file",
-                            content="Result redacted for context headroom.",
+                            content="Observation condensed for context headroom.",
                         ),
                     ),
                     MessageRewriteAnchorDraft(
                         kind="end",
-                        middleware="tool_result_redaction",
+                        middleware="observation_condensation",
                         operation="replace",
                     ),
                 ],
             )
             messages = await project_messages_from_events(
-                await ledger.list_events(run_id), ledger.get_artifact_text
+                await ledger.list_events(run_id)
             )
             return messages
 
@@ -911,7 +917,7 @@ class RefoldTests(unittest.TestCase):
         self.assertEqual(len(tool_messages), 1)
         self.assertEqual(tool_messages[0].tool_call_id, "c1")
         self.assertEqual(
-            tool_messages[0].content, "Result redacted for context headroom."
+            tool_messages[0].content, "Observation condensed for context headroom."
         )
 
     def test_tool_result_rewrite_rejects_different_tool_call_id(self) -> None:
@@ -929,7 +935,7 @@ class RefoldTests(unittest.TestCase):
                     [
                         MessageRewriteAnchorDraft(
                             kind="begin",
-                            middleware="tool_result_redaction",
+                            middleware="observation_condensation",
                             operation="replace",
                             suppresses=[f"m:{tool_event.seq}"],
                         ),
@@ -943,7 +949,7 @@ class RefoldTests(unittest.TestCase):
                         ),
                         MessageRewriteAnchorDraft(
                             kind="end",
-                            middleware="tool_result_redaction",
+                            middleware="observation_condensation",
                             operation="replace",
                         ),
                     ],
@@ -1207,7 +1213,7 @@ class EventDrivenRuntimeTests(unittest.TestCase):
         self.assertNotIn(large_body, tool_results[0].content or "")
         self.assertFalse(
             (tool_results[0].content or "").startswith(
-                "Result redacted for context headroom."
+                "Observation condensed for context headroom."
             )
         )
 
@@ -1410,10 +1416,7 @@ class EventDrivenRuntimeTests(unittest.TestCase):
             self.assertIn("run.succeeded", types)
 
             async def reconstruct():
-                ledger = runtime._services.ledger
-                return await raw_ledger_messages_from_events(
-                    events, ledger.get_artifact_text
-                )
+                return await raw_ledger_messages_from_events(events)
 
             reconstructed = anyio.run(reconstruct)
             self.assertEqual(reconstructed[-1].content, "Final answer: Knuth works")
@@ -1635,8 +1638,8 @@ class EventDrivenRuntimeTests(unittest.TestCase):
             EMPTY_ANSWER_FEEDBACK, [message.content for message in second_turn]
         )
 
-    def test_large_observation_is_offloaded_to_artifact(self) -> None:
-        big = "x" * (OBSERVATION_INLINE_LIMIT + 100)
+    def test_large_uncondensed_observation_is_condensed_for_model_context(self) -> None:
+        big = "x" * 9000
         with tempfile.TemporaryDirectory() as workspace:
             big_path = Path(workspace, "big.txt")
             big_path.write_text(big, encoding="utf-8")
@@ -1662,9 +1665,9 @@ class EventDrivenRuntimeTests(unittest.TestCase):
         completed = [
             event for event in events if event.type == "tool.invocation_completed"
         ]
-        self.assertIsNone(completed[0].observation)
-        self.assertIsNotNone(completed[0].artifact_ref)
-        self.assertTrue(completed[0].observation_preview)
+        self.assertIsNotNone(completed[0].observation)
+        self.assertEqual(completed[0].raw_artifacts, [])
+        self.assertFalse(completed[0].self_condensed)
         raw_messages = anyio.run(runtime.messages, turn.run_id)
         raw_tool_results = [
             message
@@ -1680,15 +1683,15 @@ class EventDrivenRuntimeTests(unittest.TestCase):
         ]
         self.assertTrue(
             (model_tool_results[0].content or "").startswith(
-                "Result redacted for context headroom."
+                "Observation condensed for context headroom."
             )
         )
         audit = anyio.run(runtime.rewrite_audit, turn.run_id)
         self.assertEqual(audit[0]["operation"], "replace")
-        self.assertEqual(audit[0]["middleware"], "tool_result_redaction")
+        self.assertEqual(audit[0]["middleware"], "observation_condensation")
         self.assertEqual(len(audit[0]["replacement_messages"]), 1)
 
-        # The next model request sees the projection-redacted replacement.
+        # The next model request sees the projection-condensed replacement.
         final_turn = client.captured_messages[-1]
         tool_results = [
             message
@@ -1697,10 +1700,84 @@ class EventDrivenRuntimeTests(unittest.TestCase):
         ]
         self.assertTrue(
             (tool_results[0].content or "").startswith(
-                "Result redacted for context headroom."
+                "Observation condensed for context headroom."
             )
         )
         self.assertNotIn(big, tool_results[0].content or "")
+
+    def test_shell_l1_artifact_output_is_committed_and_not_recondensed(self) -> None:
+        client = CapturingScriptedClient(
+            [
+                InferenceMessage(
+                    role=InferenceRole.ASSISTANT,
+                    tool_calls=[
+                        CoreToolCall(
+                            tool_call_id="call-shell",
+                            name="shell",
+                            arguments={"command": "printf '%05000d' 0"},
+                        )
+                    ],
+                ),
+                InferenceMessage(role=InferenceRole.ASSISTANT, content="done"),
+            ]
+        )
+        runtime = _build_runtime(client)
+
+        first = anyio.run(runtime.run_once, "run shell")
+        pending = anyio.run(runtime.pending_approvals, first.run_id)
+        self.assertEqual(first.status, RunStatus.WAITING_APPROVAL)
+        self.assertEqual(len(pending), 1)
+        anyio.run(runtime.approve, pending[0].id)
+
+        async def resume():
+            async with runtime.resume(first.run_id) as session:
+                return await session.result()
+
+        resumed = anyio.run(resume)
+        events = anyio.run(runtime.events, first.run_id)
+        completed = [
+            event for event in events if event.type == "tool.invocation_completed"
+        ][0]
+        parsed = parse_tagged_process_output(completed.observation)
+        manifest_path = (
+            runtime._services.artifact_store.root / first.run_id / "manifest.json"
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        model_tool_result = [
+            message
+            for message in client.captured_messages[-1]
+            if message.role == InferenceRole.TOOL_RESULT
+        ][0]
+
+        self.assertEqual(resumed.status, RunStatus.SUCCEEDED)
+        self.assertTrue(completed.self_condensed)
+        self.assertEqual(len(completed.raw_artifacts), 2)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.offload["status"], "offloaded")
+        self.assertEqual(parsed.offload["stdout"]["id"], completed.raw_artifacts[0])
+        self.assertEqual(parsed.offload["stderr"]["id"], completed.raw_artifacts[1])
+        self.assertEqual(
+            Path(parsed.offload["stdout"]["path"]).read_text(encoding="utf-8"),
+            "0" * 5000,
+        )
+        self.assertEqual(model_tool_result.content, completed.observation)
+        self.assertIn("</process_output>", model_tool_result.content or "")
+        self.assertEqual(
+            manifest["artifacts"][completed.raw_artifacts[0]]["state"],
+            "committed",
+        )
+        self.assertEqual(
+            manifest["artifacts"][completed.raw_artifacts[1]]["state"],
+            "committed",
+        )
+        audit = anyio.run(runtime.rewrite_audit, first.run_id)
+        self.assertFalse(
+            [
+                record
+                for record in audit
+                if record["middleware"] == "observation_condensation"
+            ]
+        )
 
     def test_agents_md_injection_is_ephemeral_and_affects_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
@@ -2470,11 +2547,16 @@ class StreamingRuntimeTests(unittest.TestCase):
             ledger = MemoryRunLedger()
             registry = create_default_registry()
             broker = ToolBroker(registry, PolicyEngine())
+            artifact_store = FilesystemArtifactStore(
+                Path(tempfile.mkdtemp()),
+                redactor=RegexSecretRedactor(),
+            )
             runtime = AgentRuntime(
                 RuntimeServices(
                     inference_client=client,
                     tool_broker=broker,
                     ledger=ledger,
+                    artifact_store=artifact_store,
                     context_builder=ContextBuilder(ledger, broker),
                     message_middleware_runner=None,
                     skill_hot_reload_service=None,
@@ -2594,10 +2676,7 @@ class StreamingRuntimeTests(unittest.TestCase):
             ) as session:
                 second = await session.result()
             events = await runtime.events(first.run_id)
-            ledger = runtime._services.ledger
-            messages = await raw_ledger_messages_from_events(
-                events, ledger.get_artifact_text
-            )
+            messages = await raw_ledger_messages_from_events(events)
             return first, second, messages
 
         first, second, messages = anyio.run(scenario)

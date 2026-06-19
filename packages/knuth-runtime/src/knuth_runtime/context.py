@@ -211,9 +211,7 @@ class ContextBuilder:
         ephemeral_rewrite_records: list[MessageRewriteRecord],
     ) -> ContextView:
         events = await self.ledger.list_events(ctx.run_id)
-        tape = await reconstruct_message_tape_from_events(
-            events, self.ledger.get_artifact_text
-        )
+        tape = await reconstruct_message_tape_from_events(events)
         if ephemeral_rewrite_records:
             tape = tape.with_records(ephemeral_rewrite_records)
         messages = tape.model_context_messages()
@@ -256,11 +254,10 @@ class ContextBuilder:
 
 async def project_messages_from_events(
     events: list[RuntimeEvent],
-    resolve_artifact_text,
     *,
     allow_open_tool_batch: bool = False,
 ) -> list[InferenceMessage]:
-    tape = await reconstruct_message_tape_from_events(events, resolve_artifact_text)
+    tape = await reconstruct_message_tape_from_events(events)
     messages = tape.model_context_messages()
     validate_provider_messages(messages, allow_open_tool_batch=allow_open_tool_batch)
     return messages
@@ -268,15 +265,13 @@ async def project_messages_from_events(
 
 async def raw_ledger_messages_from_events(
     events: list[RuntimeEvent],
-    resolve_artifact_text,
 ) -> list[InferenceMessage]:
-    tape = await reconstruct_message_tape_from_events(events, resolve_artifact_text)
+    tape = await reconstruct_message_tape_from_events(events)
     return tape.raw_ledger_messages()
 
 
 async def reconstruct_message_tape_from_events(
     events: list[RuntimeEvent],
-    resolve_artifact_text,
 ) -> MessageTape:
     """Conversation fold: a closed, typed mapping from decision events to the
     message sequence. Aggregate invariants guarantee the result is always a
@@ -308,9 +303,6 @@ async def reconstruct_message_tape_from_events(
                 )
             )
         elif event.type == "tool.invocation_completed":
-            observation = event.observation
-            if observation is None and event.artifact_ref is not None:
-                observation = await resolve_artifact_text(event.artifact_ref)
             items.append(
                 TapeMessage(
                     id=ledger_message_id(event.seq),
@@ -318,9 +310,13 @@ async def reconstruct_message_tape_from_events(
                         role=InferenceRole.TOOL_RESULT,
                         tool_call_id=event.tool_call_id,
                         tool_name=event.tool_name,
-                        content=observation or "",
+                        content=event.observation,
                     ),
                     origin=TapeItemSource.LEDGER,
+                    metadata={
+                        "raw_artifacts": list(event.raw_artifacts),
+                        "self_condensed": event.self_condensed,
+                    },
                 )
             )
         elif event.type == "conversation.notice":

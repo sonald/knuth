@@ -14,6 +14,7 @@ from knuth_runtime.agent import (
     build_memory_runtime,
     build_sqlite_runtime,
 )
+from knuth_runtime.artifacts import FilesystemArtifactStore
 from knuth_runtime.debug import DEFAULT_DEBUG_SINK_DIR, DebugEventSink
 from knuth_runtime.interrupts import InterruptController
 from knuth_runtime.context import (
@@ -40,8 +41,8 @@ from knuth_runtime.middleware import (
     MessageMiddlewareCheckpoint,
     MessageMiddlewareContext,
     MessageMiddlewareRunner,
+    ObservationCondensationMiddleware,
     ReplacePatch,
-    ToolResultRedactionMiddleware,
 )
 from knuth_runtime.redaction import (
     DEFAULT_SECRET_PATTERNS,
@@ -77,6 +78,7 @@ __all__ = [
     "DEFAULT_SECRET_PATTERNS",
     "DebugEventSink",
     "EventRedactor",
+    "FilesystemArtifactStore",
     "InterruptController",
     "LedgerError",
     "MemoryRunLedger",
@@ -85,6 +87,7 @@ __all__ = [
     "MessageMiddlewareCheckpoint",
     "MessageMiddlewareContext",
     "MessageMiddlewareRunner",
+    "ObservationCondensationMiddleware",
     "OpenToolBatch",
     "RefoldStats",
     "RegexSecretRedactor",
@@ -108,7 +111,6 @@ __all__ = [
     "SystemSectionProvider",
     "ToolInvocation",
     "ToolInvocationStatus",
-    "ToolResultRedactionMiddleware",
     "build_default_runtime",
     "build_memory_runtime",
     "build_sqlite_runtime",

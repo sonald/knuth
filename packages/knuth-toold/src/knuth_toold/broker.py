@@ -5,6 +5,7 @@ from typing import Any, Protocol
 import anyio
 from jsonschema import ValidationError, validate
 
+from knuth.core.artifacts import ArtifactSinkProvider
 from knuth.core.interrupts import InterruptSignal
 from knuth.core.invocations import (
     EXTERNAL_EFFECTS,
@@ -13,7 +14,7 @@ from knuth.core.invocations import (
     ToolInvocation,
     ToolRisk,
 )
-from knuth.core.tools import ToolExecutionOutcome, ToolExecutionResult, ToolResult
+from knuth.core.tools import ToolExecutionResult, ToolResult
 from knuth.core.types import ErrorInfo, KnuthModel
 
 from knuth_toold.base import ToolManifest, ToolRuntimeContext
@@ -70,9 +71,11 @@ class ToolBroker:
         self,
         registry: ToolRegistry,
         policy_engine: PolicyEngine | None = None,
+        artifact_sink_provider: ArtifactSinkProvider | None = None,
     ) -> None:
         self.registry = registry
         self.policy_engine = policy_engine or AllowAllPolicy()
+        self.artifact_sink_provider = artifact_sink_provider
 
     async def list_visible_tools(self, run_id: str) -> list[dict[str, Any]]:
         await self.registry.refresh()
@@ -161,10 +164,27 @@ class ToolBroker:
                 )
             )
         provider = self.registry.get_provider_for_tool(invocation.tool_name)
+        try:
+            artifact_sink = (
+                self.artifact_sink_provider.sink_for(
+                    invocation.run_id,
+                    invocation.tool_call_id,
+                )
+                if self.artifact_sink_provider is not None
+                else None
+            )
+        except ValueError as exc:
+            # An unsafe run_id / tool_call_id (e.g. a provider-issued call id
+            # with a path separator) must surface as a structured tool failure,
+            # not an unhandled error out of execute().
+            return ToolExecutionResult.failed(
+                ToolResult.from_error("artifact_sink_unavailable", str(exc))
+            )
         ctx = ToolRuntimeContext(
             run_id=invocation.run_id,
             tool_call_id=invocation.tool_call_id,
             interrupt_signal=signal,
+            artifacts=artifact_sink,
         )
         # Cooperation, not preemption (design R4): poll-friendly tools observe
         # ``signal.interrupted`` and return their own outcome; single-blocking

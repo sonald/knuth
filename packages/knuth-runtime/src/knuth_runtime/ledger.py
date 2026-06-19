@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import functools
-import hashlib
 import sqlite3
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
@@ -30,14 +29,13 @@ from knuth.core.invocations import (
     ToolInvocationStatus,
     args_hash_for,
 )
-from knuth.core.runs import AgentRun, Artifact
+from knuth.core.runs import AgentRun
 from knuth.core.runtime_events import (
     ApprovalRequestedDraft,
     ApprovalResolvedDraft,
     ConversationNoticeDraft,
     MessageRewriteAnchor,
     MessageRewriteAnchorDraft,
-    MessageRewriteMessage,
     MessageRewriteMessageDraft,
     ModelAbortedDraft,
     ModelCompletedDraft,
@@ -146,12 +144,6 @@ class RunLedger(Protocol):
     async def get_invocation(self, tool_call_id: str) -> ToolInvocation:
         ...
 
-    async def put_artifact(self, run_id: str, kind: str, content: str) -> Artifact:
-        ...
-
-    async def get_artifact_text(self, artifact_id: str) -> str:
-        ...
-
     async def refold(self) -> RefoldStats:
         ...
 
@@ -175,7 +167,7 @@ RESUMABLE_STATUSES = frozenset(
     }
 )
 
-SQLITE_LEDGER_SCHEMA_VERSION = 2
+SQLITE_LEDGER_SCHEMA_VERSION = 3
 _BREAKING_SCHEMA_MESSAGE = (
     "breaking ledger schema: remove the legacy database or use a new one"
 )
@@ -865,7 +857,7 @@ def _reduce_tool_invocation_completed(
             f"proposed/approved/running invocation, got {invocation.status}",
         )
         _require(
-            draft.observation is not None or draft.artifact_ref is not None,
+            bool(draft.observation),
             "interrupted tool completion requires a model-visible observation",
         )
         new_status = ToolInvocationStatus.INTERRUPTED
@@ -1161,13 +1153,6 @@ class _LedgerMixin[TxnT]:
             return draft
         return self._redactor.redact_event(draft)
 
-    def _redact_artifact(self, content: str) -> str:
-        """Artifacts referenced by events are semantically part of the ledger
-        (design §1.2), so they get the same pre-write redaction when the
-        redactor supports plain text."""
-        redact_text = getattr(self._redactor, "redact_text", None)
-        return redact_text(content) if redact_text is not None else content
-
     def _apply_in_txn(
         self,
         txn: TxnT,
@@ -1290,7 +1275,6 @@ class MemoryRunLedger(_LedgerMixin[None]):
         self._runs: dict[str, AgentRun] = {}
         self._invocations: dict[str, dict[str, ToolInvocation]] = {}
         self._approvals: dict[str, Approval] = {}
-        self._artifacts: dict[str, tuple[Artifact, str]] = {}
 
     async def _transact(
         self, run_id: str, draft: DurableRuntimeEventDraft
@@ -1414,23 +1398,6 @@ class MemoryRunLedger(_LedgerMixin[None]):
                 return invocations[tool_call_id]
         raise KeyError(tool_call_id)
 
-    async def put_artifact(self, run_id: str, kind: str, content: str) -> Artifact:
-        content = self._redact_artifact(content)
-        artifact = Artifact(
-            id=f"art_{uuid4().hex}",
-            run_id=run_id,
-            kind=kind,
-            sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
-            created_at=utc_now(),
-        )
-        self._artifacts[artifact.id] = (artifact, content)
-        return artifact
-
-    async def get_artifact_text(self, artifact_id: str) -> str:
-        if artifact_id not in self._artifacts:
-            raise KeyError(artifact_id)
-        return self._artifacts[artifact_id][1]
-
     async def refold(self) -> RefoldStats:
         async with self._lock:
             runs: dict[str, AgentRun] = {}
@@ -1521,14 +1488,6 @@ class SQLiteRunLedger(_LedgerMixin[sqlite3.Connection]):
                   data_json text not null,
                   created_at text not null,
                   resolved_at text
-                );
-                create table if not exists artifacts (
-                  id text primary key,
-                  run_id text not null,
-                  kind text not null,
-                  sha256 text not null,
-                  content text not null,
-                  created_at text not null
                 );
                 """
             )
@@ -1827,41 +1786,6 @@ class SQLiteRunLedger(_LedgerMixin[sqlite3.Connection]):
         if row is None:
             raise KeyError(tool_call_id)
         return ToolInvocation.model_validate_json(row[0])
-
-    @_threaded
-    def put_artifact(self, run_id: str, kind: str, content: str) -> Artifact:
-        content = self._redact_artifact(content)
-        artifact = Artifact(
-            id=f"art_{uuid4().hex}",
-            run_id=run_id,
-            kind=kind,
-            sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
-            created_at=utc_now(),
-        )
-        with self._connect() as conn:
-            conn.execute(
-                "insert into artifacts (id, run_id, kind, sha256, content, created_at)"
-                " values (?, ?, ?, ?, ?, ?)",
-                (
-                    artifact.id,
-                    artifact.run_id,
-                    artifact.kind,
-                    artifact.sha256,
-                    content,
-                    artifact.created_at,
-                ),
-            )
-        return artifact
-
-    @_threaded
-    def get_artifact_text(self, artifact_id: str) -> str:
-        with self._connect() as conn:
-            row = conn.execute(
-                "select content from artifacts where id = ?", (artifact_id,)
-            ).fetchone()
-        if row is None:
-            raise KeyError(artifact_id)
-        return row[0]
 
     @_threaded
     def refold(self) -> RefoldStats:

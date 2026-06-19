@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from knuth.core.artifacts import ArtifactSink
 from knuth.core.interrupts import InterruptSignal
 from knuth.core.invocations import (
     ToolEffect,
@@ -44,17 +45,19 @@ class ToolManifest(KnuthModel):
 
 @dataclass
 class ToolRuntimeContext:
-    """Execution context handed to a tool: data now, capability handles later.
+    """Execution context handed to a tool: ids plus narrow capabilities.
 
     ``interrupt_signal`` is present for local tools executing active work. A tool
     observes it at its own safe points (poll ``interrupted`` in a loop, or wake a
     blocking subprocess/network await via ``wait_interrupted``) and reports its
-    own outcome; the tool never touches the RunSession or ledger directly.
+    own outcome. ``artifacts`` lets self-condensing tools archive full text
+    output without seeing the ledger or runtime store.
     """
 
     run_id: str
     tool_call_id: str
     interrupt_signal: InterruptSignal | None = None
+    artifacts: ArtifactSink | None = None
 
 
 @runtime_checkable
@@ -67,7 +70,7 @@ class Tool(Protocol):
 
     async def invoke(
         self, invocation: ToolInvocation, ctx: ToolRuntimeContext
-    ) -> ToolResult:
+    ) -> ToolResult | ToolExecutionResult:
         ...
 
 

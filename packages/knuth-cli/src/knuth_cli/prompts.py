@@ -7,8 +7,8 @@ from knuth_runtime import (
     AgentsMDMiddleware,
     ContextCompactionMiddleware,
     MessageMiddleware,
+    ObservationCondensationMiddleware,
     StaticSectionProvider,
-    ToolResultRedactionMiddleware,
 )
 
 
@@ -35,6 +35,6 @@ def build_cli_message_middlewares(
     root = Path(workspace) if workspace is not None else Path.cwd()
     return [
         AgentsMDMiddleware([root / "AGENTS.md"]),
-        ToolResultRedactionMiddleware(),
+        ObservationCondensationMiddleware(),
         ContextCompactionMiddleware(),
     ]

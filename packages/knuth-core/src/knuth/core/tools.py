@@ -19,19 +19,35 @@ class ToolResult(KnuthModel):
     data: Any = None
     error: ErrorInfo | None = None
     artifacts: list[str] = Field(default_factory=list)
+    condensed: bool = False
 
     @property
     def ok(self) -> bool:
         return self.status == ToolResultStatus.SUCCESS
 
     def to_observation_text(self) -> str:
+        if self.content is not None:
+            return self.content
         if self.status == ToolResultStatus.SUCCESS:
-            return self.content if self.content is not None else repr(self.data)
+            return repr(self.data)
         return f"Tool error: {self.error.message if self.error else 'unknown error'}"
 
     @classmethod
-    def success(cls, content: str | None = None, data: object = None) -> "ToolResult":
-        return cls(status=ToolResultStatus.SUCCESS, content=content, data=data)
+    def success(
+        cls,
+        content: str | None = None,
+        data: object = None,
+        *,
+        artifacts: list[str] | None = None,
+        condensed: bool = False,
+    ) -> "ToolResult":
+        return cls(
+            status=ToolResultStatus.SUCCESS,
+            content=content,
+            data=data,
+            artifacts=list(artifacts or []),
+            condensed=condensed,
+        )
 
     @classmethod
     def from_error(
@@ -39,7 +55,7 @@ class ToolResult(KnuthModel):
     ) -> "ToolResult":
         return cls(
             status=ToolResultStatus.ERROR,
-            content="",
+            content=None,
             error=ErrorInfo(code=code, message=message, retryable=retryable),
         )
 
