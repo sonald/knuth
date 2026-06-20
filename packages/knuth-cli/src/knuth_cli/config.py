@@ -40,8 +40,11 @@ async def load_config(
     config_path: Path | str | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> AgentConfig:
-    path = Path(config_path) if config_path is not None else default_config_path()
+    explicit_config_path = config_path is not None
+    path = Path(config_path) if explicit_config_path else default_config_path()
     values = await _read_config_file(path)
+    if not explicit_config_path:
+        values.update(await _read_dotenv_file(Path.cwd() / ".env"))
     source = os.environ if environ is None else environ
     for env_key, config_key in _ENV_TO_CONFIG_KEY.items():
         if env_key in source:
@@ -208,3 +211,27 @@ async def _read_config_file(config_path: Path) -> dict[str, Any]:
             f"Config file must contain a mapping, got {type(loaded).__name__}"
         )
     return dict(loaded)
+
+
+async def _read_dotenv_file(path: Path) -> dict[str, str]:
+    if not await anyio.Path(path).exists():
+        return {}
+
+    values: dict[str, str] = {}
+    async with await anyio.open_file(path, encoding="utf-8") as file:
+        async for raw_line in file:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            config_key = _ENV_TO_CONFIG_KEY.get(key.strip())
+            if config_key is None:
+                continue
+            values[config_key] = _strip_dotenv_quotes(value.strip())
+    return values
+
+
+def _strip_dotenv_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value

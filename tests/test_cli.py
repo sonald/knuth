@@ -207,13 +207,69 @@ class AgentConfigTests(unittest.TestCase):
             with patch(
                 "knuth_cli.config.default_config_path",
                 return_value=config_path,
-            ):
+            ), patch("pathlib.Path.cwd", return_value=Path(temp_dir, "empty-cwd")):
                 config = anyio.run(load_config, None, {})
 
             self.assertEqual(config.api_key, "default-key")
             self.assertEqual(config.base_url, "https://default.test/v1")
             self.assertEqual(config.model, "default-model")
             self.assertIsNone(config.system_prompt)
+
+    def test_load_config_reads_repo_dotenv_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cwd = Path(temp_dir)
+            cwd.joinpath(".env").write_text(
+                "\n".join(
+                    [
+                        "KNUTH_API_KEY=dotenv-key",
+                        "KNUTH_BASE_URL=https://dotenv.test/v1",
+                        'KNUTH_MODEL="dotenv-model"',
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch("knuth_cli.config.default_config_path", return_value=cwd / "none.yaml"),
+                patch("pathlib.Path.cwd", return_value=cwd),
+            ):
+                config = anyio.run(load_config, None, {})
+
+            self.assertEqual(config.api_key, "dotenv-key")
+            self.assertEqual(config.base_url, "https://dotenv.test/v1")
+            self.assertEqual(config.model, "dotenv-model")
+
+    def test_environment_values_override_repo_dotenv(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cwd = Path(temp_dir)
+            cwd.joinpath(".env").write_text(
+                "\n".join(
+                    [
+                        "KNUTH_API_KEY=dotenv-key",
+                        "KNUTH_BASE_URL=https://dotenv.test/v1",
+                        "KNUTH_MODEL=dotenv-model",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch("knuth_cli.config.default_config_path", return_value=cwd / "none.yaml"),
+                patch("pathlib.Path.cwd", return_value=cwd),
+            ):
+                config = anyio.run(
+                    load_config,
+                    None,
+                    {
+                        "KNUTH_API_KEY": "env-key",
+                        "KNUTH_BASE_URL": "https://env.test/v1",
+                        "KNUTH_MODEL": "env-model",
+                    },
+                )
+
+            self.assertEqual(config.api_key, "env-key")
+            self.assertEqual(config.base_url, "https://env.test/v1")
+            self.assertEqual(config.model, "env-model")
 
     def test_load_config_enables_skills_with_project_and_user_roots_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
