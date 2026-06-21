@@ -60,6 +60,10 @@ _Avoid_: durable run model, event listener, CLI session, stored event log, runti
 The behavior of an interactive driver when it starts or returns after a local exit such as Ctrl+C. It first restores the latest actionable run state instead of showing an ordinary blank prompt: `WAITING_APPROVAL` re-shows approval, `WAITING_TOOL_RESULT` restores the wait, `PAUSED` offers resume, and a live `RUNNING` invocation is attached for observation when available. A `RUNNING` run with no live session in the current process is not auto-recovered until Knuth has a live-run lease/heartbeat; the driver must require explicit recovery or confirmation because another process may still be executing it. `INTERRUPTED` and `SUCCEEDED` return to ordinary prompt mode where the next user-authored input becomes `continue_run`. If more than one actionable run exists, the driver must ask the user to choose or require an explicit run id.
 _Avoid_: runtime control concept, model input parser, automatic resume of abandoned work, hidden approval
 
+**ProjectKey**:
+A stable workspace identity used to scope CLI-owned user state such as prompt history. It represents the project the user is operating in, not merely the process's current directory, so moving between subdirectories of the same project should not fragment project-scoped state.
+_Avoid_: current working directory, history file path, run id, session id
+
 **Run**:
 The durable conversation history and current orchestration state for an agent interaction. A `SUCCEEDED` run means the latest agent-loop invocation completed successfully; it may be continued with a new user message, unlike `FAILED` or `CANCELLED`.
 _Avoid_: permanently closed session, single model request, event stream

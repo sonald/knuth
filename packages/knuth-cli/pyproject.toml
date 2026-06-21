@@ -10,6 +10,7 @@ dependencies = [
     "knuth-runtime",
     "knuth-toold",
     "platformdirs>=4.0.0",
+    "prompt_toolkit>=3.0.50",
     "pyyaml>=6.0",
 ]
 

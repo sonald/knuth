@@ -12,11 +12,25 @@ from rich.console import Console
 
 from knuth.core.messages import InferenceMessage, InferenceRole, ToolCall as CoreToolCall
 from knuth.core.types import RunStatus
+from knuth_cli.input import InputResult
 from knuth_llmd import InferenceConfig
 from knuth_runtime import MemoryRunLedger, build_memory_runtime
 from knuth_runtime.policy import PolicyEngine
 from knuth_toold import ToolBroker, create_default_registry
 import knuth_cli.repl as repl
+
+
+class _FakePromptInput:
+    def __init__(self, *, approvals: list[InputResult] | None = None) -> None:
+        self.approvals = list(approvals or [])
+
+    async def read_prompt(self, prompt: str) -> InputResult:
+        return InputResult.eof()
+
+    async def read_approval(self, prompt: str) -> InputResult:
+        if self.approvals:
+            return self.approvals.pop(0)
+        return InputResult.eof()
 
 
 def _runtime(messages):
@@ -74,12 +88,12 @@ class ApprovalCtrlCTests(unittest.TestCase):
                 ]
             )
             console, _ = _console()
+            prompt_input = _FakePromptInput(approvals=[InputResult.cancelled()])
             # Run a turn that lands on WAITING_APPROVAL, then hit Ctrl-C at the
-            # approval prompt: _read_line raises KeyboardInterrupt.
-            with patch.object(repl, "_read_line", side_effect=KeyboardInterrupt):
-                run_id, result = await repl._run_turn(
-                    runtime, console, "write x", None, set()
-                )
+            # approval prompt.
+            run_id, result = await repl._run_turn(
+                runtime, console, "write x", None, set(), prompt_input
+            )
             status = await runtime.status(run_id)
             events = await runtime.events(run_id)
             return status, events
@@ -107,12 +121,22 @@ class ApprovalCtrlCTests(unittest.TestCase):
             )
             console, buffer = _console()
             # Reach WAITING_APPROVAL.
-            with patch.object(repl, "_read_line", side_effect=KeyboardInterrupt):
-                await repl._run_turn(runtime, console, "write x", None, set())
+            await repl._run_turn(
+                runtime,
+                console,
+                "write x",
+                None,
+                set(),
+                _FakePromptInput(approvals=[InputResult.cancelled()]),
+            )
             # Re-enter: reentry must re-show the pending approval. We feed a
-            # KeyboardInterrupt again so the approval UI exits without resolving.
-            with patch.object(repl, "_read_line", side_effect=KeyboardInterrupt):
-                adopted = await repl._reenter_actionable(runtime, console, set())
+            # cancellation again so the approval UI exits without resolving.
+            adopted = await repl._reenter_actionable(
+                runtime,
+                console,
+                set(),
+                _FakePromptInput(approvals=[InputResult.cancelled()]),
+            )
             return adopted, buffer.getvalue()
 
         adopted, output = anyio.run(scenario)
@@ -155,7 +179,9 @@ class ReentryStatusTests(unittest.TestCase):
                 ledger=ledger,
             )
             console, buffer = _console()
-            adopted = await repl._reenter_actionable(runtime, console, set())
+            adopted = await repl._reenter_actionable(
+                runtime, console, set(), _FakePromptInput()
+            )
             status = await runtime.status(run.id)
             return adopted, status, buffer.getvalue()
 
@@ -179,7 +205,7 @@ class ReentryStatusTests(unittest.TestCase):
             runtime = _Runtime()
             console, buffer = _console()
             adopted = await repl._handle_slash(
-                runtime, console, "/resume run-1", None, set()
+                runtime, console, "/resume run-1", None, set(), _FakePromptInput()
             )
             return adopted, runtime.resume_called, buffer.getvalue()
 

@@ -1,6 +1,6 @@
-import asyncio
 import contextlib
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -10,6 +10,8 @@ from unittest.mock import patch
 
 import anyio
 import platformdirs
+from prompt_toolkit.document import Document
+from rich.console import Console
 
 from knuth.core.events import (
     InferenceGenerationCompleted,
@@ -21,7 +23,16 @@ from knuth.core.messages import InferenceMessage, InferenceRole, SystemSectionSo
 from knuth.core.skills import SkillSource
 from knuth.core.types import RunStatus
 from knuth_cli.cli import main
+from knuth_cli.completion import (
+    CompletionManager,
+    CompletionSnapshot,
+    KnuthCompleter,
+    RunCompletion,
+    ToolCompletion,
+)
 from knuth_cli.config import AgentConfig, default_config_path, load_config
+from knuth_cli.input import InputResult, PromptToolkitInput, StreamInput
+from knuth_cli.input_history import PromptHistory, resolve_project_key
 from knuth_cli.prompts import build_cli_system_sections
 from knuth_cli.runtime import build_runtime
 from knuth_runtime import RunResult
@@ -101,6 +112,29 @@ class _FailingRunSession:
 
     async def result(self) -> RunResult:
         raise RuntimeError("boom")
+
+
+class _FakePromptInput:
+    def __init__(
+        self,
+        *,
+        prompts: list[InputResult] | None = None,
+        approvals: list[InputResult] | None = None,
+        records_history: bool = False,
+    ) -> None:
+        self.prompts = list(prompts or [])
+        self.approvals = list(approvals or [])
+        self.records_history = records_history
+
+    async def read_prompt(self, prompt: str) -> InputResult:
+        if self.prompts:
+            return self.prompts.pop(0)
+        return InputResult.eof()
+
+    async def read_approval(self, prompt: str) -> InputResult:
+        if self.approvals:
+            return self.approvals.pop(0)
+        return InputResult.eof()
 
 
 class CapturingInferenceClient:
@@ -465,40 +499,40 @@ class CliTests(unittest.TestCase):
 
     def test_interactive_prompt_ctrl_c_stays_in_repl(self) -> None:
         output = io.StringIO()
+        prompt_input = _FakePromptInput(
+            prompts=[InputResult.cancelled(), InputResult.text_input("/exit")]
+        )
 
         async def runtime_factory() -> _StreamingFakeRuntime:
             return _StreamingFakeRuntime()
 
         with (
-            patch(
-                "knuth_cli.repl._read_line",
-                side_effect=[KeyboardInterrupt, "/exit"],
-            ) as read_line,
+            patch("knuth_cli.repl._make_prompt_input", return_value=prompt_input),
             contextlib.redirect_stdout(output),
         ):
             exit_code = main(["run"], runtime_factory=runtime_factory)
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(read_line.call_count, 2)
+        self.assertEqual(prompt_input.prompts, [])
         self.assertIn("Knuth agent ready", output.getvalue())
 
     def test_interactive_prompt_cancellation_stays_in_repl(self) -> None:
         output = io.StringIO()
+        prompt_input = _FakePromptInput(
+            prompts=[InputResult.cancelled(), InputResult.text_input("/exit")]
+        )
 
         async def runtime_factory() -> _StreamingFakeRuntime:
             return _StreamingFakeRuntime()
 
         with (
-            patch(
-                "knuth_cli.repl._read_line",
-                side_effect=[asyncio.CancelledError(), "/exit"],
-            ) as read_line,
+            patch("knuth_cli.repl._make_prompt_input", return_value=prompt_input),
             contextlib.redirect_stdout(output),
         ):
             exit_code = main(["run"], runtime_factory=runtime_factory)
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(read_line.call_count, 2)
+        self.assertEqual(prompt_input.prompts, [])
         self.assertIn("Knuth agent ready", output.getvalue())
 
     def test_interactive_resume_slash_command_resumes_current_run(self) -> None:
@@ -654,142 +688,329 @@ class CliTests(unittest.TestCase):
         self.assertEqual(captured, {"enable_plugins": True, "debug": True})
 
 
-class _BlockingFakeStdin:
-    """Stdin double whose readline blocks until a line is pushed."""
-
-    def __init__(self) -> None:
-        import queue
-
-        self._lines: "queue.Queue[object]" = queue.Queue()
-
-    def push(self, line: object) -> None:
-        self._lines.put(line)
+class _RaisingStream:
+    def __init__(self, *items: object) -> None:
+        self._items = list(items)
 
     def readline(self) -> str:
-        line = self._lines.get()
-        if isinstance(line, BaseException):
-            raise line
-        return str(line)
+        item = self._items.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return str(item)
 
 
-class StdinReaderTests(unittest.TestCase):
-    """The single-reader discipline: an abandoned read must never leak its
-    line into (or tear) the next prompt — the bug behind the CJK
-    UnicodeDecodeError crash in the REPL."""
+class StreamInputTests(unittest.TestCase):
+    def _console(self) -> Console:
+        return Console(file=io.StringIO(), force_terminal=False, width=100)
 
-    def test_abandoned_request_drops_its_line(self) -> None:
-        from knuth_cli.repl import _StdinReader
-
-        fake = _BlockingFakeStdin()
-        reader = _StdinReader()
-        with patch("sys.stdin", fake):
-            first = reader.submit()
-            first.abandoned = True  # caller hit Ctrl-C and gave up
-            second = reader.submit()
-            fake.push("stale line\n")  # typed for the abandoned prompt
-            fake.push("fresh line\n")
-            self.assertTrue(second.done.wait(timeout=5))
-
-        self.assertFalse(first.done.is_set())
-        self.assertEqual(second.line, "fresh line")
-
-    def test_preserved_abandoned_request_hands_line_to_next_read(self) -> None:
-        from knuth_cli.repl import _StdinReader
-
-        fake = _BlockingFakeStdin()
-        reader = _StdinReader()
-        with patch("sys.stdin", fake):
-            first = reader.submit()
-            first.abandoned = True
-            first.preserve_late_line = True
-            second = reader.submit()
-            fake.push("next prompt line\n")
-            self.assertTrue(second.done.wait(timeout=5))
-
-        self.assertFalse(first.done.is_set())
-        self.assertEqual(second.line, "next prompt line")
-
-    def test_reads_are_served_strictly_in_order(self) -> None:
-        from knuth_cli.repl import _StdinReader
-
-        fake = _BlockingFakeStdin()
-        reader = _StdinReader()
-        with patch("sys.stdin", fake):
-            first = reader.submit()
-            second = reader.submit()
-            fake.push("one\n")
-            fake.push("two\n")
-            self.assertTrue(first.done.wait(timeout=5))
-            self.assertTrue(second.done.wait(timeout=5))
-
-        self.assertEqual(first.line, "one")
-        self.assertEqual(second.line, "two")
-
-    def test_decode_error_is_surfaced_not_fatal(self) -> None:
-        from knuth_cli.repl import _DECODE_ERROR, _StdinReader
-
-        fake = _BlockingFakeStdin()
-        reader = _StdinReader()
-        with patch("sys.stdin", fake):
-            request = reader.submit()
-            fake.push(
-                UnicodeDecodeError("utf-8", b"\xef", 0, 1, "invalid continuation byte")
+    def test_read_prompt_returns_text(self) -> None:
+        async def scenario():
+            prompt_input = StreamInput(
+                self._console(), input_stream=io.StringIO("hello\n")
             )
-            self.assertTrue(request.done.wait(timeout=5))
-            # The reader thread survives and serves the next request.
-            recovered = reader.submit()
-            fake.push("ok\n")
-            self.assertTrue(recovered.done.wait(timeout=5))
+            return await prompt_input.read_prompt("knuth ❯ ")
 
-        self.assertIs(request.line, _DECODE_ERROR)
-        self.assertEqual(recovered.line, "ok")
+        result = anyio.run(scenario)
 
-    def test_eof_resolves_to_none(self) -> None:
-        from knuth_cli.repl import _StdinReader
+        self.assertEqual(result, InputResult.text_input("hello"))
 
-        fake = _BlockingFakeStdin()
-        reader = _StdinReader()
-        with patch("sys.stdin", fake):
-            request = reader.submit()
-            fake.push("")  # readline returning "" means EOF
-            self.assertTrue(request.done.wait(timeout=5))
+    def test_read_prompt_returns_eof(self) -> None:
+        async def scenario():
+            prompt_input = StreamInput(self._console(), input_stream=io.StringIO(""))
+            return await prompt_input.read_prompt("knuth ❯ ")
 
-        self.assertIsNone(request.line)
+        result = anyio.run(scenario)
 
-    def test_torn_utf8_bytes_from_byte_wise_erase_do_not_poison_next_read(self) -> None:
-        """Backspacing over CJK input without IUTF8 leaves partial bytes in
-        the kernel line buffer. The torn line must surface as a decode error
-        and be fully consumed, leaving the next read clean."""
-        import queue as queue_module
+        self.assertEqual(result, InputResult.eof())
 
-        from knuth_cli.repl import _DECODE_ERROR, _StdinReader
+    def test_keyboard_interrupt_returns_cancelled(self) -> None:
+        async def scenario():
+            prompt_input = StreamInput(
+                self._console(), input_stream=_RaisingStream(KeyboardInterrupt())
+            )
+            return await prompt_input.read_prompt("knuth ❯ ")
 
-        class _BlockingBytesStdin:
-            encoding = "utf-8"
+        result = anyio.run(scenario)
 
-            def __init__(self) -> None:
-                self._lines: "queue_module.Queue[bytes]" = queue_module.Queue()
-                self.buffer = self
+        self.assertEqual(result, InputResult.cancelled())
 
-            def push(self, line: bytes) -> None:
-                self._lines.put(line)
+    def test_decode_error_retries_next_line(self) -> None:
+        async def scenario():
+            prompt_input = StreamInput(
+                self._console(),
+                input_stream=_RaisingStream(
+                    UnicodeDecodeError(
+                        "utf-8", b"\xef", 0, 1, "invalid continuation byte"
+                    ),
+                    "ok\n",
+                ),
+            )
+            return await prompt_input.read_prompt("knuth ❯ ")
 
-            def readline(self) -> bytes:
-                return self._lines.get()
+        result = anyio.run(scenario)
 
-        fake = _BlockingBytesStdin()
-        reader = _StdinReader()
-        with patch("sys.stdin", fake):
-            torn = reader.submit()
-            # "进" (E8 BF 9B) backspaced once at the byte level, then "程".
-            fake.push("x".encode() + b"\xe8\xbf" + "程\n".encode())
-            self.assertTrue(torn.done.wait(timeout=5))
-            clean = reader.submit()
-            fake.push("显示进程\n".encode())
-            self.assertTrue(clean.done.wait(timeout=5))
+        self.assertEqual(result, InputResult.text_input("ok"))
 
-        self.assertIs(torn.line, _DECODE_ERROR)
-        self.assertEqual(clean.line, "显示进程")
+
+class _FakePromptToolkitSession:
+    def __init__(self, *results: object) -> None:
+        self.results = list(results)
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def prompt_async(self, prompt: str, **kwargs: object) -> str:
+        self.calls.append((prompt, kwargs))
+        result = self.results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return str(result)
+
+
+class PromptToolkitInputTests(unittest.TestCase):
+    def _history(self, path: Path) -> PromptHistory:
+        return PromptHistory(path=path)
+
+    def test_prompt_toolkit_input_does_not_write_history_directly(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = _FakePromptToolkitSession("hello\tworld")
+            history = self._history(Path(temp_dir, "history.jsonl"))
+            prompt_input = PromptToolkitInput(
+                history=history,
+                prompt_session=session,
+                approval_session=_FakePromptToolkitSession("y"),
+            )
+
+            result = anyio.run(prompt_input.read_prompt, "knuth ❯ ")
+
+            self.assertEqual(result, InputResult.text_input("hello    world"))
+            self.assertEqual(session.calls[0][1], {})
+            history.store_string("toolkit attempted write")
+            self.assertFalse(Path(temp_dir, "history.jsonl").exists())
+
+    def test_approval_uses_separate_session_without_history_append(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            approval_session = _FakePromptToolkitSession("y")
+            prompt_input = PromptToolkitInput(
+                history=self._history(Path(temp_dir, "history.jsonl")),
+                prompt_session=_FakePromptToolkitSession("ignored"),
+                approval_session=approval_session,
+            )
+
+            result = anyio.run(prompt_input.read_approval, "approve? ")
+
+            self.assertEqual(result, InputResult.text_input("y"))
+            self.assertEqual(approval_session.calls[0][1], {})
+
+    def test_ctrl_c_and_eof_are_typed_results(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            prompt_input = PromptToolkitInput(
+                history=self._history(Path(temp_dir, "history.jsonl")),
+                prompt_session=_FakePromptToolkitSession(KeyboardInterrupt()),
+                approval_session=_FakePromptToolkitSession(EOFError()),
+            )
+
+            self.assertEqual(
+                anyio.run(prompt_input.read_prompt, "knuth ❯ "),
+                InputResult.cancelled(),
+            )
+            self.assertEqual(
+                anyio.run(prompt_input.read_approval, "approve? "),
+                InputResult.eof(),
+            )
+
+
+class PromptHistoryTests(unittest.TestCase):
+    def test_project_key_uses_git_root_for_subdirectories(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            root.joinpath(".git").mkdir()
+            subdir = root / "a" / "b"
+            subdir.mkdir(parents=True)
+
+            self.assertEqual(resolve_project_key(subdir), str(root.resolve()))
+
+    def test_project_key_falls_back_to_cwd_realpath_outside_git(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cwd = Path(temp_dir)
+
+            self.assertEqual(resolve_project_key(cwd), str(cwd.resolve()))
+
+    def test_append_prompt_writes_project_session_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            root.joinpath(".git").mkdir()
+            history_path = root / "history.jsonl"
+            history = PromptHistory(
+                path=history_path,
+                cwd=root / "subdir",
+                session_id="session-1",
+            )
+
+            history.append_prompt("explain this")
+
+            [line] = history_path.read_text(encoding="utf-8").splitlines()
+            record = json.loads(line)
+            self.assertEqual(record["text"], "explain this")
+            self.assertEqual(record["project_key"], str(root.resolve()))
+            self.assertEqual(record["cwd"], str((root / "subdir").resolve()))
+            self.assertEqual(record["session_id"], "session-1")
+            self.assertEqual(record["kind"], "prompt")
+
+    def test_consecutive_duplicates_are_not_written(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            history = PromptHistory(path=Path(temp_dir, "history.jsonl"))
+
+            history.append_prompt("same")
+            history.append_prompt("same")
+
+            lines = history.path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 1)
+
+    def test_non_consecutive_duplicates_are_kept_but_navigation_is_unique(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            history = PromptHistory(path=Path(temp_dir, "history.jsonl"))
+
+            history.append_prompt("one")
+            history.append_prompt("two")
+            history.append_prompt("one")
+
+            lines = history.path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 3)
+            self.assertEqual(list(history.load_history_strings()), ["one", "two"])
+
+    def test_new_session_changes_metadata_without_hiding_project_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            history = PromptHistory(
+                path=Path(temp_dir, "history.jsonl"),
+                session_id="session-1",
+            )
+
+            history.append_prompt("before")
+            history.start_new_session()
+            history.append_prompt("after")
+
+            records = [
+                json.loads(line)
+                for line in history.path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(records[0]["session_id"], "session-1")
+            self.assertNotEqual(records[1]["session_id"], "session-1")
+            self.assertEqual(list(history.load_history_strings()), ["after", "before"])
+
+    def test_read_failure_degrades_to_memory_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            blocked = Path(temp_dir, "blocked")
+            blocked.mkdir()
+            history = PromptHistory(path=blocked)
+
+            history.append_prompt("memory only")
+
+            self.assertEqual(list(history.load_history_strings()), ["memory only"])
+
+
+class _RecordingHistory:
+    def __init__(self) -> None:
+        self.appended: list[str] = []
+        self.session_count = 0
+
+    def append_prompt(self, text: str) -> None:
+        self.appended.append(text)
+
+    def start_new_session(self) -> None:
+        self.session_count += 1
+
+
+class ReplHistoryWriteTests(unittest.TestCase):
+    def test_prompt_history_is_written_before_failing_turn(self) -> None:
+        history = _RecordingHistory()
+        prompt_input = _FakePromptInput(
+            prompts=[InputResult.text_input("hello"), InputResult.text_input("/exit")],
+            records_history=True,
+        )
+        output = io.StringIO()
+
+        async def runtime_factory() -> _FailingFakeRuntime:
+            return _FailingFakeRuntime()
+
+        with (
+            patch("knuth_cli.repl._make_prompt_history", return_value=history),
+            patch("knuth_cli.repl._make_prompt_input", return_value=prompt_input),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["run"], runtime_factory=runtime_factory)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(history.appended, ["hello"])
+        self.assertIn("Run failed: RuntimeError: boom", output.getvalue())
+
+    def test_slash_exit_and_approval_inputs_do_not_write_prompt_history(self) -> None:
+        history = _RecordingHistory()
+        prompt_input = _FakePromptInput(
+            prompts=[InputResult.text_input("/help"), InputResult.text_input("/exit")],
+            records_history=True,
+        )
+        output = io.StringIO()
+
+        async def runtime_factory() -> _StreamingFakeRuntime:
+            return _StreamingFakeRuntime()
+
+        with (
+            patch("knuth_cli.repl._make_prompt_history", return_value=history),
+            patch("knuth_cli.repl._make_prompt_input", return_value=prompt_input),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["run"], runtime_factory=runtime_factory)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(history.appended, [])
+
+
+class CompletionTests(unittest.TestCase):
+    def _texts(self, text: str, manager: CompletionManager | None = None) -> list[str]:
+        manager = manager or CompletionManager()
+        completer = KnuthCompleter(manager)
+        return [
+            completion.text
+            for completion in completer.get_completions(Document(text), None)
+        ]
+
+    def test_completes_slash_commands(self) -> None:
+        self.assertIn("/resume", self._texts("/res"))
+
+    def test_completes_run_ids_from_snapshot(self) -> None:
+        manager = CompletionManager()
+        manager.snapshot = CompletionSnapshot(
+            runs=(
+                RunCompletion(id="run-1", status="paused"),
+                RunCompletion(id="run-2", status="succeeded"),
+            )
+        )
+
+        self.assertEqual(self._texts("/resume run-", manager), ["run-1", "run-2"])
+        self.assertEqual(self._texts("/status run-2", manager), ["run-2"])
+
+    def test_completes_tool_names_from_snapshot(self) -> None:
+        manager = CompletionManager()
+        manager.snapshot = CompletionSnapshot(
+            tools=(
+                ToolCompletion(name="read_file", description="Read"),
+                ToolCompletion(name="write_file", description="Write"),
+            )
+        )
+
+        self.assertEqual(self._texts("/tools read", manager), ["read_file"])
+
+    def test_completion_path_only_reads_snapshot(self) -> None:
+        class ExplodingRuntime:
+            async def runs(self, limit=20):
+                raise AssertionError("runtime should not be called")
+
+            async def tools(self):
+                raise AssertionError("runtime should not be called")
+
+        manager = CompletionManager()
+        manager.runtime = ExplodingRuntime()
+
+        self.assertEqual(self._texts("/too", manager), ["/tools"])
 
 
 if __name__ == "__main__":

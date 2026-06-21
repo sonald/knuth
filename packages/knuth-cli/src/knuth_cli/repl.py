@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import queue
 import signal
 import sys
-import threading
-from dataclasses import dataclass, field
 
 import anyio
 from knuth_runtime import AgentRuntime, LedgerError, RunResult, RuntimeObservationError
@@ -14,6 +11,9 @@ from rich.console import Console
 from rich.text import Text
 
 from knuth.core.types import RunStatus
+from knuth_cli.completion import CompletionManager, KnuthCompleter
+from knuth_cli.input import PromptInput, PromptToolkitInput, StreamInput
+from knuth_cli.input_history import PromptHistory
 from knuth_cli.render import EventRenderer
 
 _BANNER = "Knuth agent ready. Type /help for commands, /exit to quit."
@@ -54,8 +54,40 @@ _ACTIONABLE_STATUSES = frozenset(
 )
 
 
+def _make_prompt_history() -> PromptHistory:
+    return PromptHistory()
+
+
+def _make_prompt_input(
+    runtime: AgentRuntime,
+    console: Console,
+    history: PromptHistory | None = None,
+    completion_manager: CompletionManager | None = None,
+) -> PromptInput:
+    if _stdio_is_interactive(console):
+        if history is None:
+            history = _make_prompt_history()
+        completer = (
+            KnuthCompleter(completion_manager)
+            if completion_manager is not None
+            else None
+        )
+        return PromptToolkitInput(history=history, completer=completer)
+    return StreamInput(console)
+
+
+def _stdio_is_interactive(console: Console) -> bool:
+    stdin_is_tty = bool(getattr(sys.stdin, "isatty", lambda: False)())
+    output = getattr(console, "file", sys.stdout)
+    stdout_is_tty = bool(getattr(output, "isatty", lambda: False)())
+    return stdin_is_tty and stdout_is_tty
+
+
 async def _reenter_actionable(
-    runtime: AgentRuntime, console: Console, allowed_tools: set[str]
+    runtime: AgentRuntime,
+    console: Console,
+    allowed_tools: set[str],
+    prompt_input: PromptInput,
 ) -> str | None:
     """On entering interactive mode, restore the latest actionable run.
 
@@ -95,6 +127,7 @@ async def _reenter_actionable(
             RunResult(answer="", run_id=run.id, status=RunStatus.WAITING_APPROVAL),
             run.id,
             allowed_tools,
+            prompt_input,
         )
         return run.id
     if run.status == RunStatus.WAITING_TOOL_RESULT:
@@ -127,58 +160,92 @@ async def _reenter_actionable(
 async def run_interactive(runtime: AgentRuntime, console: Console) -> int:
     console.print(Text(_BANNER, style="bold"))
     allowed_tools: set[str] = set()
-    session_run_id: str | None = await _reenter_actionable(
-        runtime, console, allowed_tools
-    )
-    while True:
-        try:
-            line = await _read_line(
-                console, _PROMPT, preserve_late_line_on_cancel=True
+    history = _make_prompt_history()
+    completion_manager = CompletionManager()
+    try:
+        prompt_input = _make_prompt_input(runtime, console, history, completion_manager)
+    except Exception as exc:
+        console.print(
+            Text(
+                f"Could not initialize interactive input: "
+                f"{exc.__class__.__name__}: {exc}",
+                style="bold red",
             )
-        except BaseException as exc:
-            if not isinstance(exc, (KeyboardInterrupt, anyio.get_cancelled_exc_class())):
-                raise
-            console.print()
-            continue
-        if line is None:  # EOF (Ctrl-D)
-            console.print()
-            return 0
-        prompt = line.strip()
-        if not prompt:
-            continue
-        if prompt in {"/exit", "/quit"}:
-            return 0
-        if prompt.startswith("/"):
-            session_run_id = await _handle_slash(
-                runtime, console, prompt, session_run_id, allowed_tools
-            )
-            continue
-        try:
-            session_run_id, result = await _run_turn(
-                runtime, console, prompt, session_run_id, allowed_tools
-            )
-            if result is not None and result.status == RunStatus.INTERRUPTED:
+        )
+        return 1
+    async with anyio.create_task_group() as tg:
+        _schedule_completion_refresh(tg, completion_manager, runtime)
+        session_run_id: str | None = await _reenter_actionable(
+            runtime, console, allowed_tools, prompt_input
+        )
+        while True:
+            input_result = await prompt_input.read_prompt(_PROMPT)
+            if input_result.kind == "cancelled":
+                console.print()
+                continue
+            if input_result.kind == "eof":
+                console.print()
+                tg.cancel_scope.cancel()
+                return 0
+            prompt = input_result.text.strip()
+            if not prompt:
+                continue
+            if prompt in {"/exit", "/quit"}:
+                tg.cancel_scope.cancel()
+                return 0
+            if prompt.startswith("/"):
+                if prompt in {"/new", "/clear"}:
+                    history.start_new_session()
+                session_run_id = await _handle_slash(
+                    runtime,
+                    console,
+                    prompt,
+                    session_run_id,
+                    allowed_tools,
+                    prompt_input,
+                )
+                _schedule_completion_refresh(tg, completion_manager, runtime)
+                continue
+            if getattr(prompt_input, "records_history", False):
+                history.append_prompt(prompt)
+            try:
+                session_run_id, result = await _run_turn(
+                    runtime, console, prompt, session_run_id, allowed_tools, prompt_input
+                )
+                _schedule_completion_refresh(tg, completion_manager, runtime)
+                if result is not None and result.status == RunStatus.INTERRUPTED:
+                    console.print(
+                        Text(
+                            f"run {session_run_id} · interrupted"
+                            " (send a new message to continue)",
+                            style="dim",
+                        )
+                    )
+            except Exception as exc:
                 console.print(
                     Text(
-                        f"run {session_run_id} · interrupted"
-                        " (send a new message to continue)",
-                        style="dim",
+                        f"Run failed: {exc.__class__.__name__}: {exc}",
+                        style="bold red",
                     )
                 )
-        except Exception as exc:
-            console.print(
-                Text(
-                    f"Run failed: {exc.__class__.__name__}: {exc}",
-                    style="bold red",
-                )
-            )
+
+
+def _schedule_completion_refresh(
+    task_group: anyio.abc.TaskGroup,
+    manager: CompletionManager,
+    runtime: AgentRuntime,
+) -> None:
+    task_group.start_soon(manager.refresh, runtime)
 
 
 async def run_single(runtime: AgentRuntime, console: Console, prompt: str) -> int:
     """Render a single streaming turn (used for ``knuth run <prompt>``)."""
     run_id: str | None = None
+    prompt_input = _make_prompt_input(runtime, console)
     try:
-        run_id, result = await _run_turn(runtime, console, prompt, None, set())
+        run_id, result = await _run_turn(
+            runtime, console, prompt, None, set(), prompt_input
+        )
     except Exception as exc:
         console.print(
             Text(f"Run failed: {exc.__class__.__name__}: {exc}", style="bold red")
@@ -220,8 +287,9 @@ async def run_single(runtime: AgentRuntime, console: Console, prompt: str) -> in
 
 async def run_resume(runtime: AgentRuntime, console: Console, run_id: str) -> int:
     """Resume a paused or waiting run with live rendering and approvals."""
+    prompt_input = _make_prompt_input(runtime, console)
     try:
-        result = await _resume_existing_run(runtime, console, run_id, set())
+        result = await _resume_existing_run(runtime, console, run_id, set(), prompt_input)
     except _TurnForced as forced:
         console.print(Text("⊘ interrupted (forced)", style="yellow"))
         if forced.run_id:
@@ -254,6 +322,7 @@ async def _resume_existing_run(
     console: Console,
     run_id: str,
     allowed_tools: set[str],
+    prompt_input: PromptInput,
 ) -> RunResult | None:
     """Resume a durable control point using the foreground interrupt driver."""
     status_fn = getattr(runtime, "status", None)
@@ -292,6 +361,7 @@ async def _resume_existing_run(
             RunResult(answer="", run_id=run_id, status=RunStatus.WAITING_APPROVAL),
             run_id,
             allowed_tools,
+            prompt_input,
         )
 
     renderer = EventRenderer(console)
@@ -302,7 +372,9 @@ async def _resume_existing_run(
             )
     finally:
         renderer.finish()
-    return await _resolve_approvals(runtime, console, result, run_id, allowed_tools)
+    return await _resolve_approvals(
+        runtime, console, result, run_id, allowed_tools, prompt_input
+    )
 
 
 async def _drive_session_to_result(
@@ -371,6 +443,7 @@ async def _run_turn(
     prompt: str,
     session_run_id: str | None,
     allowed_tools: set[str],
+    prompt_input: PromptInput,
 ) -> tuple[str | None, RunResult | None]:
     renderer = EventRenderer(console)
     session_factory = (
@@ -412,7 +485,7 @@ async def _run_turn(
     run_id = result.run_id
     try:
         result = await _resolve_approvals(
-            runtime, console, result, run_id, allowed_tools
+            runtime, console, result, run_id, allowed_tools, prompt_input
         )
     except _TurnForced as forced:
         console.print(Text("⊘ interrupted (forced)", style="yellow"))
@@ -426,6 +499,7 @@ async def _resolve_approvals(
     result: RunResult,
     run_id: str | None,
     allowed_tools: set[str],
+    prompt_input: PromptInput,
 ) -> RunResult:
     while result.status == RunStatus.WAITING_APPROVAL and run_id is not None:
         pending = await runtime.pending_approvals(run_id)
@@ -445,14 +519,11 @@ async def _resolve_approvals(
                 )
                 continue
             label = tool or approval.title
-            try:
-                answer = await _read_line(console, f"  approve {label}? [y/N/a] ")
-            except KeyboardInterrupt:
-                answer = None
-            if answer is None:
+            answer = await prompt_input.read_approval(f"  approve {label}? [y/N/a] ")
+            if answer.kind in {"cancelled", "eof"}:
                 _print_approval_handoff(console, run_id, pending)
                 return result
-            choice = answer.strip().lower()
+            choice = answer.text.strip().lower()
             if choice in {"a", "always"}:
                 if tool:
                     allowed_tools.add(tool)
@@ -493,6 +564,7 @@ async def _handle_slash(
     command: str,
     session_run_id: str | None,
     allowed_tools: set[str],
+    prompt_input: PromptInput,
 ) -> str | None:
     parts = command.split()
     name = parts[0]
@@ -525,7 +597,7 @@ async def _handle_slash(
             return session_run_id
         try:
             result = await _resume_existing_run(
-                runtime, console, target_run_id, allowed_tools
+                runtime, console, target_run_id, allowed_tools, prompt_input
             )
         except _TurnForced as forced:
             console.print(Text("⊘ interrupted (forced)", style="yellow"))
@@ -583,188 +655,3 @@ async def _find_single_actionable_run_id(
             console.print(Text(f"  {run.id} · {run.status.value}", style="dim"))
         return None
     return actionable[0].id
-
-
-_DECODE_ERROR = object()
-
-# Darwin defines IUTF8 (0x00004000) but Python's termios module does not
-# always expose it; Linux exposes termios.IUTF8 directly.
-_DARWIN_IUTF8 = 0x00004000
-
-
-def _enable_utf8_erase() -> None:
-    """Set IUTF8 on the stdin tty so canonical-mode backspace erases whole
-    UTF-8 characters.
-
-    Reads here happen in a worker thread without readline, so the kernel
-    does the line editing. Without IUTF8 a backspace removes one byte, and
-    editing CJK input leaves torn multibyte sequences in the line buffer.
-    """
-    try:
-        import termios
-
-        if not sys.stdin.isatty():
-            return
-        iutf8 = getattr(
-            termios,
-            "IUTF8",
-            _DARWIN_IUTF8 if sys.platform == "darwin" else None,
-        )
-        if iutf8 is None:
-            return
-        fd = sys.stdin.fileno()
-        attrs = termios.tcgetattr(fd)
-        if not attrs[0] & iutf8:
-            attrs[0] |= iutf8
-            termios.tcsetattr(fd, termios.TCSANOW, attrs)
-    except Exception:
-        # Best effort: the decode-error retry below remains the fallback.
-        pass
-
-
-@dataclass
-class _ReadRequest:
-    """One pending line read; ``abandoned`` drops the line instead of
-    delivering it to a caller that already gave up (Ctrl-C, cancellation).
-
-    ``wake`` is an optional thread-safe callback the async caller registers so
-    the reader thread can notify it directly (set an ``anyio.Event`` via the
-    loop), instead of the caller blocking an AnyIO worker on ``done.wait()``.
-    A worker blocked there would outlive a Ctrl-C and stall interpreter exit.
-    """
-
-    done: threading.Event = field(default_factory=threading.Event)
-    line: object = None
-    abandoned: bool = False
-    preserve_late_line: bool = False
-    wake: object = None
-
-    def resolve(self, line: object) -> None:
-        self.line = line
-        self.done.set()
-        wake = self.wake
-        if wake is not None:
-            wake()
-
-
-class _StdinReader:
-    """Owns the only thread that ever reads stdin.
-
-    ``input()`` in ad-hoc worker threads is unsafe here: a read abandoned by
-    Ctrl-C leaves its thread blocked inside ``input()``, and the next prompt
-    spawns a second reader racing it on the same buffer. Interleaved reads
-    tear multibyte UTF-8 sequences apart (UnicodeDecodeError on CJK input).
-    Serializing every read through one thread makes that impossible.
-    """
-
-    def __init__(self) -> None:
-        self._requests: queue.Queue[_ReadRequest] = queue.Queue()
-        self._late_lines: queue.Queue[object] = queue.Queue()
-        self._thread: threading.Thread | None = None
-        self._lock = threading.Lock()
-        self._tty_prepared = False
-
-    def submit(self) -> _ReadRequest:
-        if not self._tty_prepared:
-            self._tty_prepared = True
-            _enable_utf8_erase()
-        request = _ReadRequest()
-        try:
-            request.resolve(self._late_lines.get_nowait())
-            return request
-        except queue.Empty:
-            pass
-        self._requests.put(request)
-        self._ensure_thread()
-        return request
-
-    def _ensure_thread(self) -> None:
-        with self._lock:
-            if self._thread is None or not self._thread.is_alive():
-                self._thread = threading.Thread(
-                    target=self._loop, name="knuth-stdin-reader", daemon=True
-                )
-                self._thread.start()
-
-    def _loop(self) -> None:
-        while True:
-            request = self._requests.get()
-            try:
-                request.resolve(self._late_lines.get_nowait())
-                continue
-            except queue.Empty:
-                pass
-            raw = self._read_one_line()
-            if request.abandoned:
-                if request.preserve_late_line:
-                    self._late_lines.put(raw)
-                # Most abandoned reads drop their eventual line; top-level
-                # prompt Ctrl-C preserves it so the next prompt does not eat the
-                # user's first real command after the signal.
-                continue
-            request.resolve(raw)
-
-    def _read_one_line(self) -> object:
-        """Read one line, decoding at the byte layer when possible.
-
-        Decoding bytes ourselves keeps a torn UTF-8 sequence from poisoning
-        the text wrapper's incremental decoder state: the bad line is fully
-        consumed and the next read starts clean.
-        """
-        stdin = sys.stdin
-        buffer = getattr(stdin, "buffer", None)
-        try:
-            if buffer is not None:
-                raw_bytes = buffer.readline()
-                if raw_bytes == b"":
-                    return None
-                encoding = getattr(stdin, "encoding", None) or "utf-8"
-                return raw_bytes.decode(encoding).rstrip("\n")
-            raw = stdin.readline()
-        except UnicodeDecodeError:
-            return _DECODE_ERROR
-        except Exception:
-            return None
-        return None if raw == "" else raw.rstrip("\n")
-
-
-_stdin_reader = _StdinReader()
-
-
-async def _read_line(
-    console: Console, prompt: str, *, preserve_late_line_on_cancel: bool = False
-) -> str | None:
-    """Read one line through the single stdin reader; None on EOF.
-
-    The reader thread wakes this coroutine through a thread-safe callback, so
-    no AnyIO worker is parked on ``done.wait()``. KeyboardInterrupt or
-    cancellation at the prompt propagates to the caller after marking the
-    in-flight read abandoned, so its line is discarded rather than corrupting
-    the next prompt — and no worker is left blocked to stall exit.
-    """
-    import asyncio
-
-    while True:
-        console.print(Text(prompt), end="")
-        request = _stdin_reader.submit()
-        ready = anyio.Event()
-        loop = asyncio.get_running_loop()
-        request.wake = lambda: loop.call_soon_threadsafe(ready.set)
-        # Close the race where the reader resolved before ``wake`` was set.
-        if request.done.is_set():
-            ready.set()
-        try:
-            await ready.wait()
-        except BaseException:
-            request.abandoned = True
-            request.preserve_late_line = preserve_late_line_on_cancel
-            raise
-        if request.line is _DECODE_ERROR:
-            console.print(
-                Text(
-                    "Could not decode input as UTF-8; please try again.",
-                    style="yellow",
-                )
-            )
-            continue
-        return request.line if request.line is None else str(request.line)
