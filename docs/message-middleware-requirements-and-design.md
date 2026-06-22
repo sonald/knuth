@@ -4,6 +4,8 @@
 日期：2026-06-16
 依据：[CONTEXT.md](../CONTEXT.md)、[ADR-003](decisions/ADR-003-system-preamble.md)、[ADR-004](decisions/ADR-004-runtime-control-and-agent-loop-boundaries.md)
 
+> 注意：[ADR-010](decisions/ADR-010-middleware-redesign.md) 更新了 `MessageMiddleware` 的目标 contract 和迁移计划，包括 ephemeral injection、patch API、middleware 输入、runner 返回值、projection event 编译和 replace 校验语义。本文保留为背景材料；凡涉及目标 API / 目标行为的内容，以 ADR-010 为准。
+
 本文重新定义 Knuth 中 `MessageMiddleware` 的含义和能力。旧定义把它描述为 `ContextView` 的 full-power rewriter，但这个说法过粗：它既没有表达 AgentsMD、ContextCompaction、ToolResultRedaction 这些真实诉求，也容易让实现滑向“在内存里临时删改 messages”。
 
 新的定义是：

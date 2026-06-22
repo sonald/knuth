@@ -35,12 +35,9 @@ class PlannedToolCall(KnuthModel):
     args_hash: str
 
 
-class TapePosition(KnuthModel):
-    kind: Literal["before", "after", "boundary"]
-    target_id: str | None = None
-    boundary: Literal[
-        "conversation_start", "conversation_end", "before_model_request"
-    ] | None = None
+class InsertPosition(KnuthModel):
+    kind: Literal["before", "after"]
+    target_id: str
 
 
 def ledger_message_id(seq: int) -> str:
@@ -233,9 +230,8 @@ class MessageRewriteAnchorDraft(RuntimeEventDraftBase):
     kind: Literal["begin", "end"]
     middleware: str
     operation: Literal["insert", "replace"]
-    position: TapePosition | None = None
+    position: InsertPosition | None = None
     suppresses: list[str] = Field(default_factory=list)
-    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class MessageRewriteMessageDraft(RuntimeEventDraftBase):

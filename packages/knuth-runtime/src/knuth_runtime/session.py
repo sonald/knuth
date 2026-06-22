@@ -11,6 +11,7 @@ from knuth.core.events import (
     RunInvocationStartedDraft,
     RunResumedDraft,
     UserMessageDraft,
+    ledger_message_id,
 )
 from knuth.core.types import ErrorInfo, RunStatus
 from knuth_llmd import InferenceConfig, InferenceRuntimeOptions
@@ -19,6 +20,7 @@ from knuth_runtime.interrupts import InterruptController
 from knuth_runtime.invocation import RunInvocationMode, RuntimeInvocation
 from knuth_runtime.ledger import RESUMABLE_STATUSES, LedgerError
 from knuth_runtime.loop import run_agent_loop
+from knuth_runtime.middleware import MessageMiddlewareCheckpoint
 from knuth_runtime.observation import (
     ListenerHandle,
     LiveRuntimeObservation,
@@ -171,13 +173,15 @@ class RunSession:
         if self._mode == "start":
             if self._prompt is None:
                 raise RuntimeError("start session missing prompt")
-            await invocation.emit(UserMessageDraft(content=self._prompt))
+            event = await invocation.emit(UserMessageDraft(content=self._prompt))
+            await self._run_after_user_message_committed(invocation, event.seq)
             return
         run = await self._services.ledger.get_run(invocation.run_id)
         if self._mode == "continue":
             if self._prompt is None:
                 raise ValueError("prompt is required to continue a run")
-            await invocation.emit(UserMessageDraft(content=self._prompt))
+            event = await invocation.emit(UserMessageDraft(content=self._prompt))
+            await self._run_after_user_message_committed(invocation, event.seq)
             # A finished or interrupted run continues by opening a fresh turn:
             # the new user input flips it back to RUNNING. The abandoned work of
             # an INTERRUPTED run is never replayed; the loop starts from durable
@@ -194,6 +198,23 @@ class RunSession:
                 f"run {invocation.run_id} is {run.status.value} and cannot be resumed"
             )
         await invocation.emit(RunResumedDraft(cause="user_resume"))
+
+    async def _run_after_user_message_committed(
+        self, invocation: RuntimeInvocation, user_message_seq: int
+    ) -> None:
+        runner = invocation.services.message_middleware_runner
+        if runner is None:
+            return
+        try:
+            await runner.run_checkpoint(
+                invocation.run_id,
+                MessageMiddlewareCheckpoint.AFTER_USER_MESSAGE_COMMITTED,
+                turn_start_id=ledger_message_id(user_message_seq),
+            )
+        except Exception:
+            # Turn-level reminders are a best-effort optimization; the blocking
+            # model boundary remains BEFORE_MODEL_REQUEST.
+            return
 
     async def _drive(self, invocation: RuntimeInvocation) -> None:
         status: RunStatus | None = None

@@ -15,7 +15,7 @@ from knuth.core.messages import (
     SystemSection,
     SystemSectionSource,
 )
-from knuth.core.runtime_events import ContextSnapshot, TapePosition
+from knuth.core.runtime_events import ContextSnapshot, InsertPosition
 from knuth.core.runtime_events import ledger_message_id
 from knuth.core.types import KnuthModel
 from knuth_toold import ToolBroker
@@ -125,10 +125,8 @@ class MessageTape(KnuthModel):
 
 
 class MessageRewriteRecord(KnuthModel):
-    rewrite_id: str
     operation: str
-    middleware: str
-    position: TapePosition | None = None
+    position: InsertPosition | None = None
     suppresses: list[str] = Field(default_factory=list)
     messages: list[TapeItem] = Field(default_factory=list)
 
@@ -176,8 +174,8 @@ class ContextBuilder:
 
     assemble -> redact -> tool_filter -> freeze
 
-    Durable and ephemeral message rewrites are prepared by the runtime
-    checkpoint runner before build(); this class only projects them.
+    Durable message projection events are prepared by the runtime checkpoint
+    runner before build(); this class only projects them.
     """
 
     def __init__(
@@ -197,9 +195,8 @@ class ContextBuilder:
         ctx: RunContext,
         *,
         model_config_fingerprint: str = "",
-        ephemeral_rewrite_records: list[MessageRewriteRecord] | None = None,
     ) -> ContextView:
-        view = await self._assemble(ctx, ephemeral_rewrite_records or [])
+        view = await self._assemble(ctx)
         if self.redactor is not None:
             view = await self.redactor.redact(ctx, view)
         view = await self._tool_filter(ctx, view)
@@ -208,12 +205,9 @@ class ContextBuilder:
     async def _assemble(
         self,
         ctx: RunContext,
-        ephemeral_rewrite_records: list[MessageRewriteRecord],
     ) -> ContextView:
         events = await self.ledger.list_events(ctx.run_id)
         tape = await reconstruct_message_tape_from_events(events)
-        if ephemeral_rewrite_records:
-            tape = tape.with_records(ephemeral_rewrite_records)
         messages = tape.model_context_messages()
         preamble = await self._preamble(ctx)
         if preamble:
@@ -349,9 +343,7 @@ async def reconstruct_message_tape_from_events(
                     suppresses=list(event.suppresses),
                 )
                 open_rewrites[event.rewrite_id] = MessageRewriteRecord(
-                    rewrite_id=event.rewrite_id,
                     operation=event.operation,
-                    middleware=event.middleware,
                     position=event.position,
                     suppresses=list(event.suppresses),
                     messages=[anchor] if event.suppresses else [],
@@ -452,12 +444,8 @@ def _apply_rewrite_records(
     return items
 
 
-def _position_index(items: list[TapeItem], position: TapePosition | None) -> int:
+def _position_index(items: list[TapeItem], position: InsertPosition | None) -> int:
     if position is None:
-        return len(items)
-    if position.kind == "boundary":
-        if position.boundary == "conversation_start":
-            return 0
         return len(items)
     for idx, item in enumerate(items):
         if isinstance(item, TapeMessage) and item.id == position.target_id:

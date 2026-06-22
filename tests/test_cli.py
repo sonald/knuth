@@ -400,6 +400,27 @@ class CliRuntimeFactoryTests(unittest.TestCase):
         self.assertEqual(sections[1].source, SystemSectionSource.USER)
         self.assertEqual(sections[1].text, "USER PROMPT")
 
+    def test_cli_prompt_sections_include_workspace_agents_md(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            Path(temp_dir, "AGENTS.md").write_text(
+                "Always answer with repo context.",
+                encoding="utf-8",
+            )
+
+            async def scenario():
+                providers = build_cli_system_sections(workspace=Path(temp_dir))
+                ctx = RunContext(run_id="run-1")
+                result = []
+                for provider in providers:
+                    result.extend(await provider.sections(ctx))
+                return result
+
+            sections = anyio.run(scenario)
+
+        self.assertEqual(sections[-1].source, SystemSectionSource.USER)
+        self.assertIn("# AGENTS.md", sections[-1].text)
+        self.assertIn("Always answer with repo context.", sections[-1].text)
+
     def test_build_runtime_injects_user_system_prompt_as_preamble(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir, "knuth.yaml")

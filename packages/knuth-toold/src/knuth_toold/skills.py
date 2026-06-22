@@ -277,18 +277,6 @@ def render_skills_reminder_text(snapshot: SkillSnapshot) -> str:
     return "\n".join(lines)
 
 
-def render_skill_change_notice_text(snapshot: SkillSnapshot) -> str:
-    lines = [
-        f'<knuth-skill-notice catalog-digest="{snapshot.catalog_digest}">',
-        "Available skills have changed.",
-        f"Current skills count: {len(snapshot.skills)}",
-        "",
-    ]
-    lines.extend(_skills_list_lines(snapshot))
-    lines.append("</knuth-skill-notice>")
-    return "\n".join(lines)
-
-
 def render_skill_tool_observation(skill: Skill, args: str) -> str:
     name = skill.info.metadata.name
     return "\n\n".join(
@@ -546,7 +534,6 @@ __all__ = [
     "SkillToolProvider",
     "SkillValidationError",
     "SKILL_OBSERVATION_CHAR_LIMIT",
-    "render_skill_change_notice_text",
     "render_skill_system_section_text",
     "render_skill_tool_observation",
     "render_skills_reminder_text",

@@ -222,13 +222,8 @@ async def _run_step(
     ctx = RunContext(
         run_id=run_id,
     )
-    middleware_result = None
     if services.message_middleware_runner is not None:
-        middleware_result = await services.message_middleware_runner.run_checkpoint(
-            run_id,
-            MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST,
-        )
-        await services.message_middleware_runner.assert_checkpoint_complete(
+        await services.message_middleware_runner.run_checkpoint(
             run_id,
             MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST,
         )
@@ -237,9 +232,6 @@ async def _run_step(
         model_config_fingerprint=inference_config.model_dump_json(
             exclude={"run_id", "trace_id"}
         ),
-        ephemeral_rewrite_records=middleware_result.ephemeral_records
-        if middleware_result is not None
-        else None,
     )
     assert view.snapshot is not None
     preamble = None
@@ -641,10 +633,15 @@ async def _run_after_tool_result_committed(invocation: RuntimeInvocation) -> Non
     runner = invocation.services.message_middleware_runner
     if runner is None:
         return
-    await runner.run_checkpoint(
-        invocation.run_id,
-        MessageMiddlewareCheckpoint.AFTER_TOOL_RESULT_COMMITTED,
-    )
+    try:
+        await runner.run_checkpoint(
+            invocation.run_id,
+            MessageMiddlewareCheckpoint.AFTER_TOOL_RESULT_COMMITTED,
+        )
+    except Exception:
+        # This checkpoint is an opportunistic write; BEFORE_MODEL_REQUEST is the
+        # blocking reconciliation point before another model call.
+        return
 
 
 async def _commit_completion_artifacts(
@@ -670,10 +667,13 @@ async def _run_after_turn_closed(invocation: RuntimeInvocation) -> None:
     runner = invocation.services.message_middleware_runner
     if runner is None:
         return
-    await runner.run_checkpoint(
-        invocation.run_id,
-        MessageMiddlewareCheckpoint.AFTER_TURN_CLOSED,
-    )
+    try:
+        await runner.run_checkpoint(
+            invocation.run_id,
+            MessageMiddlewareCheckpoint.AFTER_TURN_CLOSED,
+        )
+    except Exception:
+        return
 
 
 def _completion_for(

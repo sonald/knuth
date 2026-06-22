@@ -3,17 +3,15 @@ from __future__ import annotations
 import hashlib
 from abc import ABC, abstractmethod
 from enum import StrEnum
-from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import Field
 
-from knuth.core.events import rewrite_message_id
 from knuth.core.messages import InferenceMessage, InferenceRole
 from knuth.core.runtime_events import (
+    InsertPosition,
     MessageRewriteAnchorDraft,
     MessageRewriteMessageDraft,
-    TapePosition,
 )
 from knuth.core.types import KnuthModel
 from knuth_runtime.context import (
@@ -29,36 +27,27 @@ from knuth_runtime.ledger import RunLedger
 
 
 class MessageMiddlewareCheckpoint(StrEnum):
+    AFTER_USER_MESSAGE_COMMITTED = "after_user_message_committed"
     AFTER_TOOL_RESULT_COMMITTED = "after_tool_result_committed"
     AFTER_TURN_CLOSED = "after_turn_closed"
     BEFORE_MODEL_REQUEST = "before_model_request"
 
 
-class ContextBudget(KnuthModel):
-    max_input_tokens: int
-    reserved_output_tokens: int
-    target_headroom_tokens: int
-
-
 class MessageMiddlewareContext(KnuthModel):
     run_id: str
     checkpoint: MessageMiddlewareCheckpoint
-    budget: ContextBudget | None = None
+    turn_start_id: str | None = None
 
 
 class InsertPatch(KnuthModel):
-    operation: Literal["insert"] = "insert"
-    position: TapePosition
+    position: InsertPosition | None = None
     items: list[InferenceMessage]
-    durable: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ReplacePatch(KnuthModel):
-    operation: Literal["replace"] = "replace"
     target_ids: list[str]
     replacement_items: list[InferenceMessage]
-    durable: bool = True
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -74,13 +63,9 @@ class MessageMiddleware(ABC):
     async def process(
         self,
         ctx: MessageMiddlewareContext,
-        tape: MessageTape,
+        messages: tuple[TapeMessage, ...],
     ) -> list[MessageTapePatch]:
         ...
-
-
-class MessageMiddlewareRunResult(KnuthModel):
-    ephemeral_records: list[MessageRewriteRecord] = Field(default_factory=list)
 
 
 _RESERVED_PATCH_METADATA_KEYS = frozenset(
@@ -117,112 +102,152 @@ class MessageMiddlewareRunner:
         middlewares: list[MessageMiddleware] | None = None,
     ) -> None:
         self.ledger = ledger
-        self.middlewares = sorted(middlewares or [], key=lambda item: item.priority)
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for middleware in middlewares or []:
+            if middleware.name in seen:
+                duplicates.append(middleware.name)
+            seen.add(middleware.name)
+        if duplicates:
+            raise ValueError(
+                "duplicate message middleware name: " + ", ".join(sorted(duplicates))
+            )
+        self.middlewares = [
+            middleware
+            for _, middleware in sorted(
+                enumerate(middlewares or []),
+                key=lambda item: (item[1].priority, item[0]),
+            )
+        ]
 
     async def run_checkpoint(
         self,
         run_id: str,
         checkpoint: MessageMiddlewareCheckpoint,
         *,
-        budget: ContextBudget | None = None,
-    ) -> MessageMiddlewareRunResult:
-        result = MessageMiddlewareRunResult()
+        turn_start_id: str | None = None,
+    ) -> None:
         candidates = [
             middleware
             for middleware in self.middlewares
             if checkpoint in middleware.checkpoints
         ]
         if not candidates:
-            return result
-
-        ctx = MessageMiddlewareContext(
-            run_id=run_id,
-            checkpoint=checkpoint,
-            budget=budget,
-        )
-        events = await self.ledger.list_events(run_id)
-        tape = await reconstruct_message_tape_from_events(events)
-        patch_ordinal = 0
-        for middleware in candidates:
-            patches = await middleware.process(ctx, tape)
-            for patch in patches:
-                record = self._ephemeral_record(
-                    checkpoint, middleware, patch, patch_ordinal
-                )
-                patch_ordinal += 1
-                self._validate_patch_application(checkpoint, tape, patch, record)
-                if patch.durable:
-                    await self.ledger.apply_many(
-                        run_id, self._compile_durable_patch(middleware, patch)
-                    )
-                    events = await self.ledger.list_events(run_id)
-                    tape = await reconstruct_message_tape_from_events(events)
-                else:
-                    result.ephemeral_records.append(record)
-        if result.ephemeral_records:
-            self._validate_ephemeral_records(checkpoint, tape, result.ephemeral_records)
-        return result
-
-    async def assert_checkpoint_complete(
-        self,
-        run_id: str,
-        checkpoint: MessageMiddlewareCheckpoint,
-        *,
-        budget: ContextBudget | None = None,
-    ) -> None:
-        ctx = MessageMiddlewareContext(
-            run_id=run_id,
-            checkpoint=checkpoint,
-            budget=budget,
-        )
-        events = await self.ledger.list_events(run_id)
-        tape = await reconstruct_message_tape_from_events(events)
-        for middleware in self.middlewares:
-            ready = getattr(middleware, "assert_checkpoint_complete", None)
-            if ready is not None:
-                ready(ctx, tape)
-
-    def _validate_patch_application(
-        self,
-        checkpoint: MessageMiddlewareCheckpoint,
-        tape: MessageTape,
-        patch: MessageTapePatch,
-        record: MessageRewriteRecord,
-    ) -> None:
-        self._validate_patch_targets(tape, patch)
-        candidate = tape.with_records([record])
-        messages = candidate.model_context_messages()
-        if checkpoint == MessageMiddlewareCheckpoint.AFTER_TOOL_RESULT_COMMITTED:
-            validate_provider_messages(messages, allow_open_tool_batch=True)
-        else:
-            validate_provider_messages(messages)
-
-    def _validate_ephemeral_records(
-        self,
-        checkpoint: MessageMiddlewareCheckpoint,
-        tape: MessageTape,
-        records: list[MessageRewriteRecord],
-    ) -> None:
-        candidate = tape.with_records(records)
-        messages = candidate.model_context_messages()
-        if checkpoint == MessageMiddlewareCheckpoint.AFTER_TOOL_RESULT_COMMITTED:
-            validate_provider_messages(messages, allow_open_tool_batch=True)
-        else:
-            validate_provider_messages(messages)
-
-    def _validate_patch_targets(
-        self,
-        tape: MessageTape,
-        patch: MessageTapePatch,
-    ) -> None:
-        if not isinstance(patch, ReplacePatch):
             return
-        if not patch.target_ids:
-            raise ValueError("replace patch requires target_ids")
-        existing = {item.id for item in tape.model_visible()}
-        missing = [target_id for target_id in patch.target_ids if target_id not in existing]
-        if missing:
-            raise ValueError("replace patch target does not exist: " + ", ".join(missing))
+
+        ctx = MessageMiddlewareContext(
+            run_id=run_id,
+            checkpoint=checkpoint,
+            turn_start_id=turn_start_id,
+        )
+        events = await self.ledger.list_events(run_id)
+        tape = await reconstruct_message_tape_from_events(events)
+        for middleware in candidates:
+            messages = tuple(tape.model_visible())
+            patches = await middleware.process(ctx, messages)
+            if not patches:
+                continue
+            self._validate_patch_plan(checkpoint, messages, patches)
+            drafts = [
+                draft
+                for patch in patches
+                for draft in self._compile_durable_patch(middleware, patch)
+            ]
+            await self.ledger.apply_many(run_id, drafts)
+            events = await self.ledger.list_events(run_id)
+            tape = await reconstruct_message_tape_from_events(events)
+
+    def _validate_patch_plan(
+        self,
+        checkpoint: MessageMiddlewareCheckpoint,
+        messages: tuple[TapeMessage, ...],
+        patches: list[MessageTapePatch],
+    ) -> None:
+        visible_ids = {item.id for item in messages}
+        replace_targets: set[str] = set()
+        records: list[MessageRewriteRecord] = []
+
+        for ordinal, patch in enumerate(patches):
+            _semantic_metadata(patch.metadata)
+            if isinstance(patch, ReplacePatch):
+                if not patch.target_ids:
+                    raise ValueError("replace patch requires target_ids")
+                if len(set(patch.target_ids)) != len(patch.target_ids):
+                    raise ValueError("replace patch target_ids must be unique")
+                if not patch.replacement_items:
+                    raise ValueError("replace patch requires replacement_items")
+                missing = [
+                    target_id
+                    for target_id in patch.target_ids
+                    if target_id not in visible_ids
+                ]
+                if missing:
+                    raise ValueError(
+                        "replace patch target must be in current projection: "
+                        + ", ".join(missing)
+                    )
+                overlap = replace_targets & set(patch.target_ids)
+                if overlap:
+                    raise ValueError(
+                        "replace patch target overlaps another patch: "
+                        + ", ".join(sorted(overlap))
+                    )
+                replace_targets.update(patch.target_ids)
+            else:
+                if not patch.items:
+                    raise ValueError("insert patch requires items")
+                if patch.position is not None:
+                    target_id = patch.position.target_id
+                    if target_id not in visible_ids:
+                        raise ValueError(
+                            "insert patch target must be in current projection: "
+                            + target_id
+                        )
+            records.append(self._candidate_record(patch, ordinal))
+
+        candidate = MessageTape(items=list(messages)).with_records(records)
+        provider_messages = candidate.model_context_messages()
+        if checkpoint == MessageMiddlewareCheckpoint.AFTER_TOOL_RESULT_COMMITTED:
+            validate_provider_messages(provider_messages, allow_open_tool_batch=True)
+        else:
+            validate_provider_messages(provider_messages)
+
+    def _candidate_record(
+        self,
+        patch: MessageTapePatch,
+        patch_ordinal: int,
+    ) -> MessageRewriteRecord:
+        if isinstance(patch, ReplacePatch):
+            return MessageRewriteRecord(
+                operation="replace",
+                suppresses=list(patch.target_ids),
+                messages=[
+                    TapeAnchor(
+                        id=f"candidate:{patch_ordinal}:anchor",
+                        suppresses=list(patch.target_ids),
+                    ),
+                    *[
+                        TapeMessage(
+                            id=f"candidate:{patch_ordinal}#{index}",
+                            message=item,
+                            origin=TapeItemSource.MIDDLEWARE,
+                        )
+                        for index, item in enumerate(patch.replacement_items)
+                    ],
+                ],
+            )
+        return MessageRewriteRecord(
+            operation="insert",
+            position=patch.position,
+            messages=[
+                TapeMessage(
+                    id=f"candidate:{patch_ordinal}#{index}",
+                    message=item,
+                    origin=TapeItemSource.MIDDLEWARE,
+                )
+                for index, item in enumerate(patch.items)
+            ],
+        )
 
     def _compile_durable_patch(
         self,
@@ -236,11 +261,11 @@ class MessageMiddlewareRunner:
                 middleware=middleware.name,
                 operation="replace",
                 suppresses=list(patch.target_ids),
-                metadata=metadata,
             )
             messages = [
                 MessageRewriteMessageDraft(
                     message=item,
+                    metadata=metadata,
                 )
                 for item in patch.replacement_items
             ]
@@ -248,7 +273,6 @@ class MessageMiddlewareRunner:
                 kind="end",
                 middleware=middleware.name,
                 operation="replace",
-                metadata={"_runtime": {"message_count": len(messages)}},
             )
             return [begin, *messages, end]
         begin = MessageRewriteAnchorDraft(
@@ -256,11 +280,11 @@ class MessageMiddlewareRunner:
             middleware=middleware.name,
             operation="insert",
             position=patch.position,
-            metadata=metadata,
         )
         messages = [
             MessageRewriteMessageDraft(
                 message=item,
+                metadata=metadata,
             )
             for item in patch.items
         ]
@@ -268,56 +292,8 @@ class MessageMiddlewareRunner:
             kind="end",
             middleware=middleware.name,
             operation="insert",
-            metadata={"_runtime": {"message_count": len(messages)}},
         )
         return [begin, *messages, end]
-
-    def _ephemeral_record(
-        self,
-        checkpoint: MessageMiddlewareCheckpoint,
-        middleware: MessageMiddleware,
-        patch: MessageTapePatch,
-        patch_ordinal: int,
-    ) -> MessageRewriteRecord:
-        rewrite_id = f"eph:{checkpoint.value}:{patch_ordinal}"
-        _semantic_metadata(patch.metadata)
-        if isinstance(patch, ReplacePatch):
-            return MessageRewriteRecord(
-                rewrite_id=rewrite_id,
-                operation="replace",
-                middleware=middleware.name,
-                suppresses=list(patch.target_ids),
-                messages=[
-                    TapeAnchor(
-                        id=f"a:{rewrite_id}:begin",
-                        suppresses=list(patch.target_ids),
-                    ),
-                    *[
-                        TapeMessage(
-                            id=rewrite_message_id(rewrite_id, index),
-                            message=item,
-                            origin=TapeItemSource.MIDDLEWARE,
-                        )
-                        for index, item in enumerate(patch.replacement_items)
-                    ],
-                ],
-            )
-        return MessageRewriteRecord(
-            rewrite_id=rewrite_id,
-            operation="insert",
-            middleware=middleware.name,
-            position=patch.position,
-            messages=[
-                *[
-                    TapeMessage(
-                        id=rewrite_message_id(rewrite_id, index),
-                        message=item,
-                        origin=TapeItemSource.MIDDLEWARE,
-                    )
-                    for index, item in enumerate(patch.items)
-                ],
-            ],
-        )
 
 
 def _sha256(text: str) -> str:
@@ -339,10 +315,11 @@ class ObservationCondensationMiddleware(MessageMiddleware):
     async def process(
         self,
         ctx: MessageMiddlewareContext,
-        tape: MessageTape,
+        messages: tuple[TapeMessage, ...],
     ) -> list[MessageTapePatch]:
         patches: list[MessageTapePatch] = []
-        for item in tape.model_visible():
+        _ = ctx
+        for item in messages:
             if item.role != InferenceRole.TOOL_RESULT.value:
                 continue
             if item.metadata.get("self_condensed"):
@@ -366,7 +343,6 @@ class ObservationCondensationMiddleware(MessageMiddleware):
                             content=replacement_content,
                         )
                     ],
-                    durable=True,
                     metadata={
                         "algorithm": "headroom_excerpt_v1",
                         "reason": "context_headroom",
@@ -377,26 +353,6 @@ class ObservationCondensationMiddleware(MessageMiddleware):
                 )
             )
         return patches
-
-    def assert_checkpoint_complete(
-        self,
-        ctx: MessageMiddlewareContext,
-        tape: MessageTape,
-    ) -> None:
-        if ctx.checkpoint != MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST:
-            return
-        remaining = [
-            item.id
-            for item in tape.model_visible()
-            if item.role == InferenceRole.TOOL_RESULT.value
-            and not item.metadata.get("self_condensed")
-            and len(item.content or "") > self.max_chars
-        ]
-        if remaining:
-            raise ValueError(
-                "observation condensation incomplete before model request: "
-                + ", ".join(remaining)
-            )
 
 
 class ContextCompactionMiddleware(MessageMiddleware):
@@ -414,13 +370,14 @@ class ContextCompactionMiddleware(MessageMiddleware):
     async def process(
         self,
         ctx: MessageMiddlewareContext,
-        tape: MessageTape,
+        messages: tuple[TapeMessage, ...],
     ) -> list[MessageTapePatch]:
         # BEFORE_MODEL_REQUEST acts as the recovery fallback when the preferred
         # AFTER_TURN_CLOSED write was missed by a crash.
+        _ = ctx
         visible = [
             item
-            for item in tape.model_visible()
+            for item in messages
             if item.origin != TapeItemSource.MIDDLEWARE
         ]
         if len(visible) <= self.max_messages:
@@ -444,62 +401,12 @@ class ContextCompactionMiddleware(MessageMiddleware):
                         content=summary,
                     )
                 ],
-                durable=True,
                 metadata={
                     "algorithm": "deterministic_prefix_summary_v1",
                     "reason": "message_count",
                     "original_hash": digest,
                     "original_chars": len(original),
                     "replacement_chars": len(summary),
-                },
-            )
-        ]
-
-
-class AgentsMDMiddleware(MessageMiddleware):
-    name = "agents_md"
-    priority = 10
-    checkpoints = {MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST}
-
-    def __init__(self, paths: list[Path | str]) -> None:
-        self.paths = [Path(path) for path in paths]
-
-    async def process(
-        self,
-        ctx: MessageMiddlewareContext,
-        tape: MessageTape,
-    ) -> list[MessageTapePatch]:
-        parts: list[str] = []
-        hashes: list[str] = []
-        for path in self.paths:
-            if not path.exists() or not path.is_file():
-                continue
-            text = path.read_text(encoding="utf-8")
-            if not text.strip():
-                continue
-            digest = _sha256(text)
-            hashes.append(digest)
-            parts.append(f"# {path.name}\n{text}")
-        if not parts:
-            return []
-        combined = "\n\n".join(parts)
-        content_hash = _sha256(combined)
-        return [
-            InsertPatch(
-                position=TapePosition(
-                    kind="boundary",
-                    boundary="conversation_start",
-                ),
-                items=[
-                    InferenceMessage(
-                        role=InferenceRole.SYSTEM,
-                        content=combined,
-                    )
-                ],
-                durable=False,
-                metadata={
-                    "content_hash": content_hash,
-                    "source_hashes": hashes,
                 },
             )
         ]

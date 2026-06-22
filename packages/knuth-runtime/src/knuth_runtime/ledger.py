@@ -48,7 +48,7 @@ from knuth.core.runtime_events import (
     RunResumedDraft,
     RunSucceededDraft,
     StepStartedDraft,
-    TapePosition,
+    InsertPosition,
     ToolBatchClosedDraft,
     ToolBatchPlannedDraft,
     ToolInvocationAwaitingExternalResultDraft,
@@ -179,7 +179,7 @@ class _RewriteRecord:
     operation: str
     suppresses: tuple[str, ...]
     message_ids: tuple[str, ...] = ()
-    position: TapePosition | None = None
+    position: InsertPosition | None = None
 
 
 @dataclass
@@ -271,12 +271,8 @@ def _projected_ids_after_rewrites(
     return tuple(message_id for message_id in order if message_id not in suppressed)
 
 
-def _rewrite_insert_index(order: list[str], position: TapePosition | None) -> int:
+def _rewrite_insert_index(order: list[str], position: InsertPosition | None) -> int:
     if position is None:
-        return len(order)
-    if position.kind == "boundary":
-        if position.boundary == "conversation_start":
-            return 0
         return len(order)
     if position.target_id in order:
         index = order.index(position.target_id)
@@ -362,6 +358,62 @@ def _validate_rewrite_draft_batch(drafts: list[DurableRuntimeEventDraft]) -> Non
             begin.operation == end.operation,
             "message rewrite block operation mismatch",
         )
+        index = cursor + 1
+
+
+def _validate_rewrite_targets_against_start_projection(
+    drafts: list[DurableRuntimeEventDraft],
+    rewrites: _RewriteValidationState,
+) -> None:
+    projected_ids = set(rewrites.projected_order)
+    replace_targets: set[str] = set()
+    index = 0
+    while index < len(drafts):
+        draft = drafts[index]
+        if not isinstance(draft, MessageRewriteAnchorDraft | MessageRewriteMessageDraft):
+            index += 1
+            continue
+        begin = draft
+        _require(
+            isinstance(begin, MessageRewriteAnchorDraft) and begin.kind == "begin",
+            "message rewrite block must start with a begin anchor",
+        )
+        cursor = index + 1
+        while cursor < len(drafts) and isinstance(
+            drafts[cursor], MessageRewriteMessageDraft
+        ):
+            cursor += 1
+
+        if begin.operation == "replace":
+            _require(bool(begin.suppresses), "replace rewrite requires suppresses")
+            _require(
+                len(set(begin.suppresses)) == len(begin.suppresses),
+                "replace rewrite target ids must be unique",
+            )
+            missing = [
+                target_id
+                for target_id in begin.suppresses
+                if target_id not in projected_ids
+            ]
+            _require(
+                not missing,
+                "replace target must be present in transaction-start projection: "
+                + ", ".join(missing),
+            )
+            overlap = replace_targets & set(begin.suppresses)
+            _require(
+                not overlap,
+                "replace rewrite target overlaps another rewrite in batch: "
+                + ", ".join(sorted(overlap)),
+            )
+            replace_targets.update(begin.suppresses)
+        elif begin.position is not None:
+            target_id = begin.position.target_id
+            _require(
+                target_id in projected_ids,
+                "insert target must be present in transaction-start projection: "
+                + target_id,
+            )
         index = cursor + 1
 
 
@@ -966,45 +1018,21 @@ def _reduce_message_rewrite_anchor(
                 bool(draft.suppresses),
                 "replace rewrite requires suppresses target ids",
             )
+            _require(
+                len(set(draft.suppresses)) == len(draft.suppresses),
+                "replace rewrite target ids must be unique",
+            )
             for target_id in draft.suppresses:
                 _require(
-                    target_id in rewrites.message_ids,
-                    f"replace target does not exist: {target_id}",
+                    target_id in rewrites.projected_order,
+                    f"replace target must be present in current projection: {target_id}",
                 )
-                _require(
-                    target_id not in rewrites.suppressed_ids,
-                    f"replace target is already suppressed: {target_id}",
-                )
-            positions = [
-                rewrites.projected_order.index(target_id)
-                for target_id in draft.suppresses
-                if target_id in rewrites.projected_order
-            ]
-            _require(
-                len(positions) == len(draft.suppresses),
-                "replace target must be present in current projection",
-            )
-            _require(
-                sorted(positions)
-                == list(range(min(positions), min(positions) + len(positions))),
-                "replace target ids must be a contiguous projected span",
-            )
         else:
-            _require(draft.position is not None, "insert rewrite requires position")
-            if draft.position.kind in {"before", "after"}:
+            if draft.position is not None:
                 _require(
-                    draft.position.target_id in rewrites.message_ids,
-                    f"insert target does not exist: {draft.position.target_id}",
-                )
-            else:
-                _require(
-                    draft.position.boundary
-                    in {
-                        "conversation_start",
-                        "conversation_end",
-                        "before_model_request",
-                    },
-                    "insert boundary is required for boundary position",
+                    draft.position.target_id in rewrites.projected_order,
+                    "insert target must be present in current projection: "
+                    + draft.position.target_id,
                 )
         return ctx.mutations
 
@@ -1188,6 +1216,19 @@ class _LedgerMixin[TxnT]:
         run_id: str,
         drafts: list[DurableRuntimeEventDraft],
     ) -> list[StoredRuntimeEvent]:
+        if any(
+            isinstance(draft, MessageRewriteAnchorDraft | MessageRewriteMessageDraft)
+            for draft in drafts
+        ):
+            start_view = self._load_view(
+                txn,
+                run_id,
+                with_last_tool_call_ids=False,
+            )
+            _validate_rewrite_targets_against_start_projection(
+                drafts,
+                start_view.message_rewrites,
+            )
         # Within one transaction each apply persists into ``txn``; the next
         # ``_load_view`` reads those uncommitted writes, so per-draft invariants
         # (seq, batch state) fold in order.

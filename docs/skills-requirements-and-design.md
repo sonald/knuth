@@ -4,6 +4,8 @@
 日期：2026-06-17
 依据：[CONTEXT.md](../CONTEXT.md)、[ADR-003](decisions/ADR-003-system-preamble.md)、[ADR-004](decisions/ADR-004-runtime-control-and-agent-loop-boundaries.md)、[MessageMiddleware 需求与设计](message-middleware-requirements-and-design.md)、[Agent Skills Specification](https://agentskills.io/specification)
 
+> 注意：[ADR-010](decisions/ADR-010-middleware-redesign.md) 更新了本文关于 `SkillReminderMiddleware` / `SkillChangeNoticeMiddleware` 的目标设计和迁移计划：动态 skill catalog reminder 迁移为 turn-level、cache-aware、durable projection event；`SkillChangeNoticeMiddleware` 目标态删除。相关目标行为以 ADR-010 为准。
+
 本文定义 Knuth 的 Skill 文件格式和内置运行时能力。这里的关键边界是：
 
 > Skill 是 Knuth 的内置 agent 能力，不能由 host 开关关闭；CLI 只负责把 host 侧可变配置传进 Knuth，例如从哪些目录加载、目录优先级、hot reload 参数和环境变量覆盖。

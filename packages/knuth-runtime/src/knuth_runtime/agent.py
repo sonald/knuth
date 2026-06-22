@@ -46,8 +46,6 @@ from knuth_runtime.middleware import (
     ObservationCondensationMiddleware,
 )
 from knuth_runtime.skills import (
-    SkillChangeNoticeMiddleware,
-    SkillNoticeState,
     SkillReminderMiddleware,
     SkillRuntimeConfig,
     SkillSystemSectionProvider,
@@ -277,7 +275,6 @@ class AgentRuntime:
                     if event.position is not None
                     else None,
                     "suppresses": list(event.suppresses),
-                    "metadata": dict(event.metadata),
                     "replacement_messages": [],
                     "begin_seq": event.seq,
                     "end_seq": None,
@@ -469,13 +466,7 @@ def _compose_message_middlewares(
         else _default_message_middlewares()
     )
     if skill_manager is not None:
-        notice_state = SkillNoticeState()
-        middlewares.extend(
-            [
-                SkillReminderMiddleware(skill_manager, notice_state),
-                SkillChangeNoticeMiddleware(skill_manager, notice_state),
-            ]
-        )
+        middlewares.append(SkillReminderMiddleware(skill_manager))
     return middlewares
 
 

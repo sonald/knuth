@@ -40,7 +40,7 @@ from knuth.core.runtime_events import (
     RunResumedDraft,
     RunSucceededDraft,
     StepStartedDraft,
-    TapePosition,
+    InsertPosition,
     ToolBatchClosedDraft,
     ToolBatchPlannedDraft,
     ToolInvocationCompletedDraft,
@@ -60,7 +60,6 @@ from knuth_runtime import (
     FilesystemArtifactStore,
     LedgerError,
     MemoryRunLedger,
-    AgentsMDMiddleware,
     ContextCompactionMiddleware,
     InsertPatch,
     MessageMiddleware,
@@ -68,8 +67,6 @@ from knuth_runtime import (
     MessageMiddlewareContext,
     MessageMiddlewareRunner,
     RegexSecretRedactor,
-    SkillChangeNoticeMiddleware,
-    SkillNoticeState,
     SkillReminderMiddleware,
     SkillRuntimeConfig,
     SQLiteRunLedger,
@@ -161,7 +158,6 @@ class RunLedgerTests(unittest.TestCase):
                         middleware="context_compaction",
                         operation="replace",
                         suppresses=["m:2"],
-                        metadata={"reason": "test"},
                     ),
                     MessageRewriteMessageDraft(
                         message=InferenceMessage(
@@ -284,7 +280,9 @@ class RunLedgerTests(unittest.TestCase):
 
             anyio.run(scenario)
 
-    def test_message_rewrite_insert_position_affects_later_span_validation(self) -> None:
+    def test_message_rewrite_insert_position_preserves_intermediate_projection(
+        self,
+    ) -> None:
         async def scenario():
             ledger = MemoryRunLedger()
             run = await ledger.create_run("hello")
@@ -297,7 +295,7 @@ class RunLedgerTests(unittest.TestCase):
                         kind="begin",
                         middleware="agents_md",
                         operation="insert",
-                        position=TapePosition(kind="before", target_id="m:3"),
+                        position=InsertPosition(kind="before", target_id="m:3"),
                     ),
                     MessageRewriteMessageDraft(
                         message=InferenceMessage(
@@ -311,32 +309,85 @@ class RunLedgerTests(unittest.TestCase):
                     ),
                 ],
             )
-            with self.assertRaisesRegex(
-                LedgerError, "replace target ids must be a contiguous projected span"
-            ):
-                await ledger.apply_many(
-                    run.id,
-                    [
-                        MessageRewriteAnchorDraft(
-                            kind="begin",
-                            middleware="context_compaction",
-                            operation="replace",
-                            suppresses=["m:2", "m:3"],
+            await ledger.apply_many(
+                run.id,
+                [
+                    MessageRewriteAnchorDraft(
+                        kind="begin",
+                        middleware="context_compaction",
+                        operation="replace",
+                        suppresses=["m:2", "m:3"],
+                    ),
+                    MessageRewriteMessageDraft(
+                        message=InferenceMessage(
+                            role=InferenceRole.USER, content="summary"
                         ),
-                        MessageRewriteMessageDraft(
-                            message=InferenceMessage(
-                                role=InferenceRole.USER, content="summary"
-                            ),
-                        ),
-                        MessageRewriteAnchorDraft(
-                            kind="end",
-                            middleware="context_compaction",
-                            operation="replace",
-                        ),
-                    ],
-                )
+                    ),
+                    MessageRewriteAnchorDraft(
+                        kind="end",
+                        middleware="context_compaction",
+                        operation="replace",
+                    ),
+                ],
+            )
+            return await project_messages_from_events(await ledger.list_events(run.id))
 
-        anyio.run(scenario)
+        messages = anyio.run(scenario)
+        self.assertEqual([message.content for message in messages], ["summary", "middle"])
+
+    def test_message_rewrite_insert_can_anchor_to_replaced_target_in_same_batch(
+        self,
+    ) -> None:
+        async def scenario():
+            ledger = MemoryRunLedger()
+            run = await ledger.create_run("hello")
+            await ledger.apply(run.id, UserMessageDraft(content="left"))
+            await ledger.apply_many(
+                run.id,
+                [
+                    MessageRewriteAnchorDraft(
+                        kind="begin",
+                        middleware="inserter",
+                        operation="insert",
+                        position=InsertPosition(kind="before", target_id="m:2"),
+                    ),
+                    MessageRewriteMessageDraft(
+                        message=InferenceMessage(
+                            role=InferenceRole.USER,
+                            content="inserted before original",
+                        ),
+                    ),
+                    MessageRewriteAnchorDraft(
+                        kind="end",
+                        middleware="inserter",
+                        operation="insert",
+                    ),
+                    MessageRewriteAnchorDraft(
+                        kind="begin",
+                        middleware="replacer",
+                        operation="replace",
+                        suppresses=["m:2"],
+                    ),
+                    MessageRewriteMessageDraft(
+                        message=InferenceMessage(
+                            role=InferenceRole.USER,
+                            content="replacement",
+                        ),
+                    ),
+                    MessageRewriteAnchorDraft(
+                        kind="end",
+                        middleware="replacer",
+                        operation="replace",
+                    ),
+                ],
+            )
+            return await project_messages_from_events(await ledger.list_events(run.id))
+
+        messages = anyio.run(scenario)
+        self.assertEqual(
+            [message.content for message in messages],
+            ["inserted before original", "replacement"],
+        )
 
     def test_message_rewrite_events_must_be_atomic(self) -> None:
         ledger = MemoryRunLedger()
@@ -1072,6 +1123,35 @@ def _build_runtime(client, section_providers=None, message_middlewares=None):
 
 
 class EventDrivenRuntimeTests(unittest.TestCase):
+    def test_after_user_message_committed_receives_turn_start_id(self) -> None:
+        class RecorderMiddleware(MessageMiddleware):
+            name = "turn_start_recorder"
+            priority = 1
+            checkpoints = {MessageMiddlewareCheckpoint.AFTER_USER_MESSAGE_COMMITTED}
+
+            def __init__(self) -> None:
+                self.calls: list[tuple[str | None, list[str]]] = []
+
+            async def process(
+                self,
+                ctx: MessageMiddlewareContext,
+                messages,
+            ):
+                self.calls.append((ctx.turn_start_id, [item.id for item in messages]))
+                return []
+
+        recorder = RecorderMiddleware()
+        runtime = _build_runtime(
+            ScriptedInferenceClient(
+                [InferenceMessage(role=InferenceRole.ASSISTANT, content="done")]
+            ),
+            message_middlewares=[recorder],
+        )
+
+        anyio.run(runtime.run_once, "hello")
+
+        self.assertEqual(recorder.calls, [("m:2", ["m:2"])])
+
     def test_skill_invocation_records_loaded_content_as_tool_result(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir, "skills")
@@ -1217,7 +1297,9 @@ class EventDrivenRuntimeTests(unittest.TestCase):
             )
         )
 
-    def test_skill_catalog_change_notice_is_durable_and_deduplicated(self) -> None:
+    def test_skill_reminder_is_durable_before_turn_user_message_and_deduplicated(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir, "skills")
             skill_dir = root / "example-skill"
@@ -1244,52 +1326,40 @@ class EventDrivenRuntimeTests(unittest.TestCase):
                 ledger = MemoryRunLedger()
                 run = await ledger.create_run("hello")
                 await ledger.apply(run.id, UserMessageDraft(content="hello"))
-                notice_state = SkillNoticeState()
                 runner = MessageMiddlewareRunner(
                     ledger,
-                    [
-                        SkillReminderMiddleware(manager, notice_state),
-                        SkillChangeNoticeMiddleware(manager, notice_state),
-                    ],
+                    [SkillReminderMiddleware(manager)],
                 )
                 await runner.run_checkpoint(
-                    run.id, MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST
-                )
-                skill_file.write_text(
-                    "\n".join(
-                        [
-                            "---",
-                            "name: example-skill",
-                            "description: Use v2.",
-                            "---",
-                            "",
-                            "Body.",
-                        ]
-                    ),
-                    encoding="utf-8",
-                )
-                manager.invalidate("frontmatter changed")
-                await runner.run_checkpoint(
-                    run.id, MessageMiddlewareCheckpoint.AFTER_TURN_CLOSED
+                    run.id,
+                    MessageMiddlewareCheckpoint.AFTER_USER_MESSAGE_COMMITTED,
+                    turn_start_id="m:2",
                 )
                 await runner.run_checkpoint(
-                    run.id, MessageMiddlewareCheckpoint.AFTER_TURN_CLOSED
+                    run.id,
+                    MessageMiddlewareCheckpoint.AFTER_USER_MESSAGE_COMMITTED,
+                    turn_start_id="m:2",
                 )
-                return await ledger.list_events(run.id)
+                events = await ledger.list_events(run.id)
+                messages = await project_messages_from_events(events)
+                return events, messages
 
-            events = anyio.run(scenario)
+            events, messages = anyio.run(scenario)
 
-        notices = [
-            event.message.content
+        reminders = [
+            event
             for event in events
             if event.type == "message.rewrite_message"
-            and event.message.content
-            and "<knuth-skill-notice" in event.message.content
+            and event.metadata.get("semantic", {}).get("category") == "skill_reminder"
         ]
-        self.assertEqual(len(notices), 1)
-        self.assertIn("- example-skill: Use v2.", notices[0])
+        self.assertEqual(len(reminders), 1)
+        self.assertIn("- example-skill: Use v1.", reminders[0].message.content)
+        self.assertEqual(
+            [message.content for message in messages],
+            [reminders[0].message.content, "hello"],
+        )
 
-    def test_skill_catalog_change_notice_is_per_run_not_globally_consumed(self) -> None:
+    def test_skill_reminder_is_per_run_not_globally_consumed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir, "skills")
             skill_dir = root / "example-skill"
@@ -1318,26 +1388,55 @@ class EventDrivenRuntimeTests(unittest.TestCase):
                 second = await ledger.create_run("second")
                 await ledger.apply(first.id, UserMessageDraft(content="first"))
                 await ledger.apply(second.id, UserMessageDraft(content="second"))
-                notice_state = SkillNoticeState()
                 runner = MessageMiddlewareRunner(
                     ledger,
-                    [
-                        SkillReminderMiddleware(manager, notice_state),
-                        SkillChangeNoticeMiddleware(manager, notice_state),
-                    ],
+                    [SkillReminderMiddleware(manager)],
                 )
                 await runner.run_checkpoint(
-                    first.id, MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST
+                    first.id,
+                    MessageMiddlewareCheckpoint.AFTER_USER_MESSAGE_COMMITTED,
+                    turn_start_id="m:2",
                 )
                 await runner.run_checkpoint(
-                    second.id, MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST
+                    second.id,
+                    MessageMiddlewareCheckpoint.AFTER_USER_MESSAGE_COMMITTED,
+                    turn_start_id="m:2",
                 )
+                return await ledger.list_events(first.id), await ledger.list_events(second.id)
+
+            first_events, second_events = anyio.run(scenario)
+
+        first_reminders = [
+            event
+            for event in first_events
+            if event.type == "message.rewrite_message"
+            and event.metadata.get("semantic", {}).get("category") == "skill_reminder"
+        ]
+        second_reminders = [
+            event
+            for event in second_events
+            if event.type == "message.rewrite_message"
+            and event.metadata.get("semantic", {}).get("category") == "skill_reminder"
+        ]
+        self.assertEqual(len(first_reminders), 1)
+        self.assertEqual(len(second_reminders), 1)
+        self.assertIn("- example-skill: Use v1.", first_reminders[0].message.content)
+        self.assertIn("- example-skill: Use v1.", second_reminders[0].message.content)
+
+    def test_skill_reminder_deduplicates_against_latest_digest_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir, "skills")
+            skill_dir = root / "example-skill"
+            skill_dir.mkdir(parents=True)
+            skill_file = skill_dir / "SKILL.md"
+
+            def write_skill(description: str) -> None:
                 skill_file.write_text(
                     "\n".join(
                         [
                             "---",
                             "name: example-skill",
-                            "description: Use v2.",
+                            f"description: {description}",
                             "---",
                             "",
                             "Body.",
@@ -1345,35 +1444,61 @@ class EventDrivenRuntimeTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-                manager.invalidate("frontmatter changed")
-                await runner.run_checkpoint(
-                    first.id, MessageMiddlewareCheckpoint.AFTER_TURN_CLOSED
-                )
-                await runner.run_checkpoint(
-                    second.id, MessageMiddlewareCheckpoint.AFTER_TURN_CLOSED
-                )
-                return await ledger.list_events(first.id), await ledger.list_events(second.id)
 
-            first_events, second_events = anyio.run(scenario)
+            write_skill("Use v1.")
+            manager = SkillManager(
+                [SkillRoot(source=SkillSource.PROJECT, path=str(root))]
+            )
 
-        first_notices = [
-            event.message.content
-            for event in first_events
+            async def scenario():
+                ledger = MemoryRunLedger()
+                run = await ledger.create_run("hello")
+                runner = MessageMiddlewareRunner(
+                    ledger,
+                    [SkillReminderMiddleware(manager)],
+                )
+
+                first = await ledger.apply(run.id, UserMessageDraft(content="turn 1"))
+                await runner.run_checkpoint(
+                    run.id,
+                    MessageMiddlewareCheckpoint.AFTER_USER_MESSAGE_COMMITTED,
+                    turn_start_id=f"m:{first.seq}",
+                )
+
+                write_skill("Use v2.")
+                manager.invalidate("skill changed to v2")
+                second = await ledger.apply(run.id, UserMessageDraft(content="turn 2"))
+                await runner.run_checkpoint(
+                    run.id,
+                    MessageMiddlewareCheckpoint.AFTER_USER_MESSAGE_COMMITTED,
+                    turn_start_id=f"m:{second.seq}",
+                )
+
+                write_skill("Use v1.")
+                manager.invalidate("skill reverted to v1")
+                third = await ledger.apply(run.id, UserMessageDraft(content="turn 3"))
+                await runner.run_checkpoint(
+                    run.id,
+                    MessageMiddlewareCheckpoint.AFTER_USER_MESSAGE_COMMITTED,
+                    turn_start_id=f"m:{third.seq}",
+                )
+                return await ledger.list_events(run.id)
+
+            events = anyio.run(scenario)
+
+        reminders = [
+            event
+            for event in events
             if event.type == "message.rewrite_message"
-            and event.message.content
-            and "<knuth-skill-notice" in event.message.content
+            and event.metadata.get("semantic", {}).get("category") == "skill_reminder"
         ]
-        second_notices = [
-            event.message.content
-            for event in second_events
-            if event.type == "message.rewrite_message"
-            and event.message.content
-            and "<knuth-skill-notice" in event.message.content
-        ]
-        self.assertEqual(len(first_notices), 1)
-        self.assertEqual(len(second_notices), 1)
-        self.assertIn("- example-skill: Use v2.", first_notices[0])
-        self.assertIn("- example-skill: Use v2.", second_notices[0])
+        self.assertEqual(len(reminders), 3)
+        digests = [event.metadata["semantic"]["catalog_digest"] for event in reminders]
+        self.assertEqual(digests[0], digests[2])
+        self.assertNotEqual(digests[0], digests[1])
+        self.assertIn("- example-skill: Use v1.", reminders[0].message.content)
+        self.assertIn("- example-skill: Use v2.", reminders[1].message.content)
+        self.assertIn("- example-skill: Use v1.", reminders[2].message.content)
 
     def test_runtime_executes_tool_then_succeeds(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
@@ -1687,9 +1812,13 @@ class EventDrivenRuntimeTests(unittest.TestCase):
             )
         )
         audit = anyio.run(runtime.rewrite_audit, turn.run_id)
-        self.assertEqual(audit[0]["operation"], "replace")
-        self.assertEqual(audit[0]["middleware"], "observation_condensation")
-        self.assertEqual(len(audit[0]["replacement_messages"]), 1)
+        condensation = next(
+            record
+            for record in audit
+            if record["middleware"] == "observation_condensation"
+        )
+        self.assertEqual(condensation["operation"], "replace")
+        self.assertEqual(len(condensation["replacement_messages"]), 1)
 
         # The next model request sees the projection-condensed replacement.
         final_turn = client.captured_messages[-1]
@@ -1779,28 +1908,7 @@ class EventDrivenRuntimeTests(unittest.TestCase):
             ]
         )
 
-    def test_agents_md_injection_is_ephemeral_and_affects_snapshot(self) -> None:
-        with tempfile.TemporaryDirectory() as workspace:
-            agents_path = Path(workspace, "AGENTS.md")
-            agents_path.write_text("Always answer with repo context.", encoding="utf-8")
-            client = CapturingScriptedClient(
-                [InferenceMessage(role=InferenceRole.ASSISTANT, content="done")]
-            )
-            runtime = _build_runtime(
-                client,
-                message_middlewares=[AgentsMDMiddleware([agents_path])],
-            )
-
-            turn = anyio.run(runtime.run_once, "hello")
-            events = anyio.run(runtime.events, turn.run_id)
-
-        self.assertIn("Always answer with repo context.", client.captured_messages[0][0].content)
-        self.assertEqual(client.captured_messages[0][0].role, InferenceRole.SYSTEM)
-        self.assertNotIn("message.rewrite_anchor", [event.type for event in events])
-        step = next(event for event in events if event.type == "step.started")
-        self.assertEqual(step.snapshot.message_count, len(client.captured_messages[0]))
-
-    def test_ephemeral_rewrites_from_same_named_middlewares_get_unique_ids(self) -> None:
+    def test_duplicate_message_middleware_names_are_rejected(self) -> None:
         class SameNamedMiddleware(MessageMiddleware):
             name = "same_name"
             checkpoints = {MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST}
@@ -1812,53 +1920,20 @@ class EventDrivenRuntimeTests(unittest.TestCase):
             async def process(
                 self,
                 ctx: MessageMiddlewareContext,
-                tape,
+                messages,
             ):
-                return [
-                    InsertPatch(
-                        position=TapePosition(
-                            kind="boundary",
-                            boundary="conversation_start",
-                        ),
-                        items=[
-                            InferenceMessage(
-                                role=InferenceRole.SYSTEM,
-                                content=self.content,
-                            )
-                        ],
-                        durable=False,
-                    )
-                ]
+                _ = ctx, messages
+                return []
 
-        async def scenario():
-            ledger = MemoryRunLedger()
-            run = await ledger.create_run("hello")
-            await ledger.apply(run.id, UserMessageDraft(content="hello"))
+        with self.assertRaisesRegex(ValueError, "duplicate message middleware name"):
             runner = MessageMiddlewareRunner(
-                ledger,
+                MemoryRunLedger(),
                 [
                     SameNamedMiddleware("first", priority=1),
                     SameNamedMiddleware("second", priority=2),
                 ],
             )
-            result = await runner.run_checkpoint(
-                run.id, MessageMiddlewareCheckpoint.BEFORE_MODEL_REQUEST
-            )
-            return [
-                item.id
-                for record in result.ephemeral_records
-                for item in record.messages
-                if isinstance(item, TapeMessage)
-            ]
-
-        message_ids = anyio.run(scenario)
-        self.assertEqual(
-            message_ids,
-            [
-                "eph:before_model_request:0#0",
-                "eph:before_model_request:1#0",
-            ],
-        )
+            self.assertIsNotNone(runner)
 
     def test_patch_metadata_rejects_runtime_reserved_keys(self) -> None:
         class BadMetadataMiddleware(MessageMiddleware):
@@ -1869,21 +1944,18 @@ class EventDrivenRuntimeTests(unittest.TestCase):
             async def process(
                 self,
                 ctx: MessageMiddlewareContext,
-                tape,
+                messages,
             ):
+                _ = ctx, messages
                 return [
                     InsertPatch(
-                        position=TapePosition(
-                            kind="boundary",
-                            boundary="conversation_start",
-                        ),
+                        position=InsertPosition(kind="before", target_id="m:2"),
                         items=[
                             InferenceMessage(
                                 role=InferenceRole.SYSTEM,
                                 content="bad",
                             )
                         ],
-                        durable=False,
                         metadata={"rewrite_id": "spoof"},
                     )
                 ]
@@ -1997,9 +2069,13 @@ class EventDrivenRuntimeTests(unittest.TestCase):
             include_default_tools=False,
         )
         first = anyio.run(first_runtime.run_once, "first question")
-        self.assertNotIn(
-            "message.rewrite_anchor",
-            [event.type for event in anyio.run(first_runtime.events, first.run_id)],
+        self.assertFalse(
+            [
+                event
+                for event in anyio.run(first_runtime.events, first.run_id)
+                if event.type == "message.rewrite_anchor"
+                and event.middleware == "context_compaction"
+            ]
         )
 
         second_client = CapturingScriptedClient(
