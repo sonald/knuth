@@ -1546,6 +1546,49 @@ class EventDrivenRuntimeTests(unittest.TestCase):
             reconstructed = anyio.run(reconstruct)
             self.assertEqual(reconstructed[-1].content, "Final answer: Knuth works")
 
+    def test_runtime_preserves_responses_tool_call_continuation_id(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            fact_path = Path(workspace, "fact.txt")
+            fact_path.write_text("Knuth works", encoding="utf-8")
+            client = CapturingScriptedClient(
+                [
+                    InferenceMessage(
+                        role=InferenceRole.ASSISTANT,
+                        tool_calls=[
+                            CoreToolCall(
+                                tool_call_id="fc_1",
+                                name="read_file",
+                                arguments={"path": str(fact_path)},
+                                raw={"responses_call_id": "call_1"},
+                            )
+                        ],
+                    ),
+                    InferenceMessage(role=InferenceRole.ASSISTANT, content="done"),
+                ]
+            )
+            runtime = _build_runtime(client)
+
+            turn = anyio.run(runtime.run_once, "read fact.txt")
+
+            self.assertEqual(turn.status, RunStatus.SUCCEEDED)
+            second_request = client.captured_messages[1]
+            assistant = next(
+                message
+                for message in second_request
+                if message.role == InferenceRole.ASSISTANT and message.tool_calls
+            )
+            tool_result = next(
+                message
+                for message in second_request
+                if message.role == InferenceRole.TOOL_RESULT
+            )
+            self.assertEqual(assistant.tool_calls[0].tool_call_id, "fc_1")
+            self.assertEqual(
+                assistant.tool_calls[0].raw,
+                {"responses_call_id": "call_1"},
+            )
+            self.assertEqual(tool_result.tool_call_id, "fc_1")
+
     def test_step_started_carries_context_snapshot(self) -> None:
         runtime = _build_runtime(
             ScriptedInferenceClient(

@@ -7,6 +7,8 @@ import backendModule from "../electron/backend-manager.cjs";
 import settingsModule from "../electron/settings-store.cjs";
 
 const { BackendManager } = backendModule;
+const { modelEnvironment } = backendModule;
+const { parseChatgptDeviceCode } = backendModule;
 const { SettingsStore } = settingsModule;
 
 const appRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -60,6 +62,48 @@ try {
   assert(secrets.apiKey.value === "secret-test-key", "API key should be stored in the local secret file");
   const secretMode = fs.statSync(path.join(userData, "secrets.json")).mode & 0o777;
   assert(secretMode === 0o600, `secrets.json should be mode 0600, got ${secretMode.toString(8)}`);
+
+  const chatgptUserData = path.join(tempRoot, "chatgpt-user-data");
+  fs.mkdirSync(chatgptUserData, { recursive: true });
+  const chatgptStore = new SettingsStore({
+    app: fakeApp(true, chatgptUserData),
+    appRoot,
+  });
+  const chatgptSaved = chatgptStore.save({
+    authMode: "chatgpt",
+    model: "chatgpt/gpt-5.3-codex",
+    timeout: "42",
+    workspace,
+    dbPath: path.join(chatgptUserData, "knuth-im.db"),
+  });
+  assert(chatgptSaved.ready === true, "ChatGPT settings should not require API key or base URL");
+  assert(chatgptSaved.authMode === "chatgpt", "ChatGPT settings should report auth mode");
+  assert(chatgptSaved.hasApiKey === false, "ChatGPT settings should not report an API key");
+  assert(chatgptSaved.needsLogin === true, "ChatGPT settings should report login required without auth file");
+  assert(!chatgptSaved.missing.includes("apiKey"), "ChatGPT settings should not miss apiKey");
+  const chatgptBackend = chatgptStore.resolveForBackend({}, { allowEnvFallback: false });
+  assert(chatgptBackend.apiKey === "", "ChatGPT backend settings should not include API key");
+  assert(chatgptBackend.modelBaseUrl === "", "ChatGPT backend settings should not include model base URL");
+  assert(chatgptBackend.chatgptTokenDir.endsWith("litellm-chatgpt"), "ChatGPT token dir should be app-owned");
+  assert(fs.statSync(chatgptBackend.chatgptTokenDir).isDirectory(), "ChatGPT token dir should exist");
+  const tokenDirMode = fs.statSync(chatgptBackend.chatgptTokenDir).mode & 0o777;
+  assert(tokenDirMode === 0o700, `ChatGPT token dir should be mode 0700, got ${tokenDirMode.toString(8)}`);
+  fs.writeFileSync(path.join(chatgptBackend.chatgptTokenDir, "auth.json"), "{}\n", { mode: 0o600 });
+  assert(chatgptStore.publicSettings({}, { allowEnvFallback: false }).needsLogin === false, "ChatGPT auth file should satisfy login state");
+  chatgptStore.clearChatgptAuth();
+  assert(!fs.existsSync(chatgptBackend.chatgptTokenDir), "clearing ChatGPT auth should remove token dir");
+  assert(chatgptStore.publicSettings({}, { allowEnvFallback: false }).needsLogin === true, "clearing ChatGPT auth should require login again");
+  const chatgptEnv = modelEnvironment(chatgptBackend);
+  assert(chatgptEnv.KNUTH_AUTH_MODE === "chatgpt", "ChatGPT backend env should include auth mode");
+  assert(chatgptEnv.KNUTH_MODEL === "chatgpt/gpt-5.3-codex", "ChatGPT backend env should include model");
+  assert(chatgptEnv.CHATGPT_TOKEN_DIR === chatgptBackend.chatgptTokenDir, "ChatGPT backend env should include token dir");
+  assert(!("KNUTH_API_KEY" in chatgptEnv), "ChatGPT backend env should not include API key");
+  assert(!("KNUTH_BASE_URL" in chatgptEnv), "ChatGPT backend env should not include base URL");
+  const login = parseChatgptDeviceCode(
+    "Sign in with ChatGPT using device code:\n1) Visit https://auth.openai.com/codex/device\n2) Enter code: ABCD-EFGH\n",
+  );
+  assert(login?.url === "https://auth.openai.com/codex/device", "device-code parser should capture URL");
+  assert(login?.code === "ABCD-EFGH", "device-code parser should capture code");
 
   let rejectedInvalidUrl = false;
   try {

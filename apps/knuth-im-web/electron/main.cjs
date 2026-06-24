@@ -206,6 +206,17 @@ app.whenReady().then(async () => {
       backend: backendManager.connection(),
     };
   });
+  ipcMain.handle("knuth:settings:clearChatgptAuth", async () => {
+    settingsStore.clearChatgptAuth();
+    backendReady = backendManager.restart();
+    await backendReady;
+    return {
+      settings: settingsStore.publicSettings(process.env, {
+        allowEnvFallback: !app.isPackaged,
+      }),
+      backend: backendManager.connection(),
+    };
+  });
   ipcMain.handle("knuth:settings:chooseWorkspace", async () => {
     const settings = settingsStore.publicSettings(process.env, {
       allowEnvFallback: !app.isPackaged,

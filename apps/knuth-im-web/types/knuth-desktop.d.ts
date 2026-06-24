@@ -1,12 +1,15 @@
 import type { AgentConnection } from "../lib/agui";
 
 export type KnuthDesktopSettings = {
+  authMode: "api_key" | "chatgpt";
   modelBaseUrl: string;
   model: string;
   timeout: number;
   workspace: string;
   dbPath: string;
   hasApiKey: boolean;
+  hasChatgptAuth?: boolean;
+  needsLogin?: boolean;
   apiKeySource: "stored" | "environment" | null;
   secretStorage?: "local-file" | null;
   missing: string[];
@@ -14,6 +17,7 @@ export type KnuthDesktopSettings = {
 };
 
 export type KnuthDesktopSettingsInput = {
+  authMode?: "api_key" | "chatgpt";
   modelBaseUrl?: string;
   model?: string;
   timeout?: number | string;
@@ -38,6 +42,10 @@ declare global {
       saveSettings?: (
         settings: KnuthDesktopSettingsInput,
       ) => Promise<{ settings: KnuthDesktopSettings; backend: AgentConnection }>;
+      clearChatgptAuth?: () => Promise<{
+        settings: KnuthDesktopSettings;
+        backend: AgentConnection;
+      }>;
       chooseWorkspace?: () => Promise<string | null>;
       openEventViewer?: () => Promise<void>;
     };

@@ -87,6 +87,17 @@ function normalizeModel(value) {
   return model;
 }
 
+function normalizeAuthMode(value, model) {
+  const mode = asString(value);
+  if (mode) {
+    if (!["api_key", "chatgpt"].includes(mode)) {
+      throw new Error("Auth mode is invalid.");
+    }
+    return mode;
+  }
+  return normalizeModel(model).startsWith("chatgpt/") ? "chatgpt" : "api_key";
+}
+
 function normalizeTimeout(value) {
   if (value === undefined || value === null || value === "") {
     return DEFAULT_TIMEOUT;
@@ -152,6 +163,25 @@ class SettingsStore {
     return path.join(this.app.getPath("userData"), SECRETS_FILE);
   }
 
+  chatgptTokenDir() {
+    const dirPath = path.join(this.app.getPath("userData"), "litellm-chatgpt");
+    ensureDir(dirPath);
+    fs.chmodSync(dirPath, 0o700);
+    return dirPath;
+  }
+
+  chatgptAuthPath() {
+    return path.join(this.chatgptTokenDir(), "auth.json");
+  }
+
+  hasChatgptAuth() {
+    return fs.existsSync(this.chatgptAuthPath());
+  }
+
+  clearChatgptAuth() {
+    fs.rmSync(this.chatgptTokenDir(), { recursive: true, force: true });
+  }
+
   readConfig() {
     const config = readJson(this.configPath());
     return isRecord(config) ? config : {};
@@ -208,6 +238,10 @@ class SettingsStore {
     const fallbackDbPath = defaultDbPath(this.app);
     const next = {
       version: CONFIG_VERSION,
+      authMode:
+        "authMode" in input
+          ? normalizeAuthMode(input.authMode, input.model ?? previous.model)
+          : normalizeAuthMode(previous.authMode, input.model ?? previous.model),
       modelBaseUrl:
         "modelBaseUrl" in input
           ? normalizeUrl(input.modelBaseUrl)
@@ -268,34 +302,50 @@ class SettingsStore {
       dbPathValid = false;
     }
 
-    const settings = {
-      modelBaseUrl:
+    const model =
+      asString(config.model) ||
+      (allowEnvFallback ? asString(env.KNUTH_MODEL) : "");
+    const authMode = normalizeAuthMode(config.authMode || env.KNUTH_AUTH_MODE, model);
+    const modelBaseUrl =
+      authMode === "chatgpt"
+        ? ""
+        :
         asString(config.modelBaseUrl) ||
-        (allowEnvFallback ? asString(env.KNUTH_BASE_URL) : ""),
-      model:
-        asString(config.model) ||
-        (allowEnvFallback ? asString(env.KNUTH_MODEL) : ""),
+          (allowEnvFallback ? asString(env.KNUTH_BASE_URL) : "");
+    const settings = {
+      authMode,
+      modelBaseUrl,
+      model,
       timeout:
         config.timeout !== undefined
           ? normalizeTimeout(config.timeout)
           : normalizeTimeout(allowEnvFallback ? env.KNUTH_TIMEOUT : undefined),
       workspace,
       dbPath,
-      hasApiKey: storedApiKey || envApiKey,
-      apiKeySource: storedApiKey ? "stored" : envApiKey ? "environment" : null,
+      hasApiKey: authMode === "api_key" && (storedApiKey || envApiKey),
+      apiKeySource:
+        authMode === "api_key"
+          ? storedApiKey
+            ? "stored"
+            : envApiKey
+              ? "environment"
+              : null
+          : null,
       secretStorage: storedApiKey ? "local-file" : null,
+      hasChatgptAuth: authMode === "chatgpt" && this.hasChatgptAuth(),
       missing: [],
       ready: false,
     };
+    settings.needsLogin = authMode === "chatgpt" && !settings.hasChatgptAuth;
 
     const missing = [];
-    if (!settings.modelBaseUrl) {
+    if (authMode === "api_key" && !settings.modelBaseUrl) {
       missing.push("modelBaseUrl");
     }
     if (!settings.model) {
       missing.push("model");
     }
-    if (!settings.hasApiKey) {
+    if (authMode === "api_key" && !settings.hasApiKey) {
       missing.push("apiKey");
     }
     if (!workspaceValid) {
@@ -320,6 +370,8 @@ class SettingsStore {
     return {
       ...publicSettings,
       apiKey,
+      chatgptTokenDir:
+        publicSettings.authMode === "chatgpt" ? this.chatgptTokenDir() : "",
     };
   }
 }

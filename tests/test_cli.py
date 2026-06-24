@@ -284,6 +284,33 @@ class AgentConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "KNUTH_API_KEY"):
             anyio.run(load_config, Path("does-not-exist.yaml"), {})
 
+    def test_load_config_allows_chatgpt_model_without_api_key(self) -> None:
+        config = anyio.run(
+            load_config,
+            Path("does-not-exist.yaml"),
+            {
+                "KNUTH_MODEL": "chatgpt/gpt-5.3-codex",
+                "KNUTH_CHATGPT_TOKEN_DIR": "/tmp/knuth-chatgpt",
+            },
+        )
+
+        self.assertEqual(config.model, "chatgpt/gpt-5.3-codex")
+        self.assertEqual(config.auth_mode, "chatgpt")
+        self.assertEqual(config.chatgpt_token_dir, "/tmp/knuth-chatgpt")
+        self.assertIsNone(config.api_key)
+        self.assertIsNone(config.base_url)
+
+    def test_load_config_rejects_unknown_auth_mode(self) -> None:
+        with self.assertRaisesRegex(ValueError, "KNUTH_AUTH_MODE"):
+            anyio.run(
+                load_config,
+                Path("does-not-exist.yaml"),
+                {
+                    "KNUTH_MODEL": "chatgpt/gpt-5.3-codex",
+                    "KNUTH_AUTH_MODE": "chatgppt",
+                },
+            )
+
     def test_load_config_defaults_to_user_data_dir_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir, "knuth-cli", "knuth.yaml")
@@ -513,6 +540,27 @@ class CliRuntimeFactoryTests(unittest.TestCase):
         self.assertEqual(first_turn_messages[0].role, InferenceRole.SYSTEM)
         self.assertIn("Knuth Shell", first_turn_messages[0].content or "")
         self.assertIn("USER PROMPT", first_turn_messages[0].content or "")
+
+    def test_build_runtime_maps_chatgpt_token_dir_for_litellm(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir, "knuth.yaml")
+            db_path = Path(temp_dir, "knuth.db")
+            token_dir = Path(temp_dir, "chatgpt")
+            _write_yaml(
+                config_path,
+                {
+                    "auth_mode": "chatgpt",
+                    "model": "chatgpt/gpt-5.3-codex",
+                    "chatgpt_token_dir": str(token_dir),
+                },
+            )
+
+            async def make_runtime():
+                return await build_runtime(config_path=config_path, db_path=db_path)
+
+            with patch.dict(os.environ, {}, clear=True):
+                anyio.run(make_runtime)
+                self.assertEqual(os.environ["CHATGPT_TOKEN_DIR"], str(token_dir))
 
     def test_build_runtime_registers_cli_local_tools_after_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

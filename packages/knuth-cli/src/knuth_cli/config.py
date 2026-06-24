@@ -15,9 +15,11 @@ from knuth_toold.skills import SkillRoot
 
 @dataclass(frozen=True)
 class AgentConfig:
-    api_key: str
-    base_url: str
+    api_key: str | None
+    base_url: str | None
     model: str
+    auth_mode: str = "api_key"
+    chatgpt_token_dir: str | None = None
     timeout: float = 60.0
     system_prompt: str | None = None
     skill_roots: list[SkillRoot] | None = None
@@ -50,10 +52,30 @@ async def load_config(
         if env_key in source:
             values[config_key] = source[env_key]
 
+    return _agent_config_from_values(values)
+
+
+def load_agent_config_from_env(environ: Mapping[str, str] | None = None) -> AgentConfig:
+    source = os.environ if environ is None else environ
+    values = {
+        config_key: source[env_key]
+        for env_key, config_key in _ENV_TO_CONFIG_KEY.items()
+        if env_key in source
+    }
+    return _agent_config_from_values(values)
+
+
+def _agent_config_from_values(values: Mapping[str, Any]) -> AgentConfig:
+    model = str(values.get("model") or "")
+    auth_mode = _auth_mode(values.get("auth_mode"), model)
+    required_config_keys = {"model"}
+    if auth_mode == "api_key":
+        required_config_keys.update({"api_key", "base_url"})
+
     missing = [
         env_key
         for env_key, config_key in _ENV_TO_CONFIG_KEY.items()
-        if config_key not in _OPTIONAL_CONFIG_KEYS and not values.get(config_key)
+        if config_key in required_config_keys and not values.get(config_key)
     ]
     if missing:
         joined = ", ".join(missing)
@@ -63,9 +85,15 @@ async def load_config(
     system_prompt = values.get("system_prompt")
     skill_config = parse_agent_skill_config(values)
     return AgentConfig(
-        api_key=str(values["api_key"]),
-        base_url=str(values["base_url"]),
-        model=str(values["model"]),
+        api_key=str(values["api_key"]) if values.get("api_key") else None,
+        base_url=str(values["base_url"]) if values.get("base_url") else None,
+        model=model,
+        auth_mode=auth_mode,
+        chatgpt_token_dir=(
+            str(values["chatgpt_token_dir"])
+            if values.get("chatgpt_token_dir")
+            else None
+        ),
         timeout=timeout,
         system_prompt=str(system_prompt) if system_prompt else None,
         skill_roots=skill_config.roots,
@@ -84,6 +112,8 @@ _ENV_TO_CONFIG_KEY = {
     "KNUTH_API_KEY": "api_key",
     "KNUTH_BASE_URL": "base_url",
     "KNUTH_MODEL": "model",
+    "KNUTH_AUTH_MODE": "auth_mode",
+    "KNUTH_CHATGPT_TOKEN_DIR": "chatgpt_token_dir",
     "KNUTH_TIMEOUT": "timeout",
     "KNUTH_SYSTEM_PROMPT": "system_prompt",
     **_SKILL_ENV_TO_CONFIG_KEY,
@@ -92,10 +122,23 @@ _ENV_TO_CONFIG_KEY = {
 _OPTIONAL_CONFIG_KEYS = {
     "timeout",
     "system_prompt",
+    "auth_mode",
+    "chatgpt_token_dir",
     "skill_roots",
     "skill_hot_reload",
     "skill_hot_reload_debounce_ms",
 }
+
+
+def _auth_mode(value: object, model: str) -> str:
+    mode = str(value or "").strip()
+    if mode:
+        if mode not in {"api_key", "chatgpt"}:
+            raise ValueError("KNUTH_AUTH_MODE must be 'api_key' or 'chatgpt'")
+        return mode
+    if model.startswith("chatgpt/"):
+        return "chatgpt"
+    return "api_key"
 
 
 def _default_skill_roots() -> list[SkillRoot]:

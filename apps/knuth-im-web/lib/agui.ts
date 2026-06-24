@@ -10,16 +10,23 @@ export type AgentConnection = {
   mode?: string;
   workspace?: string;
   settings?: {
+    authMode: "api_key" | "chatgpt";
     modelBaseUrl: string;
     model: string;
     timeout: number;
     workspace: string;
     dbPath: string;
     hasApiKey: boolean;
+    hasChatgptAuth?: boolean;
+    needsLogin?: boolean;
     apiKeySource: "stored" | "environment" | null;
     secretStorage?: "local-file" | null;
     missing: string[];
     ready: boolean;
+  };
+  chatgptLogin?: {
+    url: string;
+    code: string;
   };
   error?: string;
 };

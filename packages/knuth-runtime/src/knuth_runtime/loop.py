@@ -339,13 +339,14 @@ async def _run_step(
         return RunStatus.FAILED
 
     # Persist only the minimal facts: provider raw payloads stay out of the
-    # ledger by construction.
+    # ledger, except continuation ids required by providers such as Responses.
     tool_calls = [
         ToolCall(
             tool_call_id=call.effective_id,
             name=call.name,
             arguments=call.arguments,
             index=call.index,
+            raw=_tool_call_continuation_raw(call),
         )
         for call in assistant_message.tool_calls
     ]
@@ -686,6 +687,13 @@ async def _run_after_turn_closed(invocation: RuntimeInvocation) -> None:
         # Writer is a maintenance cache. Any failure is logged inside the
         # writer; surface nothing to the loop.
         return
+
+
+def _tool_call_continuation_raw(call: ToolCall) -> dict[str, str]:
+    responses_call_id = call.raw.get("responses_call_id")
+    if isinstance(responses_call_id, str):
+        return {"responses_call_id": responses_call_id}
+    return {}
 
 
 def _completion_for(

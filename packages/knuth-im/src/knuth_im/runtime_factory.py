@@ -6,7 +6,7 @@ import os
 from collections.abc import Iterable
 from pathlib import Path
 
-from knuth_cli.config import load_agent_skill_config_from_env
+from knuth_cli.config import load_agent_config_from_env
 from knuth_cli.prompts import build_cli_message_middlewares, build_cli_system_sections
 from knuth_cli.tools import create_cli_tool_provider
 from knuth_llmd import InferenceConfig, LiteLLMInferenceClient
@@ -32,33 +32,23 @@ def build_runtime(
     *,
     tool_providers: Iterable[ToolProvider] = (),
 ) -> AgentRuntime:
-    api_key = os.environ.get("KNUTH_API_KEY")
-    base_url = os.environ.get("KNUTH_BASE_URL")
-    model = os.environ.get("KNUTH_MODEL")
-    if not (api_key and base_url and model):
-        raise ValueError(
-            "Set KNUTH_API_KEY, KNUTH_BASE_URL, and KNUTH_MODEL "
-            "(or put them in .env)"
-        )
-    timeout = float(os.environ.get("KNUTH_TIMEOUT") or 60.0)
-    system_prompt = os.environ.get("KNUTH_SYSTEM_PROMPT")
-    skill_config = load_agent_skill_config_from_env()
+    config = load_agent_config_from_env()
     return build_sqlite_runtime(
         inference_client=LiteLLMInferenceClient(
-            model=model,
-            base_url=base_url,
-            api_key=api_key,
-            timeout=timeout,
+            model=config.model,
+            base_url=config.base_url,
+            api_key=config.api_key,
+            timeout=config.timeout,
         ),
-        inference_config=InferenceConfig(timeout_s=timeout),
+        inference_config=InferenceConfig(timeout_s=config.timeout),
         db_path=db_path or Path("~/.knuth/knuth-im.db"),
-        section_providers=build_cli_system_sections(system_prompt),
+        section_providers=build_cli_system_sections(config.system_prompt),
         message_middlewares=build_cli_message_middlewares(),
         tool_providers=[create_cli_tool_provider(), *tool_providers],
         include_default_tools=True,
         skill_config=SkillRuntimeConfig(
-            roots=skill_config.roots,
-            hot_reload=skill_config.hot_reload,
-            hot_reload_debounce_ms=skill_config.hot_reload_debounce_ms,
+            roots=config.skill_roots or [],
+            hot_reload=config.skill_hot_reload,
+            hot_reload_debounce_ms=config.skill_hot_reload_debounce_ms,
         ),
     )

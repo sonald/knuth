@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld("knuthDesktop", {
   restartBackend: () => ipcRenderer.invoke("knuth:backend:restart"),
   getSettings: () => ipcRenderer.invoke("knuth:settings:get"),
   saveSettings: (settings) => ipcRenderer.invoke("knuth:settings:save", settings),
+  clearChatgptAuth: () => ipcRenderer.invoke("knuth:settings:clearChatgptAuth"),
   chooseWorkspace: () => ipcRenderer.invoke("knuth:settings:chooseWorkspace"),
   openEventViewer: () => ipcRenderer.invoke("knuth:open-event-viewer"),
 });

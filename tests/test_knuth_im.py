@@ -41,6 +41,19 @@ class KnuthIMRuntimeFactoryTests(unittest.TestCase):
         self.assertIn("grep", names)
         self.assertIn("shell", names)
 
+    def test_build_runtime_accepts_chatgpt_model_without_api_key(self) -> None:
+        env = {"KNUTH_MODEL": "chatgpt/gpt-5.3-codex"}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict(os.environ, env, clear=True):
+                runtime = build_runtime(db_path=Path(temp_dir, "knuth-im.db"))
+
+                async def scenario():
+                    return await runtime.tools()
+
+                names = _tool_names(anyio.run(scenario))
+
+        self.assertIn("read_file", names)
+
     def test_build_runtime_uses_cli_skill_environment_config(self) -> None:
         env = {
             "KNUTH_API_KEY": "test-key",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Mapping
 
@@ -21,6 +22,8 @@ async def build_runtime(
     debug: bool = False,
 ) -> AgentRuntime:
     config = await load_config(config_path, environ)
+    if config.chatgpt_token_dir:
+        os.environ["CHATGPT_TOKEN_DIR"] = config.chatgpt_token_dir
     return build_sqlite_runtime(
         inference_client=LiteLLMInferenceClient(
             model=config.model,

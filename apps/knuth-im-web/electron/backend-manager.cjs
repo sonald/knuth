@@ -99,6 +99,27 @@ async function waitForHealth(baseUrl, timeoutMs = 120_000) {
   throw new Error(`Timed out waiting for backend health at ${baseUrl}/healthz`);
 }
 
+function modelEnvironment(settings) {
+  const env = {
+    KNUTH_AUTH_MODE: settings.authMode || "api_key",
+    KNUTH_MODEL: settings.model,
+    KNUTH_TIMEOUT: String(settings.timeout),
+  };
+  if (settings.authMode === "chatgpt") {
+    env.CHATGPT_TOKEN_DIR = settings.chatgptTokenDir;
+    return env;
+  }
+  env.KNUTH_API_KEY = settings.apiKey;
+  env.KNUTH_BASE_URL = settings.modelBaseUrl;
+  return env;
+}
+
+function parseChatgptDeviceCode(text) {
+  const url = text.match(/Visit\s+(https?:\/\/\S+)/)?.[1];
+  const code = text.match(/Enter code:\s*([A-Z0-9-]+)/)?.[1];
+  return url && code ? { url, code } : null;
+}
+
 class BackendManager {
   constructor({ app, appRoot, logger = console, settingsStore = null }) {
     this.app = app;
@@ -106,6 +127,7 @@ class BackendManager {
     this.logger = logger;
     this.settingsStore = settingsStore;
     this.child = null;
+    this.outputBuffer = "";
     this.state = {
       status: "starting",
       baseUrl: process.env.NEXT_PUBLIC_KNUTH_AGUI_URL || DEFAULT_EXTERNAL_URL,
@@ -143,12 +165,11 @@ class BackendManager {
       return this.state;
     }
 
-    const host = process.env.KNUTH_IM_HOST || DEFAULT_HOST;
-    const port = Number(process.env.KNUTH_IM_PORT || (await getFreePort(host)));
-    const baseUrl = `http://${host}:${port}`;
-    const token = randomToken();
     const settings = this.resolveModelSettings();
     if (!settings.ready) {
+      const host = process.env.KNUTH_IM_HOST || DEFAULT_HOST;
+      const port = Number(process.env.KNUTH_IM_PORT || 8000);
+      const baseUrl = `http://${host}:${port}`;
       this.state = {
         status: "needs_settings",
         baseUrl,
@@ -161,6 +182,10 @@ class BackendManager {
       return this.state;
     }
 
+    const host = process.env.KNUTH_IM_HOST || DEFAULT_HOST;
+    const port = Number(process.env.KNUTH_IM_PORT || (await getFreePort(host)));
+    const baseUrl = `http://${host}:${port}`;
+    const token = randomToken();
     const workspace = settings.workspace || localWorkspace(this.app, this.appRoot);
     const dbPath =
       settings.dbPath ||
@@ -193,25 +218,28 @@ class BackendManager {
       settings: publicSettings(settings),
     };
 
+    const childEnv = {
+      ...process.env,
+      ...modelEnvironment(settings),
+      KNUTH_IM_AUTH_TOKEN: token,
+    };
+    if (settings.authMode === "chatgpt") {
+      delete childEnv.KNUTH_API_KEY;
+      delete childEnv.KNUTH_BASE_URL;
+    }
+
     this.child = spawn(command.command, args, {
       cwd: command.cwd,
-      env: {
-        ...process.env,
-        KNUTH_IM_AUTH_TOKEN: token,
-        KNUTH_API_KEY: settings.apiKey,
-        KNUTH_BASE_URL: settings.modelBaseUrl,
-        KNUTH_MODEL: settings.model,
-        KNUTH_TIMEOUT: String(settings.timeout),
-      },
+      env: childEnv,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
 
     this.child.stdout.on("data", (chunk) => {
-      this.logger.info(`[knuth-im] ${chunk.toString().trimEnd()}`);
+      this._recordOutput(chunk, "info");
     });
     this.child.stderr.on("data", (chunk) => {
-      this.logger.warn(`[knuth-im] ${chunk.toString().trimEnd()}`);
+      this._recordOutput(chunk, "warn");
     });
     this.child.on("exit", (code, signal) => {
       if (this.state.status === "ready") {
@@ -298,6 +326,21 @@ class BackendManager {
     }
     this.child = null;
   }
+
+  _recordOutput(chunk, level) {
+    const text = chunk.toString();
+    this.logger[level](`[knuth-im] ${text.trimEnd()}`);
+    this.outputBuffer = `${this.outputBuffer}${text}`.slice(-2000);
+    const login = parseChatgptDeviceCode(this.outputBuffer);
+    if (login) {
+      this.state = {
+        ...this.state,
+        status: "login_required",
+        chatgptLogin: login,
+        error: "ChatGPT login required",
+      };
+    }
+  }
 }
 
 function publicSettings(settings) {
@@ -308,5 +351,7 @@ function publicSettings(settings) {
 module.exports = {
   BackendManager,
   getFreePort,
+  modelEnvironment,
+  parseChatgptDeviceCode,
   waitForHealth,
 };

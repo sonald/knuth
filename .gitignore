@@ -13,3 +13,4 @@ wheels/
 # Local secrets and runtime configuration
 .env
 .zcache
+/~/
