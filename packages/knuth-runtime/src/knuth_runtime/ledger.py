@@ -33,7 +33,10 @@ from knuth.core.runs import AgentRun
 from knuth.core.runtime_events import (
     ApprovalRequestedDraft,
     ApprovalResolvedDraft,
+    CheckpointTapeMessage,
     ConversationNoticeDraft,
+    MessageProjectionCheckpoint,
+    MessageProjectionCheckpointDraft,
     MessageRewriteAnchor,
     MessageRewriteAnchorDraft,
     MessageRewriteMessageDraft,
@@ -105,6 +108,21 @@ class RefoldStats:
     events: int
 
 
+@dataclass(frozen=True)
+class MessageProjectionCheckpointRecord:
+    """Narrow read view returned by the projection-checkpoint query.
+
+    Exposes only the bits the loader needs to build an initial tape — seq for
+    audit/log, through_seq to compute the tail event window, and the captured
+    model-visible messages. The full envelope (run_id, id, created_at) stays
+    inside the ledger; consumers should not depend on durable event identity.
+    """
+
+    seq: int
+    through_seq: int
+    messages: tuple[CheckpointTapeMessage, ...]
+
+
 class RunLedger(Protocol):
     async def create_run(self, query: str, run_id: str | None = None) -> AgentRun:
         ...
@@ -130,6 +148,35 @@ class RunLedger(Protocol):
     async def list_events(
         self, run_id: str, after_seq: int | None = None
     ) -> list[StoredRuntimeEvent]:
+        ...
+
+    async def list_message_projection_events(
+        self,
+        run_id: str,
+        *,
+        after_seq: int | None = None,
+        through_seq: int | None = None,
+    ) -> list[StoredRuntimeEvent]:
+        """Tail-fold window for ``MessageTape`` reconstruction.
+
+        Always excludes ``message.projection_checkpoint`` events: the tape fold
+        ignores them by contract, and the loader uses
+        :meth:`latest_message_projection_checkpoint` for the baseline instead.
+        """
+        ...
+
+    async def latest_message_projection_checkpoint(
+        self,
+        run_id: str,
+        *,
+        before_seq: int | None = None,
+    ) -> MessageProjectionCheckpointRecord | None:
+        """Return the newest usable checkpoint, or ``None``.
+
+        ``before_seq`` lets the loader walk older candidates if the newest one
+        was rejected by validation. Implementations may scan in any order so
+        long as they honor the ``seq < before_seq`` filter when set.
+        """
         ...
 
     async def run_state(self, run_id: str) -> RunLedgerState:
@@ -997,6 +1044,43 @@ def _reduce_verification_failed(
     return ctx.mutations
 
 
+@_reduces(MessageProjectionCheckpointDraft)
+def _reduce_message_projection_checkpoint(
+    ctx: _ReduceContext, draft: MessageProjectionCheckpointDraft
+) -> _Mutations:
+    # Cache facts only land on closed conversation boundaries: open tool
+    # batches mean observations are still missing, and waiting/recovery states
+    # leave the run mid-decision. ``through_seq`` must mark the last durable
+    # event the writer folded — i.e. the event immediately before this one
+    # (``view.run.last_seq``); ``ctx.run.last_seq`` already advanced.
+    assert ctx.view.run is not None
+    pre_append_last_seq = ctx.view.run.last_seq
+    _require(
+        ctx.run.open_batch_id is None,
+        "message.projection_checkpoint requires no open tool batch",
+    )
+    _require(
+        ctx.run.status
+        not in {RunStatus.WAITING_APPROVAL, RunStatus.WAITING_TOOL_RESULT},
+        "message.projection_checkpoint cannot land while waiting for approval"
+        " or tool result",
+    )
+    _require(
+        draft.through_seq == pre_append_last_seq,
+        f"message.projection_checkpoint through_seq {draft.through_seq} does"
+        f" not match run.last_seq {pre_append_last_seq}",
+    )
+    _require(
+        bool(draft.messages),
+        "message.projection_checkpoint requires at least one message; a buggy"
+        " writer must not persist an empty cache fact that the loader would"
+        " treat as 'this run has no projection'",
+    )
+    # Run/tool/approval projections do not change; only run.updated_at and
+    # last_seq advance via the default ``mutations.run`` copy.
+    return ctx.mutations
+
+
 @_reduces(MessageRewriteAnchorDraft)
 def _reduce_message_rewrite_anchor(
     ctx: _ReduceContext, draft: MessageRewriteAnchorDraft
@@ -1406,6 +1490,43 @@ class MemoryRunLedger(_LedgerMixin[None]):
             return list(events)
         return [event for event in events if event.seq > after_seq]
 
+    async def list_message_projection_events(
+        self,
+        run_id: str,
+        *,
+        after_seq: int | None = None,
+        through_seq: int | None = None,
+    ) -> list[StoredRuntimeEvent]:
+        # Mirror the SQL window: exclude checkpoint events, then bound by seq.
+        out: list[StoredRuntimeEvent] = []
+        for event in self._events.get(run_id, []):
+            if event.type == "message.projection_checkpoint":
+                continue
+            if after_seq is not None and event.seq <= after_seq:
+                continue
+            if through_seq is not None and event.seq > through_seq:
+                continue
+            out.append(event)
+        return out
+
+    async def latest_message_projection_checkpoint(
+        self,
+        run_id: str,
+        *,
+        before_seq: int | None = None,
+    ) -> MessageProjectionCheckpointRecord | None:
+        for event in reversed(self._events.get(run_id, [])):
+            if event.type != "message.projection_checkpoint":
+                continue
+            if before_seq is not None and event.seq >= before_seq:
+                continue
+            return MessageProjectionCheckpointRecord(
+                seq=event.seq,
+                through_seq=event.through_seq,
+                messages=tuple(event.messages),
+            )
+        return None
+
     async def run_state(self, run_id: str) -> RunLedgerState:
         run = await self.get_run(run_id)
         pending = tuple(
@@ -1767,6 +1888,75 @@ class SQLiteRunLedger(_LedgerMixin[sqlite3.Connection]):
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [parse_stored_runtime_event_json(row[0]) for row in rows]
+
+    @_threaded
+    def list_message_projection_events(
+        self,
+        run_id: str,
+        *,
+        after_seq: int | None = None,
+        through_seq: int | None = None,
+    ) -> list[StoredRuntimeEvent]:
+        # Filter checkpoint events at the SQL layer so the tail fold cost is
+        # linear in actual projection events, not in stored cache writes.
+        sql = (
+            "select event_json from events"
+            " where run_id = ? and type != 'message.projection_checkpoint'"
+        )
+        params: tuple[SQLiteParam, ...] = (run_id,)
+        if after_seq is not None:
+            sql += " and seq > ?"
+            params += (after_seq,)
+        if through_seq is not None:
+            sql += " and seq <= ?"
+            params += (through_seq,)
+        sql += " order by seq"
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [parse_stored_runtime_event_json(row[0]) for row in rows]
+
+    @_threaded
+    def latest_message_projection_checkpoint(
+        self,
+        run_id: str,
+        *,
+        before_seq: int | None = None,
+    ) -> MessageProjectionCheckpointRecord | None:
+        # First version leans on the existing ``(run_id, seq)`` ordering: the
+        # type filter then a descending seq scan picks up the newest matching
+        # row. A partial index can be introduced later if this becomes a hot
+        # path on long runs.
+        sql = (
+            "select event_json, seq from events"
+            " where run_id = ? and type = 'message.projection_checkpoint'"
+        )
+        params: tuple[SQLiteParam, ...] = (run_id,)
+        if before_seq is not None:
+            sql += " and seq < ?"
+            params += (before_seq,)
+        sql += " order by seq desc"
+        with self._connect() as conn:
+            cursor = conn.execute(sql, params)
+            # Walk descending rows until one parses cleanly. ADR-011 makes
+            # corrupt-checkpoint fallback the loader's job, but returning
+            # ``None`` on the first unparseable row would hide every older
+            # candidate from ``before_seq`` walks. We iterate here so the
+            # caller's ``before_seq`` cursor advances by seq, not by 'first
+            # parseable seq'.
+            for row in cursor:
+                event_json, row_seq = row
+                try:
+                    event = parse_stored_runtime_event_json(event_json)
+                except Exception:
+                    continue
+                if event.type != "message.projection_checkpoint":
+                    continue
+                return MessageProjectionCheckpointRecord(
+                    seq=event.seq,
+                    through_seq=event.through_seq,
+                    messages=tuple(event.messages),
+                )
+        return None
 
     @_threaded
     def run_state(self, run_id: str) -> RunLedgerState:

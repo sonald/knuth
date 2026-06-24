@@ -665,14 +665,26 @@ async def _commit_completion_artifacts(
 
 async def _run_after_turn_closed(invocation: RuntimeInvocation) -> None:
     runner = invocation.services.message_middleware_runner
-    if runner is None:
+    if runner is not None:
+        try:
+            await runner.run_checkpoint(
+                invocation.run_id,
+                MessageMiddlewareCheckpoint.AFTER_TURN_CLOSED,
+            )
+        except Exception:
+            # Middleware failures here are non-fatal; the BEFORE_MODEL_REQUEST
+            # boundary will retry on the next turn. The projection-checkpoint
+            # writer still gets a chance below because its safe-boundary check
+            # consults durable run state, not the middleware outcome.
+            pass
+    writer = invocation.services.projection_checkpoint_writer
+    if writer is None:
         return
     try:
-        await runner.run_checkpoint(
-            invocation.run_id,
-            MessageMiddlewareCheckpoint.AFTER_TURN_CLOSED,
-        )
+        await writer.maybe_append(invocation.run_id)
     except Exception:
+        # Writer is a maintenance cache. Any failure is logged inside the
+        # writer; surface nothing to the loop.
         return
 
 

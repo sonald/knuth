@@ -58,6 +58,10 @@ from knuth_runtime.observation import (
     RuntimeEventOverflowPolicy,
     RuntimeObservationError,
 )
+from knuth_runtime.projection_checkpoint import (
+    ProjectionCheckpointPolicy,
+    ProjectionCheckpointWriter,
+)
 from knuth_runtime.result import RunResult
 from knuth_runtime.session import RunSession
 
@@ -83,6 +87,8 @@ __all__ = [
     "MessageMiddlewareRunner",
     "ObservationCondensationMiddleware",
     "OpenToolBatch",
+    "ProjectionCheckpointPolicy",
+    "ProjectionCheckpointWriter",
     "RefoldStats",
     "RegexSecretRedactor",
     "ReplacePatch",

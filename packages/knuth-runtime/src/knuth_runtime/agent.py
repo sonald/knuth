@@ -45,6 +45,10 @@ from knuth_runtime.middleware import (
     MessageMiddlewareRunner,
     ObservationCondensationMiddleware,
 )
+from knuth_runtime.projection_checkpoint import (
+    ProjectionCheckpointPolicy,
+    ProjectionCheckpointWriter,
+)
 from knuth_runtime.skills import (
     SkillReminderMiddleware,
     SkillRuntimeConfig,
@@ -536,6 +540,7 @@ def build_sqlite_runtime(
         ledger=ledger,
         artifact_store=artifact_store,
         message_middleware_runner=message_middleware_runner,
+        projection_checkpoint_writer=ProjectionCheckpointWriter(ledger),
         skill_hot_reload_service=skill_hot_reload_service,
         context_builder=ContextBuilder(
             ledger,
@@ -613,6 +618,7 @@ def build_memory_runtime(
         ledger=ledger,
         artifact_store=artifact_store,
         message_middleware_runner=message_middleware_runner,
+        projection_checkpoint_writer=ProjectionCheckpointWriter(ledger),
         skill_hot_reload_service=skill_hot_reload_service,
         context_builder=ContextBuilder(
             ledger,

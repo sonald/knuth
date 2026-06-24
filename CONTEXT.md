@@ -136,6 +136,14 @@ _Avoid_: log line, debug trace, transient delta, snapshot dump
 A derived, rebuildable read model (runs, tool invocations, approvals, conversation) computed by folding decision events. It is updated synchronously in the same transaction as the event append and can always be dropped and refolded; changing a projection's schema is not a data migration. Event type shapes are the only durable contract.
 _Avoid_: authoritative state, source of truth, cache that can silently drift
 
+**MessageProjectionCheckpoint**:
+A durable cache fact that stores a folded model-visible `MessageTape` projection through a specific event sequence boundary so future conversation loads can start from that tape and fold only later events. It is ignored by run, tool, and approval reducers, can be skipped or rebuilt without changing semantics, and does not include the system preamble, tool list, runtime state, or suppressed historical messages.
+_Avoid_: run checkpoint, runtime snapshot, decision event, message rewrite, full prompt dump
+
+**ProjectionCheckpointWriter**:
+The runtime-owned maintenance component that appends `MessageProjectionCheckpoint` facts after a safe conversation boundary, using an already-stable message projection. It is not a `MessageMiddleware`, does not produce patches, and must not change which messages the model sees.
+_Avoid_: middleware, compaction algorithm, context builder, projection reducer
+
 **ToolInvocation**:
 The per-tool-call state machine projection, keyed by `tool_call_id` and carrying `args_hash`, `effect`, and `risk`. Its states are proposed, awaiting_approval, approved, waiting_tool_result, denied, running, succeeded, failed, interrupted, and unknown. It is the unit the agent loop schedules and the unit crash recovery reasons about; it subsumes what other designs call a pending action or execution record. During an active interrupt, the tool/provider reports the outcome cooperatively; `effect` and `risk` are conservative fallback inputs when the runtime loses contact or receives no reliable outcome, not a replacement for the tool's own report. For non-dangerous/non-external-write tools cancelled by user stop with no more precise outcome, the fallback is interrupted, not failed.
 _Avoid_: tool intent, pending action, execution log entry, queue item

@@ -9,6 +9,7 @@ from knuth_runtime.context import ContextBuilder
 from knuth_runtime.artifacts import FilesystemArtifactStore
 from knuth_runtime.ledger import RunLedger
 from knuth_runtime.middleware import MessageMiddlewareRunner
+from knuth_runtime.projection_checkpoint import ProjectionCheckpointWriter
 
 
 @dataclass
@@ -19,4 +20,5 @@ class RuntimeServices:
     artifact_store: FilesystemArtifactStore
     context_builder: ContextBuilder
     message_middleware_runner: MessageMiddlewareRunner | None = None
+    projection_checkpoint_writer: ProjectionCheckpointWriter | None = None
     skill_hot_reload_service: SkillHotReloadService | None = None

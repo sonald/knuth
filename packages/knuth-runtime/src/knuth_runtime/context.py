@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from abc import ABC, abstractmethod
-from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import Field
@@ -15,12 +15,19 @@ from knuth.core.messages import (
     SystemSection,
     SystemSectionSource,
 )
-from knuth.core.runtime_events import ContextSnapshot, InsertPosition
-from knuth.core.runtime_events import ledger_message_id
+from knuth.core.runtime_events import (
+    CheckpointTapeMessage,
+    ContextSnapshot,
+    InsertPosition,
+    TapeItemSource,
+    ledger_message_id,
+)
 from knuth.core.types import KnuthModel
 from knuth_toold import ToolBroker
 
 from knuth_runtime.ledger import RunLedger
+
+_LOG = logging.getLogger(__name__)
 
 _PREAMBLE_SEPARATOR = "\n\n"
 
@@ -48,11 +55,6 @@ class ContextView(KnuthModel):
     tools: list[dict[str, Any]]
     snapshot: ContextSnapshot | None = None
     diagnostics: dict[str, Any] = Field(default_factory=dict)
-
-
-class TapeItemSource(StrEnum):
-    LEDGER = "ledger"
-    MIDDLEWARE = "middleware"
 
 
 class TapeMessage(KnuthModel):
@@ -206,8 +208,7 @@ class ContextBuilder:
         self,
         ctx: RunContext,
     ) -> ContextView:
-        events = await self.ledger.list_events(ctx.run_id)
-        tape = await reconstruct_message_tape_from_events(events)
+        tape = await load_message_tape(self.ledger, ctx.run_id)
         messages = tape.model_context_messages()
         preamble = await self._preamble(ctx)
         if preamble:
@@ -264,16 +265,138 @@ async def raw_ledger_messages_from_events(
     return tape.raw_ledger_messages()
 
 
+def _checkpoint_initial_tape(messages: tuple[CheckpointTapeMessage, ...]) -> MessageTape:
+    """Materialize the checkpoint payload as the baseline tape for tail folds.
+
+    Only model-visible items are stored, so no ``TapeAnchor`` is reconstructed:
+    rewrites the checkpoint captured are already collapsed into the stored
+    message sequence. Identity (``id``, ``origin``, ``metadata``) survives so
+    middleware patches that target a pre-checkpoint message still match.
+    """
+    return MessageTape(
+        items=[
+            TapeMessage(
+                id=entry.id,
+                message=entry.message,
+                origin=entry.origin,
+                metadata=dict(entry.metadata),
+            )
+            for entry in messages
+        ]
+    )
+
+
+async def load_message_tape(ledger: "RunLedger", run_id: str) -> MessageTape:
+    """Shared read entry: latest valid checkpoint + tail fold, with full-replay
+    fallback.
+
+    The loader walks checkpoint candidates newest-first; corrupt or
+    invalid-``through_seq`` records are skipped without a durable failure
+    event, since the contract is that a bad cache only causes a performance
+    regression, never a read failure. Bad-cache fallbacks are diagnostic
+    logged (ADR-011 "第一版本只记录 diagnostics / debug log").
+    """
+    try:
+        run = await ledger.get_run(run_id)
+        run_last_seq = run.last_seq
+    except KeyError:
+        run_last_seq = None
+    before_seq: int | None = None
+    while True:
+        checkpoint = await ledger.latest_message_projection_checkpoint(
+            run_id, before_seq=before_seq
+        )
+        if checkpoint is None:
+            break
+        if checkpoint.through_seq < 0 or (
+            run_last_seq is not None and checkpoint.through_seq > run_last_seq
+        ):
+            _LOG.debug(
+                "projection checkpoint skipped: through_seq out of range",
+                extra={
+                    "run_id": run_id,
+                    "checkpoint_seq": checkpoint.seq,
+                    "through_seq": checkpoint.through_seq,
+                    "run_last_seq": run_last_seq,
+                },
+            )
+            before_seq = checkpoint.seq
+            continue
+        try:
+            initial = _checkpoint_initial_tape(checkpoint.messages)
+            tail = await ledger.list_message_projection_events(
+                run_id, after_seq=checkpoint.through_seq
+            )
+            return await fold_message_tape(initial, tail)
+        except Exception:
+            # Bad checkpoint payload (schema break, fold error reading the
+            # baseline): log diagnostic and try the next-older candidate. ADR
+            # requires only perf regression, not a read failure.
+            _LOG.warning(
+                "projection checkpoint skipped: fast-path fold failed",
+                extra={
+                    "run_id": run_id,
+                    "checkpoint_seq": checkpoint.seq,
+                    "through_seq": checkpoint.through_seq,
+                },
+                exc_info=True,
+            )
+            before_seq = checkpoint.seq
+            continue
+    events = await ledger.list_message_projection_events(run_id)
+    return await reconstruct_message_tape_from_events(events)
+
+
+async def load_message_tape_without_checkpoint(
+    ledger: "RunLedger",
+    run_id: str,
+    *,
+    through_seq: int,
+) -> MessageTape:
+    """Writer-facing fold: replay raw projection events up to a fixed seq.
+
+    Used by :class:`ProjectionCheckpointWriter` to produce the payload it then
+    appends. Never consults existing checkpoints so a new cache write does not
+    inherit corruption from an old one.
+    """
+    events = await ledger.list_message_projection_events(
+        run_id, through_seq=through_seq
+    )
+    return await reconstruct_message_tape_from_events(events)
+
+
 async def reconstruct_message_tape_from_events(
     events: list[RuntimeEvent],
 ) -> MessageTape:
+    """Full-replay entry point: fold an event sequence onto an empty tape.
+
+    Kept as a thin wrapper around :func:`fold_message_tape` so any callers that
+    want a from-scratch fold do not have to know about the empty-initial
+    convention.
+    """
+    return await fold_message_tape(MessageTape(items=[]), events)
+
+
+async def fold_message_tape(
+    initial: MessageTape,
+    events: list[RuntimeEvent],
+) -> MessageTape:
     """Conversation fold: a closed, typed mapping from decision events to the
-    message sequence. Aggregate invariants guarantee the result is always a
-    provider-valid sequence, so no defensive repair happens here."""
-    items: list[TapeItem] = []
+    message sequence.
+
+    The caller supplies an already-folded ``initial`` tape — typically empty
+    for a full replay, or a checkpoint-derived prefix for the fast path. Tail
+    folds intentionally ignore ``message.projection_checkpoint`` events so a
+    full replay always agrees with the checkpoint fast path.
+    """
+    items: list[TapeItem] = list(initial.items)
     rewrite_records: list[MessageRewriteRecord] = []
     open_rewrites: dict[str, MessageRewriteRecord] = {}
     for event in events:
+        if event.type == "message.projection_checkpoint":
+            # Checkpoints are projection cache facts, not decision events; they
+            # never modify the model-visible message sequence.
+            continue
         if event.type == "user.message":
             items.append(
                 TapeMessage(

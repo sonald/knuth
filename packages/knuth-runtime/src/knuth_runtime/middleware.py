@@ -20,7 +20,7 @@ from knuth_runtime.context import (
     TapeAnchor,
     TapeItemSource,
     TapeMessage,
-    reconstruct_message_tape_from_events,
+    load_message_tape,
     validate_provider_messages,
 )
 from knuth_runtime.ledger import RunLedger
@@ -140,8 +140,7 @@ class MessageMiddlewareRunner:
             checkpoint=checkpoint,
             turn_start_id=turn_start_id,
         )
-        events = await self.ledger.list_events(run_id)
-        tape = await reconstruct_message_tape_from_events(events)
+        tape = await load_message_tape(self.ledger, run_id)
         for middleware in candidates:
             messages = tuple(tape.model_visible())
             patches = await middleware.process(ctx, messages)
@@ -154,8 +153,7 @@ class MessageMiddlewareRunner:
                 for draft in self._compile_durable_patch(middleware, patch)
             ]
             await self.ledger.apply_many(run_id, drafts)
-            events = await self.ledger.list_events(run_id)
-            tape = await reconstruct_message_tape_from_events(events)
+            tape = await load_message_tape(self.ledger, run_id)
 
     def _validate_patch_plan(
         self,

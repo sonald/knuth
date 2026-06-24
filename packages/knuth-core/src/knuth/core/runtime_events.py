@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Any, Literal
 
 from pydantic import Field
@@ -12,6 +13,32 @@ from knuth.core.invocations import (
 )
 from knuth.core.messages import InferenceMessage, ToolCall
 from knuth.core.types import ErrorInfo, EventDurability, KnuthModel, RunStatus
+
+
+class TapeItemSource(StrEnum):
+    """Origin tag carried by every model-visible ``TapeMessage`` so projections
+    can distinguish raw ledger facts from middleware rewrites without scanning
+    event types."""
+
+    LEDGER = "ledger"
+    MIDDLEWARE = "middleware"
+
+
+class CheckpointTapeMessage(KnuthModel):
+    """One model-visible projection entry serialized into a checkpoint payload.
+
+    A checkpoint stores enough of each ``TapeMessage`` for middleware rewrites
+    to keep targeting the same items after a fast-path load: stable ``id``, the
+    provider-facing ``InferenceMessage``, the ``TapeItemSource``, and any
+    semantic metadata. ``TapeAnchor`` items are intentionally not stored — they
+    are projection-only suppress markers and are reconstructed from suppressing
+    items inside the stored set on load.
+    """
+
+    id: str
+    message: InferenceMessage
+    origin: TapeItemSource
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ContextSnapshot(KnuthModel):
@@ -240,6 +267,21 @@ class MessageRewriteMessageDraft(RuntimeEventDraftBase):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class MessageProjectionCheckpointDraft(RuntimeEventDraftBase):
+    """A durable cache fact: the folded model-visible tape through a sequence
+    boundary.
+
+    The reducer treats this event as a no-op for run/tool/approval projections;
+    only the ``through_seq == current run.last_seq`` invariant is enforced when
+    the event is appended. The ``MessageTape`` fold ignores this event so a
+    full replay always agrees with the checkpoint fast path.
+    """
+
+    type: Literal["message.projection_checkpoint"] = "message.projection_checkpoint"
+    through_seq: int
+    messages: list[CheckpointTapeMessage] = Field(default_factory=list)
+
+
 DurableRuntimeEventDraft = (
     RunCreatedDraft
     | UserMessageDraft
@@ -266,6 +308,7 @@ DurableRuntimeEventDraft = (
     | VerificationFailedDraft
     | MessageRewriteAnchorDraft
     | MessageRewriteMessageDraft
+    | MessageProjectionCheckpointDraft
 )
 
 
@@ -468,6 +511,12 @@ class MessageRewriteMessage(MessageRewriteMessageDraft, StoredRuntimeEventBase):
     message_id: str
 
 
+class MessageProjectionCheckpoint(
+    MessageProjectionCheckpointDraft, StoredRuntimeEventBase
+):
+    pass
+
+
 class ContextSystemPreambleBuilt(
     ContextSystemPreambleBuiltDraft, TransientRuntimeEventBase
 ):
@@ -532,6 +581,7 @@ StoredRuntimeEvent = (
     | VerificationFailed
     | MessageRewriteAnchor
     | MessageRewriteMessage
+    | MessageProjectionCheckpoint
 )
 
 TransientRuntimeEvent = (
