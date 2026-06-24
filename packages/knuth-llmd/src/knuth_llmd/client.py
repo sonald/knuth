@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import warnings
 from collections.abc import Callable
 from typing import Any, AsyncIterator, Mapping, Protocol, Sequence
 from uuid import uuid4
@@ -249,7 +251,7 @@ class StreamAccumulator:
             arguments = _get(raw_function, "arguments")
             if isinstance(arguments, str):
                 current["arguments_json"] += arguments
-            current["raw"] = _to_plain(raw_call)
+            current["raw"] = {**current["raw"], **_to_plain(raw_call)}
             if isinstance(name, str) or isinstance(arguments, str):
                 events.append(
                     (
@@ -333,12 +335,14 @@ class LiteLLMInferenceClient:
         base_url: str | None = None,
         api_key: str | None = None,
         completion_fn: Callable[..., object] | None = None,
+        responses_fn: Callable[..., object] | None = None,
         timeout: float = 60.0,
     ) -> None:
         self._model = model
         self._base_url = base_url
         self._api_key = api_key
         self._completion_fn = completion_fn or _default_completion_fn
+        self._responses_fn = responses_fn or _default_responses_fn
         self._timeout = timeout
 
     @property
@@ -375,16 +379,28 @@ class LiteLLMInferenceClient:
 
         accumulator = StreamAccumulator()
         try:
-            kwargs = self._completion_kwargs(
-                config=config,
-                messages=messages,
-                stream=True,
-                tools=tools,
-            )
+            model = _litellm_model_name(self._model)
+            use_responses = _is_chatgpt_model(model)
+            if use_responses:
+                kwargs = self._responses_kwargs(
+                    config=config,
+                    messages=messages,
+                    stream=True,
+                    tools=tools,
+                )
+                request_fn = self._responses_fn
+            else:
+                kwargs = self._completion_kwargs(
+                    config=config,
+                    messages=messages,
+                    stream=True,
+                    tools=tools,
+                )
+                request_fn = self._completion_fn
             # The initial request await (TTFT) must be wakeable by the signal,
             # not just observed after the first chunk arrives.
             response, interrupted = await _await_or_interrupt(
-                signal, lambda: self._completion_fn(**kwargs)
+                signal, lambda: request_fn(**kwargs)
             )
             if interrupted:
                 yield event(InferenceAborted, {"reason": _signal_reason(signal)})
@@ -393,8 +409,14 @@ class LiteLLMInferenceClient:
                 if _signal_interrupted(signal):
                     yield event(InferenceAborted, {"reason": _signal_reason(signal)})
                     return
-                for event_class, fields in accumulator.feed_chunk(chunk):
-                    yield event(event_class, fields)
+                chunks = (
+                    _responses_event_to_completion_chunks(chunk)
+                    if use_responses
+                    else [chunk]
+                )
+                for normalized in chunks:
+                    for event_class, fields in accumulator.feed_chunk(normalized):
+                        yield event(event_class, fields)
             for event_class, fields in accumulator.finish():
                 yield event(event_class, fields)
             yield event(
@@ -428,7 +450,7 @@ class LiteLLMInferenceClient:
             kwargs["api_key"] = self._api_key
         if config.temperature is not None:
             kwargs["temperature"] = config.temperature
-        if config.max_output_tokens is not None:
+        if config.max_output_tokens is not None and not _is_chatgpt_model(model):
             kwargs["max_tokens"] = config.max_output_tokens
         kwargs.update(config.provider_options)
         return kwargs
@@ -454,6 +476,29 @@ class LiteLLMInferenceClient:
             kwargs["tool_choice"] = "auto"
         return kwargs
 
+    def _responses_kwargs(
+        self,
+        *,
+        config: InferenceConfig,
+        messages: Sequence[InferenceMessage],
+        stream: bool,
+        tools: Sequence[dict[str, Any]],
+    ) -> dict[str, object]:
+        kwargs = self._base_kwargs(config)
+        kwargs.update(
+            {
+                "input": _to_responses_input(messages),
+                "stream": stream,
+                "parallel_tool_calls": False,
+            }
+        )
+        if _is_chatgpt_model(str(kwargs["model"])):
+            kwargs["no-log"] = True
+        if tools:
+            kwargs["tools"] = [_to_responses_tool(tool) for tool in tools]
+            kwargs["tool_choice"] = "auto"
+        return kwargs
+
 
 def _litellm_model_name(model: str) -> str:
     if "/" in model:
@@ -461,12 +506,242 @@ def _litellm_model_name(model: str) -> str:
     return f"openai/{model}"
 
 
+def _is_chatgpt_model(model: str) -> bool:
+    return model.startswith("chatgpt/")
+
+
+_CHATGPT_STREAMING_PATCH_LOCK = anyio.Lock()
+
+
+def _knuth_env_snapshot() -> dict[str, str]:
+    return {key: value for key, value in os.environ.items() if key.startswith("KNUTH_")}
+
+
+def _restore_knuth_env(snapshot: Mapping[str, str]) -> None:
+    for key in list(os.environ):
+        if key.startswith("KNUTH_") and key not in snapshot:
+            del os.environ[key]
+    os.environ.update(snapshot)
+
+
+def _import_litellm_preserving_knuth_env():
+    snapshot = _knuth_env_snapshot()
+    try:
+        import litellm
+    finally:
+        _restore_knuth_env(snapshot)
+    return litellm
+
+
+def _install_litellm_response_usage_warning_filter() -> None:
+    message_pattern = r"(?s)^Pydantic serializer warnings:.*ResponseAPIUsage"
+    for action, message, category, _module, _lineno in warnings.filters:
+        if (
+            action == "ignore"
+            and getattr(message, "pattern", None) == message_pattern
+            and category is UserWarning
+        ):
+            return
+    warnings.filterwarnings(
+        "ignore",
+        message=message_pattern,
+        category=UserWarning,
+    )
+
+
 async def _default_completion_fn(**kwargs: object) -> object:
-    import litellm
+    litellm = _import_litellm_preserving_knuth_env()
     from litellm import acompletion
 
     litellm.suppress_debug_info = True  # keep "Give Feedback" banners out of the CLI
     return await acompletion(**kwargs)
+
+
+async def _default_responses_fn(**kwargs: object) -> object:
+    litellm = _import_litellm_preserving_knuth_env()
+    from litellm import aresponses
+
+    litellm.suppress_debug_info = True  # keep "Give Feedback" banners out of the CLI
+    model = kwargs.get("model")
+    if not isinstance(model, str) or not _is_chatgpt_model(model):
+        return await aresponses(**kwargs)
+    _install_litellm_response_usage_warning_filter()
+
+    original_supports_native_streaming = litellm.utils.supports_native_streaming
+
+    def supports_chatgpt_native_streaming(
+        model: str, custom_llm_provider: str | None = None
+    ) -> bool:
+        if custom_llm_provider == "chatgpt" or _is_chatgpt_model(model):
+            return True
+        return original_supports_native_streaming(model, custom_llm_provider)
+
+    async with _CHATGPT_STREAMING_PATCH_LOCK:
+        litellm.utils.supports_native_streaming = supports_chatgpt_native_streaming
+        try:
+            return await aresponses(**kwargs)
+        finally:
+            litellm.utils.supports_native_streaming = original_supports_native_streaming
+
+
+def _to_responses_input(messages: Sequence[InferenceMessage]) -> list[dict[str, Any]]:
+    input_items: list[dict[str, Any]] = []
+    call_ids_by_item_id: dict[str, str] = {}
+    for message in messages:
+        input_items.extend(_to_responses_input_items(message, call_ids_by_item_id))
+    return input_items
+
+
+def _to_responses_input_items(
+    message: InferenceMessage, call_ids_by_item_id: dict[str, str]
+) -> list[dict[str, Any]]:
+    if message.role == InferenceRole.TOOL_RESULT:
+        call_id = call_ids_by_item_id.get(message.tool_call_id or "")
+        return [
+            {
+                "type": "function_call_output",
+                "call_id": call_id or message.tool_call_id or "",
+                "output": message.content or "",
+            }
+        ]
+    if message.role == InferenceRole.ASSISTANT and message.tool_calls:
+        items: list[dict[str, Any]] = []
+        if message.content:
+            items.append({"role": "assistant", "content": message.content})
+        for call in message.tool_calls:
+            responses_call_id = call.raw.get("responses_call_id")
+            if isinstance(responses_call_id, str) and call.tool_call_id:
+                call_ids_by_item_id[call.tool_call_id] = responses_call_id
+        items.extend(
+            {
+                "type": "function_call",
+                "id": call.tool_call_id,
+                "call_id": call.raw.get("responses_call_id") or call.effective_id,
+                "name": call.name,
+                "arguments": call.arguments_as_json(),
+            }
+            for call in message.tool_calls
+        )
+        return items
+    return [
+        {
+            "role": message.role.value,
+            "content": message.content or "",
+        }
+    ]
+
+
+def _to_responses_tool(tool: dict[str, Any]) -> dict[str, Any]:
+    if tool.get("type") != "function" or not isinstance(tool.get("function"), Mapping):
+        return dict(tool)
+    function = tool["function"]
+    responses_tool: dict[str, Any] = {
+        "type": "function",
+        "name": function.get("name"),
+    }
+    if "description" in function:
+        responses_tool["description"] = function["description"]
+    if "parameters" in function:
+        responses_tool["parameters"] = function["parameters"]
+    return responses_tool
+
+
+def _responses_event_to_completion_chunks(event: object) -> list[dict[str, Any]]:
+    event_type = _get(event, "type")
+    if event_type == "response.output_text.delta":
+        delta = _get(event, "delta")
+        if isinstance(delta, str) and delta:
+            return [{"choices": [{"delta": {"content": delta}}]}]
+        return []
+    if event_type == "response.reasoning_summary_text.delta":
+        delta = _get(event, "delta")
+        if isinstance(delta, str) and delta:
+            return [{"choices": [{"delta": {"reasoning_content": delta}}]}]
+        return []
+    if event_type == "response.output_item.added":
+        item = _get(event, "item") or {}
+        if _get(item, "type") != "function_call":
+            return []
+        output_index = _get(event, "output_index")
+        index = output_index if isinstance(output_index, int) else 0
+        item_id = _string_or_none(_get(item, "id"))
+        call_id = _string_or_none(_get(item, "call_id")) or item_id
+        name = _string_or_none(_get(item, "name"))
+        return [
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": index,
+                                    "id": item_id or call_id,
+                                    "responses_call_id": call_id,
+                                    "function": {
+                                        "name": name or "",
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        ]
+    if event_type == "response.output_item.done":
+        item = _get(event, "item") or {}
+        if _get(item, "type") != "function_call":
+            return []
+        arguments = _string_or_none(_get(item, "arguments"))
+        if not arguments:
+            return []
+        output_index = _get(event, "output_index")
+        index = output_index if isinstance(output_index, int) else 0
+        return [
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": index,
+                                    "function": {"arguments": arguments},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        ]
+    if event_type == "response.function_call_arguments.delta":
+        delta = _get(event, "delta")
+        if not isinstance(delta, str) or not delta:
+            return []
+        output_index = _get(event, "output_index")
+        index = output_index if isinstance(output_index, int) else 0
+        return [
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": index,
+                                    "function": {
+                                        "arguments": delta,
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        ]
+    if event_type == "response.completed":
+        return [{"choices": [{"delta": {}, "finish_reason": "stop"}]}]
+    if event_type in {"response.failed", "response.incomplete"}:
+        error = _get(event, "error") or _get(_get(event, "response") or {}, "error")
+        raise RuntimeError(str(_to_plain(error or event)))
+    return []
 
 
 def _get(value: object, key: str) -> object:

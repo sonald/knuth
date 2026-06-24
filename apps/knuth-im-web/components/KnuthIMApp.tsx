@@ -119,6 +119,7 @@ type ThreadGroup = {
 };
 
 type SettingsDraft = {
+  authMode: "api_key" | "chatgpt";
   modelBaseUrl: string;
   model: string;
   timeout: string;
@@ -135,6 +136,7 @@ const EXAMPLE_PROMPTS = [
 ];
 
 const EMPTY_SETTINGS_DRAFT: SettingsDraft = {
+  authMode: "api_key",
   modelBaseUrl: "",
   model: "",
   timeout: "60",
@@ -470,6 +472,7 @@ function threadTitle(thread: ThreadSummary | undefined): string {
 
 function settingsDraftFrom(settings: KnuthDesktopSettings): SettingsDraft {
   return {
+    authMode: settings.authMode,
     modelBaseUrl: settings.modelBaseUrl,
     model: settings.model,
     timeout: String(settings.timeout || 60),
@@ -488,6 +491,7 @@ function desktopConnectionFrom(backend: AgentConnection): AgentConnection {
     mode: backend.mode,
     workspace: backend.workspace,
     settings: backend.settings,
+    chatgptLogin: backend.chatgptLogin,
     error: backend.error,
   };
 }
@@ -717,6 +721,7 @@ export function KnuthIMApp() {
       setSettingsError(undefined);
       setSettingsMessage(undefined);
       const payload: KnuthDesktopSettingsInput = {
+        authMode: settingsDraft.authMode,
         modelBaseUrl: settingsDraft.modelBaseUrl,
         model: settingsDraft.model,
         timeout: settingsDraft.timeout,
@@ -759,6 +764,66 @@ export function KnuthIMApp() {
     },
     [settingsDraft],
   );
+
+  const clearChatgptAuth = useCallback(async () => {
+    if (!window.knuthDesktop?.clearChatgptAuth) {
+      return;
+    }
+    setSettingsSaving(true);
+    setSettingsError(undefined);
+    setSettingsMessage(undefined);
+    try {
+      const result = await window.knuthDesktop.clearChatgptAuth();
+      setDesktopSettings(result.settings);
+      setSettingsDraft(settingsDraftFrom(result.settings));
+      const next = desktopConnectionFrom(result.backend);
+      setDesktopConnection(next);
+      setBaseUrl(next.baseUrl);
+      setSettingsMessage("ChatGPT login cleared");
+    } catch (err) {
+      setSettingsError(String(err));
+    } finally {
+      setSettingsSaving(false);
+    }
+  }, []);
+
+  const verifyChatgptLogin = useCallback(() => {
+    setSettingsError(undefined);
+    setSettingsMessage("Waiting for ChatGPT login…");
+    void fetch(`${agentConnection.baseUrl}/agent`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(agentConnection.headers ?? {}),
+      },
+      body: JSON.stringify({
+        messages: [{ role: "user", content: "Reply with ok." }],
+      }),
+    }).catch(() => {
+      setSettingsError("ChatGPT login check failed");
+    });
+  }, [agentConnection]);
+
+  useEffect(() => {
+    if (
+      !showSettings ||
+      desktopSettings?.authMode !== "chatgpt" ||
+      !window.knuthDesktop?.backend
+    ) {
+      return;
+    }
+    const interval = window.setInterval(() => {
+      void window.knuthDesktop?.backend?.().then((backend) => {
+        const next = desktopConnectionFrom(backend);
+        setDesktopConnection(next);
+        setBaseUrl(next.baseUrl);
+        if (backend.chatgptLogin) {
+          setSettingsMessage(undefined);
+        }
+      });
+    }, 1000);
+    return () => window.clearInterval(interval);
+  }, [desktopSettings?.authMode, showSettings]);
 
   const restartDesktopBackend = useCallback(async () => {
     if (!window.knuthDesktop?.restartBackend) {
@@ -1433,20 +1498,45 @@ export function KnuthIMApp() {
               {desktopMode ? (
                 <form className="settingsForm" onSubmit={saveDesktopSettings}>
                   <label className="settingsField">
-                    <span>Model endpoint</span>
-                    <input
-                      value={settingsDraft.modelBaseUrl}
+                    <span>Auth</span>
+                    <select
+                      value={settingsDraft.authMode}
                       onChange={(event) => {
+                        const authMode = event.target
+                          .value as SettingsDraft["authMode"];
                         setSettingsMessage(undefined);
                         setSettingsDraft((current) => ({
                           ...current,
-                          modelBaseUrl: event.target.value,
+                          authMode,
+                          modelBaseUrl:
+                            authMode === "chatgpt" ? "" : current.modelBaseUrl,
+                          apiKey: authMode === "chatgpt" ? "" : current.apiKey,
+                          clearApiKey:
+                            authMode === "chatgpt" ? false : current.clearApiKey,
                         }));
                       }}
-                      placeholder="https://api.example.com/v1"
-                      spellCheck={false}
-                    />
+                    >
+                      <option value="api_key">API key</option>
+                      <option value="chatgpt">ChatGPT subscription</option>
+                    </select>
                   </label>
+                  {settingsDraft.authMode === "api_key" ? (
+                    <label className="settingsField">
+                      <span>Model endpoint</span>
+                      <input
+                        value={settingsDraft.modelBaseUrl}
+                        onChange={(event) => {
+                          setSettingsMessage(undefined);
+                          setSettingsDraft((current) => ({
+                            ...current,
+                            modelBaseUrl: event.target.value,
+                          }));
+                        }}
+                        placeholder="https://api.example.com/v1"
+                        spellCheck={false}
+                      />
+                    </label>
+                  ) : null}
                   <label className="settingsField">
                     <span>Model</span>
                     <input
@@ -1462,34 +1552,50 @@ export function KnuthIMApp() {
                       spellCheck={false}
                     />
                   </label>
-                  <label className="settingsField">
-                    <span>
-                      API key
-                      {desktopSettings?.hasApiKey ? (
-                        <span className="savedKey">saved</span>
-                      ) : null}
-                    </span>
-                    <span className="secretInput">
-                      <KeyRound size={14} />
-                      <input
-                        type="password"
-                        value={settingsDraft.apiKey}
-                        onChange={(event) => {
-                          setSettingsMessage(undefined);
-                          setSettingsDraft((current) => ({
-                            ...current,
-                            apiKey: event.target.value,
-                            clearApiKey: false,
-                          }));
-                        }}
-                        placeholder={
-                          desktopSettings?.hasApiKey ? "Saved API key" : "API key"
-                        }
-                        spellCheck={false}
-                      />
-                    </span>
-                  </label>
-                  {desktopSettings?.hasApiKey ? (
+                  {settingsDraft.authMode === "api_key" ? (
+                    <label className="settingsField">
+                      <span>
+                        API key
+                        {desktopSettings?.hasApiKey ? (
+                          <span className="savedKey">saved</span>
+                        ) : null}
+                      </span>
+                      <span className="secretInput">
+                        <KeyRound size={14} />
+                        <input
+                          type="password"
+                          value={settingsDraft.apiKey}
+                          onChange={(event) => {
+                            setSettingsMessage(undefined);
+                            setSettingsDraft((current) => ({
+                              ...current,
+                              apiKey: event.target.value,
+                              clearApiKey: false,
+                            }));
+                          }}
+                          placeholder={
+                            desktopSettings?.hasApiKey ? "Saved API key" : "API key"
+                          }
+                          spellCheck={false}
+                        />
+                      </span>
+                    </label>
+                  ) : (
+                    <div className="settingsNotice">
+                      {desktopSettings?.needsLogin
+                        ? "ChatGPT login required"
+                        : "ChatGPT login ready"}
+                      <button
+                        type="button"
+                        className="inlineSettingsButton"
+                        onClick={verifyChatgptLogin}
+                      >
+                        Login/Verify
+                      </button>
+                    </div>
+                  )}
+                  {settingsDraft.authMode === "api_key" &&
+                  desktopSettings?.hasApiKey ? (
                     <label className="settingsCheck">
                       <input
                         type="checkbox"
@@ -1569,6 +1675,11 @@ export function KnuthIMApp() {
                     <div className="settingsNotice danger">{settingsError}</div>
                   ) : settingsMessage ? (
                     <div className="settingsNotice ok">{settingsMessage}</div>
+                  ) : desktopConnection?.chatgptLogin ? (
+                    <div className="settingsNotice">
+                      Visit {desktopConnection.chatgptLogin.url} and enter{" "}
+                      <code>{desktopConnection.chatgptLogin.code}</code>
+                    </div>
                   ) : null}
                   <div className="settingsActions">
                     <button
@@ -1591,6 +1702,17 @@ export function KnuthIMApp() {
                       <RefreshCw size={14} />
                       Restart
                     </button>
+                    {settingsDraft.authMode === "chatgpt" ? (
+                      <button
+                        type="button"
+                        className="settingsRestart"
+                        onClick={() => void clearChatgptAuth()}
+                        disabled={settingsSaving}
+                      >
+                        <KeyRound size={14} />
+                        Clear Login
+                      </button>
+                    ) : null}
                   </div>
                 </form>
               ) : (
