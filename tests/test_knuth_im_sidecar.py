@@ -9,7 +9,9 @@ from unittest.mock import patch
 from starlette.testclient import TestClient
 
 from knuth_llmd import InferenceConfig
-from knuth_runtime import build_memory_runtime
+from knuth_runtime import SkillRuntimeConfig, build_memory_runtime
+from knuth.core.skills import SkillSource
+from knuth_toold import SkillRoot
 from knuth_agui import create_app
 from knuth_im.__main__ import parse_server_config
 
@@ -23,11 +25,17 @@ class _NoopInferenceClient:
 
 
 class KnuthIMSidecarTests(unittest.TestCase):
-    def _app(self, *, auth_token: str | None = None):
+    def _app(
+        self,
+        *,
+        auth_token: str | None = None,
+        skill_config: SkillRuntimeConfig | None = None,
+    ):
         runtime = build_memory_runtime(
             inference_client=_NoopInferenceClient(),
             inference_config=InferenceConfig(),
             include_default_tools=False,
+            skill_config=skill_config,
         )
         return create_app(runtime, auth_token=auth_token)
 
@@ -59,6 +67,42 @@ class KnuthIMSidecarTests(unittest.TestCase):
             response = client.get("/threads")
 
         self.assertEqual(response.status_code, 200)
+
+    def test_commands_endpoint_returns_builtin_and_skill_metadata_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir, "skills")
+            skill_dir = root / "example-skill"
+            skill_dir.mkdir(parents=True)
+            skill_dir.joinpath("SKILL.md").write_text(
+                "\n".join(
+                    [
+                        "---",
+                        "name: example-skill",
+                        "description: Use when an example skill is needed.",
+                        "---",
+                        "",
+                        "Follow the example workflow.",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            app = self._app(
+                skill_config=SkillRuntimeConfig(
+                    roots=[SkillRoot(source=SkillSource.PROJECT, path=str(root))],
+                )
+            )
+            with TestClient(app) as client:
+                response = client.get("/commands")
+
+        self.assertEqual(response.status_code, 200)
+        commands = response.json()["commands"]
+        by_name = {command["name"]: command for command in commands}
+        self.assertIn("usage", by_name)
+        self.assertIn("skill:example-skill", by_name)
+        self.assertEqual(by_name["skill:example-skill"]["source"], "skill")
+        self.assertEqual(by_name["skill:example-skill"]["canonical"], "skill:example-skill")
+        self.assertNotIn("handler", by_name["skill:example-skill"])
+        self.assertNotIn("action", by_name["skill:example-skill"])
 
     def test_server_config_parses_flags_after_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

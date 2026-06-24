@@ -17,10 +17,11 @@ from knuth.core.events import (
     InferenceGenerationCompleted,
     ModelContentDeltaDraft,
     RunSucceeded,
+    UsageInfo,
     emit_transient_runtime_event,
 )
 from knuth.core.messages import InferenceMessage, InferenceRole, SystemSectionSource
-from knuth.core.skills import SkillSource
+from knuth.core.skills import SkillInfo, SkillMetadata, SkillSource
 from knuth.core.types import RunStatus
 from knuth_cli.cli import main
 from knuth_cli.completion import (
@@ -70,6 +71,64 @@ class _FailingFakeRuntime:
         return _FailingRunSession()
 
     async def pending_approvals(self, run_id=None):
+        return []
+
+
+class _SkillFakeRuntime(_StreamingFakeRuntime):
+    async def skills(self):
+        return [
+            SkillInfo(
+                metadata=SkillMetadata(
+                    name="example-skill",
+                    description="Use when an example skill is needed.",
+                ),
+                source=SkillSource.PROJECT,
+                file_path="/tmp/example-skill/SKILL.md",
+            )
+        ]
+
+
+class _BrokenSkillRuntime(_StreamingFakeRuntime):
+    async def skills(self):
+        raise RuntimeError("catalog down")
+
+
+class _UsageFakeRuntime(_StreamingFakeRuntime):
+    async def events(self, run_id: str):
+        self.requested_run_id = run_id
+        return [
+            type(
+                "Event",
+                (),
+                {
+                    "type": "model.completed",
+                    "usage": UsageInfo(
+                        input_tokens=10,
+                        output_tokens=5,
+                        total_tokens=15,
+                        cost_usd=0.001,
+                    ),
+                },
+            )(),
+            type(
+                "Event",
+                (),
+                {
+                    "type": "model.completed",
+                    "usage": UsageInfo(
+                        input_tokens=7,
+                        output_tokens=3,
+                        total_tokens=10,
+                        cost_usd=0.002,
+                    ),
+                },
+            )(),
+        ]
+
+
+class _MissingUsageRunFakeRuntime(_StreamingFakeRuntime):
+    async def events(self, run_id: str):
+        self.requested_run_id = run_id
         return []
 
 
@@ -591,6 +650,162 @@ class CliTests(unittest.TestCase):
         self.assertIn("real-ish: resumed", output.getvalue())
         self.assertIn("run run-2 · succeeded", output.getvalue())
 
+    def test_unknown_leading_slash_is_sent_as_prompt(self) -> None:
+        output = io.StringIO()
+        input_stream = io.StringIO("/not-a-command explain this\n/exit\n")
+
+        async def runtime_factory() -> _StreamingFakeRuntime:
+            return _StreamingFakeRuntime()
+
+        with (
+            patch("sys.stdin", input_stream),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["run"], runtime_factory=runtime_factory)
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("real-ish: /not-a-command explain this", output.getvalue())
+        self.assertNotIn("Unknown command", output.getvalue())
+
+    def test_skill_slash_command_starts_model_turn_and_records_raw_history(self) -> None:
+        history = _RecordingHistory()
+        prompt_input = _FakePromptInput(
+            prompts=[
+                InputResult.text_input("/skill:example-skill with care"),
+                InputResult.text_input("/exit"),
+            ],
+            records_history=True,
+        )
+        output = io.StringIO()
+
+        async def runtime_factory() -> _SkillFakeRuntime:
+            return _SkillFakeRuntime()
+
+        with (
+            patch("knuth_cli.repl._make_prompt_history", return_value=history),
+            patch("knuth_cli.repl._make_prompt_input", return_value=prompt_input),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["run"], runtime_factory=runtime_factory)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(history.appended, ["/skill:example-skill with care"])
+        self.assertIn(
+            "Use the example-skill skill for this request before answering.",
+            output.getvalue(),
+        )
+        self.assertIn("Skill command arguments:", output.getvalue())
+        self.assertIn("with care", output.getvalue())
+
+    def test_skill_builtin_command_accepts_skill_name_and_raw_args(self) -> None:
+        output = io.StringIO()
+        input_stream = io.StringIO("/skill example-skill with care\n/exit\n")
+
+        async def runtime_factory() -> _SkillFakeRuntime:
+            return _SkillFakeRuntime()
+
+        with (
+            patch("sys.stdin", input_stream),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["run"], runtime_factory=runtime_factory)
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Use the example-skill skill", output.getvalue())
+        self.assertIn("with care", output.getvalue())
+
+    def test_skill_slash_command_catalog_error_is_not_sent_as_prompt(self) -> None:
+        output = io.StringIO()
+        input_stream = io.StringIO("/skill:example-skill with care\n/exit\n")
+
+        async def runtime_factory() -> _BrokenSkillRuntime:
+            return _BrokenSkillRuntime()
+
+        with (
+            patch("sys.stdin", input_stream),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["run"], runtime_factory=runtime_factory)
+
+        text = output.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Could not load commands: RuntimeError: catalog down", text)
+        self.assertNotIn("real-ish: /skill:example-skill with care", text)
+
+    def test_help_uses_builtin_catalog_when_skill_catalog_fails(self) -> None:
+        output = io.StringIO()
+        input_stream = io.StringIO("/help\n/exit\n")
+
+        async def runtime_factory() -> _BrokenSkillRuntime:
+            return _BrokenSkillRuntime()
+
+        with (
+            patch("sys.stdin", input_stream),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["run"], runtime_factory=runtime_factory)
+
+        text = output.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertIn("/usage", text)
+        self.assertNotIn("catalog down", text)
+
+    def test_usage_slash_command_reports_current_run_token_usage(self) -> None:
+        output = io.StringIO()
+        input_stream = io.StringIO("hello\n/usage\n/exit\n")
+
+        async def runtime_factory() -> _UsageFakeRuntime:
+            return _UsageFakeRuntime()
+
+        with (
+            patch("sys.stdin", input_stream),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["run"], runtime_factory=runtime_factory)
+
+        self.assertEqual(exit_code, 0)
+        text = output.getvalue()
+        self.assertIn("run-1 usage", text)
+        self.assertIn("model calls: 2", text)
+        self.assertIn("input tokens: 17", text)
+        self.assertIn("output tokens: 8", text)
+        self.assertIn("total tokens: 25", text)
+        self.assertIn("cost: $0.003000", text)
+
+    def test_usage_slash_command_reports_missing_run(self) -> None:
+        output = io.StringIO()
+        input_stream = io.StringIO("/usage missing-run\n/exit\n")
+
+        async def runtime_factory() -> _MissingUsageRunFakeRuntime:
+            return _MissingUsageRunFakeRuntime()
+
+        with (
+            patch("sys.stdin", input_stream),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["run"], runtime_factory=runtime_factory)
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Run not found: missing-run", output.getvalue())
+
+    def test_help_slash_command_uses_catalog_with_usage_and_skills(self) -> None:
+        output = io.StringIO()
+        input_stream = io.StringIO("/help\n/exit\n")
+
+        async def runtime_factory() -> _SkillFakeRuntime:
+            return _SkillFakeRuntime()
+
+        with (
+            patch("sys.stdin", input_stream),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["run"], runtime_factory=runtime_factory)
+
+        self.assertEqual(exit_code, 0)
+        text = output.getvalue()
+        self.assertIn("/usage", text)
+        self.assertIn("/skill:example-skill", text)
+
     def test_interactive_run_reports_turn_errors_without_crashing_repl(self) -> None:
         output = io.StringIO()
         input_stream = io.StringIO("hello\n/exit\n")
@@ -984,6 +1199,30 @@ class ReplHistoryWriteTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(history.appended, [])
 
+    def test_skill_builtin_command_writes_raw_prompt_history(self) -> None:
+        history = _RecordingHistory()
+        prompt_input = _FakePromptInput(
+            prompts=[
+                InputResult.text_input("/skill example-skill with care"),
+                InputResult.text_input("/exit"),
+            ],
+            records_history=True,
+        )
+        output = io.StringIO()
+
+        async def runtime_factory() -> _SkillFakeRuntime:
+            return _SkillFakeRuntime()
+
+        with (
+            patch("knuth_cli.repl._make_prompt_history", return_value=history),
+            patch("knuth_cli.repl._make_prompt_input", return_value=prompt_input),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["run"], runtime_factory=runtime_factory)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(history.appended, ["/skill example-skill with care"])
+
 
 class CompletionTests(unittest.TestCase):
     def _texts(self, text: str, manager: CompletionManager | None = None) -> list[str]:
@@ -996,6 +1235,7 @@ class CompletionTests(unittest.TestCase):
 
     def test_completes_slash_commands(self) -> None:
         self.assertIn("/resume", self._texts("/res"))
+        self.assertIn("/usage", self._texts("/us"))
 
     def test_completes_run_ids_from_snapshot(self) -> None:
         manager = CompletionManager()
@@ -1019,6 +1259,14 @@ class CompletionTests(unittest.TestCase):
         )
 
         self.assertEqual(self._texts("/tools read", manager), ["read_file"])
+
+    def test_completes_skill_commands_from_runtime_snapshot(self) -> None:
+        manager = CompletionManager()
+
+        anyio.run(manager.refresh, _SkillFakeRuntime())
+
+        self.assertIn("/skill:example-skill", self._texts("/skill:exa", manager))
+        self.assertIn("/example-skill", self._texts("/exa", manager))
 
     def test_completion_path_only_reads_snapshot(self) -> None:
         class ExplodingRuntime:

@@ -60,6 +60,30 @@ _Avoid_: durable run model, event listener, CLI session, stored event log, runti
 The behavior of an interactive driver when it starts or returns after a local exit such as Ctrl+C. It first restores the latest actionable run state instead of showing an ordinary blank prompt: `WAITING_APPROVAL` re-shows approval, `WAITING_TOOL_RESULT` restores the wait, `PAUSED` offers resume, and a live `RUNNING` invocation is attached for observation when available. A `RUNNING` run with no live session in the current process is not auto-recovered until Knuth has a live-run lease/heartbeat; the driver must require explicit recovery or confirmation because another process may still be executing it. `INTERRUPTED` and `SUCCEEDED` return to ordinary prompt mode where the next user-authored input becomes `continue_run`. If more than one actionable run exists, the driver must ask the user to choose or require an explicit run id.
 _Avoid_: runtime control concept, model input parser, automatic resume of abandoned work, hidden approval
 
+**InteractiveCommand**:
+A host-owned interactive action invoked before user text enters the model conversation. It is not durable history, not runtime control, and not model-visible by itself. It runs through host-provided `CommandCapability` values rather than receiving raw runtime, terminal, web app, or transport objects.
+_Avoid_: runtime command, model message, durable event, raw app callback
+
+**CommandInvocation**:
+A host-local parsed request to invoke an `InteractiveCommand`, carrying the command name, the raw argument text after the command token, and the `CommandSurface` that invoked it. It is ephemeral; only runtime effects caused by invoked capabilities become durable, and model-visible turns compiled by a command are stored as ordinary user messages.
+_Avoid_: durable command event, parsed user message, runtime intent, tool call
+
+**CommandSurface**:
+A host UI or input surface that can invoke `InteractiveCommand` values, such as CLI slash text, IM slash text, generated UI, or a command palette. Slash syntax is one surface behavior, not a CLI-only command model.
+_Avoid_: command implementation, runtime transport, CLI-only parser
+
+**CommandCatalog**:
+An on-demand host view built from builtin command specs plus current runtime-provided skill information. It is not a state source and does not own skill refresh, versions, hot reload, or filesystem scanning.
+_Avoid_: skill manager, cached snapshot, runtime registry, durable projection
+
+**CommandCapability**:
+A narrow host-provided operation exposed to command handlers. It lets commands print or render UI, start or continue a conversation, resume or query a run, or read current catalogs without depending on raw host or runtime objects.
+_Avoid_: raw runtime, application object, terminal object, transport adapter
+
+**SkillCommand**:
+An `InteractiveCommand` that requests use of a skill. It does not execute the skill tool, load skill content, or forge a tool result itself; it compiles the invocation into a model-visible user turn that asks the agent to invoke the existing skill tool.
+_Avoid_: skill execution path, direct SKILL.md injection, host-side tool result
+
 **ProjectKey**:
 A stable workspace identity used to scope CLI-owned user state such as prompt history. It represents the project the user is operating in, not merely the process's current directory, so moving between subdirectories of the same project should not fragment project-scoped state.
 _Avoid_: current working directory, history file path, run id, session id

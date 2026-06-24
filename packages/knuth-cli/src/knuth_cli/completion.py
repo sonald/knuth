@@ -10,17 +10,7 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 
 from knuth.core.types import RunStatus
-
-SLASH_COMMANDS: tuple[str, ...] = (
-    "/help",
-    "/tools",
-    "/new",
-    "/clear",
-    "/resume",
-    "/status",
-    "/exit",
-    "/quit",
-)
+from knuth_cli.interactive_commands import builtin_command_catalog, load_command_catalog
 
 
 @dataclass(frozen=True)
@@ -36,7 +26,15 @@ class ToolCompletion:
 
 
 @dataclass(frozen=True)
+class CommandCompletion:
+    name: str
+    description: str = ""
+    source: str = "builtin"
+
+
+@dataclass(frozen=True)
 class CompletionSnapshot:
+    commands: tuple[CommandCompletion, ...] = ()
     runs: tuple[RunCompletion, ...] = ()
     tools: tuple[ToolCompletion, ...] = ()
 
@@ -45,13 +43,20 @@ class CompletionManager:
     """Owns best-effort runtime completion snapshots."""
 
     def __init__(self) -> None:
-        self.snapshot = CompletionSnapshot()
+        self.snapshot = CompletionSnapshot(
+            commands=_command_completions_from_catalog(builtin_command_catalog())
+        )
 
     async def refresh(self, runtime, *, timeout: float = 1.0) -> None:
         with anyio.move_on_after(timeout):
+            catalog = await load_command_catalog(runtime, best_effort=True)
             runs = await _load_runs(runtime)
             tools = await _load_tools(runtime)
-            self.snapshot = CompletionSnapshot(runs=tuple(runs), tools=tuple(tools))
+            self.snapshot = CompletionSnapshot(
+                commands=_command_completions_from_catalog(catalog),
+                runs=tuple(runs),
+                tools=tuple(tools),
+            )
 
 
 class KnuthCompleter(Completer):
@@ -72,7 +77,9 @@ class KnuthCompleter(Completer):
         command = parts[0] if parts else text
 
         if not trailing_space and len(parts) <= 1:
-            yield from _slash_command_completions(command)
+            yield from _slash_command_completions(
+                self._manager.snapshot.commands, command
+            )
             return
 
         token = "" if trailing_space else parts[-1]
@@ -132,10 +139,27 @@ async def _load_tools(runtime) -> list[ToolCompletion]:
     return completions
 
 
-def _slash_command_completions(token: str) -> Iterable[Completion]:
-    for command in SLASH_COMMANDS:
-        if command.startswith(token):
-            yield Completion(command, start_position=-len(token))
+def _command_completions_from_catalog(catalog) -> tuple[CommandCompletion, ...]:
+    return tuple(
+        CommandCompletion(
+            name=f"/{command.name}",
+            description=command.description,
+            source=command.source,
+        )
+        for command in catalog.commands
+    )
+
+
+def _slash_command_completions(
+    commands: Iterable[CommandCompletion], token: str
+) -> Iterable[Completion]:
+    for command in commands:
+        if command.name.startswith(token):
+            yield Completion(
+                command.name,
+                start_position=-len(token),
+                display_meta=command.description,
+            )
 
 
 def _run_id_completions(

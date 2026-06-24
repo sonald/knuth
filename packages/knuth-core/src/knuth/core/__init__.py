@@ -1,4 +1,14 @@
 from knuth.core.artifacts import ArtifactSink, ArtifactSinkProvider, StoredArtifact
+from knuth.core.commands import (
+    CommandCatalog,
+    CommandInvocation,
+    CommandSpec,
+    DEFAULT_BUILTIN_COMMAND_SPECS,
+    build_command_catalog,
+    parse_slash_invocation,
+    project_skill_commands,
+    render_skill_command_prompt,
+)
 from knuth.core.events import (
     ContextSnapshot,
     DurableRuntimeEventDraft,
@@ -47,6 +57,10 @@ __all__ = [
     "ArtifactSinkProvider",
     "Artifact",
     "ContextSnapshot",
+    "CommandCatalog",
+    "CommandInvocation",
+    "CommandSpec",
+    "DEFAULT_BUILTIN_COMMAND_SPECS",
     "DurableRuntimeEventDraft",
     "ErrorInfo",
     "EventDurability",
@@ -80,7 +94,11 @@ __all__ = [
     "TransientRuntimeEventDraft",
     "approval_id_for",
     "args_hash_for",
+    "build_command_catalog",
     "ledger_message_id",
+    "parse_slash_invocation",
+    "project_skill_commands",
+    "render_skill_command_prompt",
     "rewrite_id_for_begin_seq",
     "rewrite_message_id",
 ]

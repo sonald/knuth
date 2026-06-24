@@ -2448,6 +2448,38 @@ class SystemPreambleTests(unittest.TestCase):
             reminders[0].content or "",
         )
 
+    def test_runtime_exposes_current_skill_infos_for_hosts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir, "skills")
+            skill_dir = root / "example-skill"
+            skill_dir.mkdir(parents=True)
+            skill_dir.joinpath("SKILL.md").write_text(
+                "\n".join(
+                    [
+                        "---",
+                        "name: example-skill",
+                        "description: Use when an example skill is needed.",
+                        "---",
+                        "",
+                        "Follow the example workflow.",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            runtime = build_memory_runtime(
+                inference_client=CapturingInferenceClient(["Hello"]),
+                inference_config=InferenceConfig(),
+                include_default_tools=False,
+                skill_config=SkillRuntimeConfig(
+                    roots=[SkillRoot(source=SkillSource.PROJECT, path=str(root))],
+                ),
+            )
+
+            infos = anyio.run(runtime.skills)
+
+        self.assertEqual([info.metadata.name for info in infos], ["example-skill"])
+        self.assertEqual(infos[0].metadata.description, "Use when an example skill is needed.")
+
     def test_base_identity_delivered_as_leading_system_message(self) -> None:
         client = CapturingInferenceClient(["Hello"])
         runtime = _build_runtime(

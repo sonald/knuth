@@ -6,6 +6,11 @@ import signal
 import sys
 
 import anyio
+from knuth.core.commands import (
+    CommandInvocation,
+    parse_slash_invocation,
+    render_skill_command_prompt,
+)
 from knuth_runtime import AgentRuntime, LedgerError, RunResult, RuntimeObservationError
 from rich.console import Console
 from rich.text import Text
@@ -14,18 +19,11 @@ from knuth.core.types import RunStatus
 from knuth_cli.completion import CompletionManager, KnuthCompleter
 from knuth_cli.input import PromptInput, PromptToolkitInput, StreamInput
 from knuth_cli.input_history import PromptHistory
+from knuth_cli.interactive_commands import builtin_command_catalog, load_command_catalog
 from knuth_cli.render import EventRenderer
 
 _BANNER = "Knuth agent ready. Type /help for commands, /exit to quit."
 _PROMPT = "knuth ❯ "
-_HELP = """Commands:
-  /help            Show this help
-  /tools           List available tools
-  /new, /clear     Start a fresh conversation
-  /resume [run]    Resume the current or specified waiting/paused run
-  /status          Show the current run status
-  /exit, /quit     Leave the session"""
-
 _EXIT_INTERRUPTED = 130
 
 # How long a graceful interrupt may run before the driver force-cancels the
@@ -194,18 +192,35 @@ async def run_interactive(runtime: AgentRuntime, console: Console) -> int:
                 tg.cancel_scope.cancel()
                 return 0
             if prompt.startswith("/"):
-                if prompt in {"/new", "/clear"}:
-                    history.start_new_session()
-                session_run_id = await _handle_slash(
-                    runtime,
-                    console,
-                    prompt,
-                    session_run_id,
-                    allowed_tools,
-                    prompt_input,
-                )
-                _schedule_completion_refresh(tg, completion_manager, runtime)
-                continue
+                try:
+                    invocation = await _parse_cli_command(runtime, prompt)
+                except Exception as exc:
+                    console.print(
+                        Text(
+                            "Could not load commands: "
+                            f"{exc.__class__.__name__}: {exc}",
+                            style="bold red",
+                        )
+                    )
+                    continue
+                if invocation is not None:
+                    if prompt in {"/new", "/clear"}:
+                        history.start_new_session()
+                    if getattr(
+                        prompt_input, "records_history", False
+                    ) and await _command_writes_prompt_history(runtime, invocation):
+                        history.append_prompt(prompt)
+                    session_run_id = await _handle_slash(
+                        runtime,
+                        console,
+                        prompt,
+                        session_run_id,
+                        allowed_tools,
+                        prompt_input,
+                        invocation=invocation,
+                    )
+                    _schedule_completion_refresh(tg, completion_manager, runtime)
+                    continue
             if getattr(prompt_input, "records_history", False):
                 history.append_prompt(prompt)
             try:
@@ -236,6 +251,28 @@ def _schedule_completion_refresh(
     runtime: AgentRuntime,
 ) -> None:
     task_group.start_soon(manager.refresh, runtime)
+
+
+async def _parse_cli_command(runtime: AgentRuntime, prompt: str):
+    builtin_invocation = parse_slash_invocation(
+        prompt, builtin_command_catalog(), surface="cli.slash"
+    )
+    if builtin_invocation is not None:
+        return builtin_invocation
+    catalog = await load_command_catalog(runtime)
+    return parse_slash_invocation(prompt, catalog, surface="cli.slash")
+
+
+async def _command_writes_prompt_history(
+    runtime: AgentRuntime,
+    invocation: CommandInvocation,
+) -> bool:
+    if invocation.command.source == "skill":
+        return True
+    if invocation.name != "skill":
+        return False
+    parts = invocation.raw_args.split(maxsplit=1)
+    return bool(parts) and await _has_skill(runtime, parts[0], best_effort=True)
 
 
 async def run_single(runtime: AgentRuntime, console: Console, prompt: str) -> int:
@@ -565,11 +602,28 @@ async def _handle_slash(
     session_run_id: str | None,
     allowed_tools: set[str],
     prompt_input: PromptInput,
+    *,
+    invocation: CommandInvocation | None = None,
 ) -> str | None:
+    if invocation is not None and invocation.command.source == "skill":
+        skill_name = invocation.command.skill_name
+        if skill_name is None:
+            console.print(Text(f"Skill not available: {invocation.name}", style="red"))
+            return session_run_id
+        return await _run_skill_turn(
+            runtime,
+            console,
+            skill_name,
+            invocation.raw_args,
+            session_run_id,
+            allowed_tools,
+            prompt_input,
+        )
+
     parts = command.split()
     name = parts[0]
     if name == "/help":
-        console.print(_HELP)
+        await _print_command_help(runtime, console)
     elif name == "/tools":
         for item in await runtime.tools():
             function = item.get("function", {})
@@ -621,9 +675,211 @@ async def _handle_slash(
                 )
             return result.run_id
         return target_run_id
+    elif name == "/skill":
+        raw_args = invocation.raw_args if invocation is not None else command[6:].lstrip()
+        skill_parts = raw_args.split(maxsplit=1)
+        if not skill_parts:
+            console.print(Text("Usage: /skill <skill_name> [args]", style="red"))
+            return session_run_id
+        skill_name = skill_parts[0]
+        skill_args = skill_parts[1] if len(skill_parts) > 1 else ""
+        try:
+            has_skill = await _has_skill(runtime, skill_name)
+        except Exception as exc:
+            console.print(
+                Text(
+                    f"Could not load skills: {exc.__class__.__name__}: {exc}",
+                    style="bold red",
+                )
+            )
+            return session_run_id
+        if not has_skill:
+            console.print(Text(f"Skill not found: {skill_name}", style="red"))
+            return session_run_id
+        return await _run_skill_turn(
+            runtime,
+            console,
+            skill_name,
+            skill_args,
+            session_run_id,
+            allowed_tools,
+            prompt_input,
+        )
+    elif name == "/usage":
+        raw_args = invocation.raw_args if invocation is not None else " ".join(parts[1:])
+        usage_parts = raw_args.split()
+        if len(usage_parts) > 1:
+            console.print(Text("Usage: /usage [run_id]", style="red"))
+            return session_run_id
+        target_run_id = usage_parts[0] if usage_parts else session_run_id
+        if target_run_id is None:
+            console.print(Text("No active run. Use /usage <run_id>.", style="dim"))
+            return session_run_id
+        await _print_run_usage(runtime, console, target_run_id)
     else:
         console.print(Text(f"Unknown command: {name}", style="red"))
     return session_run_id
+
+
+async def _print_command_help(runtime: AgentRuntime, console: Console) -> None:
+    catalog = await load_command_catalog(runtime, best_effort=True)
+    console.print("Commands:")
+    for command in catalog.commands:
+        if command.source == "skill" and command.name != command.canonical:
+            continue
+        console.print(
+            Text(f"  /{command.name:<20}", style="bold")
+            + Text(command.description, style="dim")
+        )
+
+
+async def _print_run_usage(
+    runtime: AgentRuntime,
+    console: Console,
+    run_id: str,
+) -> None:
+    events_fn = getattr(runtime, "events", None)
+    if events_fn is None:
+        console.print(Text(f"Usage unavailable for run {run_id}.", style="dim"))
+        return
+    try:
+        events = await events_fn(run_id)
+    except KeyError:
+        console.print(Text(f"Run not found: {run_id}", style="red"))
+        return
+    except Exception as exc:
+        console.print(
+            Text(
+                f"Could not read usage for {run_id}: {exc.__class__.__name__}: {exc}",
+                style="bold red",
+            )
+        )
+        return
+    if not events:
+        console.print(Text(f"Run not found: {run_id}", style="red"))
+        return
+
+    calls = 0
+    input_tokens = 0
+    output_tokens = 0
+    total_tokens = 0
+    cost_usd = 0.0
+    has_input = False
+    has_output = False
+    has_total = False
+    has_cost = False
+
+    for event in events:
+        if getattr(event, "type", None) != "model.completed":
+            continue
+        usage = getattr(event, "usage", None)
+        if usage is None:
+            continue
+        calls += 1
+        value = getattr(usage, "input_tokens", None)
+        if value is not None:
+            has_input = True
+            input_tokens += int(value)
+        value = getattr(usage, "output_tokens", None)
+        if value is not None:
+            has_output = True
+            output_tokens += int(value)
+        value = getattr(usage, "total_tokens", None)
+        if value is not None:
+            has_total = True
+            total_tokens += int(value)
+        value = getattr(usage, "cost_usd", None)
+        if value is not None:
+            has_cost = True
+            cost_usd += float(value)
+
+    if calls == 0:
+        console.print(Text(f"Usage unavailable for run {run_id}.", style="dim"))
+        return
+
+    console.print(Text(f"{run_id} usage", style="bold"))
+    console.print(Text(f"  model calls: {calls}", style="dim"))
+    console.print(
+        Text(
+            "  input tokens: "
+            + (_format_int(input_tokens) if has_input else "unavailable"),
+            style="dim",
+        )
+    )
+    console.print(
+        Text(
+            "  output tokens: "
+            + (_format_int(output_tokens) if has_output else "unavailable"),
+            style="dim",
+        )
+    )
+    console.print(
+        Text(
+            "  total tokens: "
+            + (_format_int(total_tokens) if has_total else "unavailable"),
+            style="dim",
+        )
+    )
+    console.print(
+        Text(
+            "  cost: " + (f"${cost_usd:.6f}" if has_cost else "unavailable"),
+            style="dim",
+        )
+    )
+
+
+def _format_int(value: int) -> str:
+    return f"{value:,}"
+
+
+async def _run_skill_turn(
+    runtime: AgentRuntime,
+    console: Console,
+    skill_name: str,
+    raw_args: str,
+    session_run_id: str | None,
+    allowed_tools: set[str],
+    prompt_input: PromptInput,
+) -> str | None:
+    prompt = render_skill_command_prompt(skill_name, raw_args)
+    try:
+        run_id, result = await _run_turn(
+            runtime, console, prompt, session_run_id, allowed_tools, prompt_input
+        )
+    except Exception as exc:
+        console.print(
+            Text(f"Run failed: {exc.__class__.__name__}: {exc}", style="bold red")
+        )
+        return session_run_id
+    if result is not None and result.status == RunStatus.INTERRUPTED:
+        console.print(
+            Text(
+                f"run {run_id} · interrupted (send a new message to continue)",
+                style="dim",
+            )
+        )
+    return run_id
+
+
+async def _has_skill(
+    runtime: AgentRuntime,
+    skill_name: str,
+    *,
+    best_effort: bool = False,
+) -> bool:
+    skills_fn = getattr(runtime, "skills", None)
+    if skills_fn is None:
+        return False
+    try:
+        skills = await skills_fn()
+    except Exception:
+        if not best_effort:
+            raise
+        return False
+    return any(
+        getattr(getattr(skill, "metadata", skill), "name", None) == skill_name
+        for skill in skills
+    )
 
 
 async def _find_single_actionable_run_id(

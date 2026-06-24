@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
+from knuth.core.commands import DEFAULT_BUILTIN_COMMAND_SPECS, build_command_catalog
 from knuth.core.invocations import ToolInvocationStatus
 from knuth.core.types import RunStatus
 from knuth_runtime import AgentRuntime, LedgerError
@@ -288,6 +289,23 @@ def create_app(
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/commands")
+    async def commands() -> dict[str, list[dict[str, Any]]]:
+        skills_fn = getattr(runtime, "skills", None)
+        skills = await skills_fn() if skills_fn is not None else []
+        catalog = build_command_catalog(DEFAULT_BUILTIN_COMMAND_SPECS, skills)
+        return {
+            "commands": [
+                {
+                    "name": command.name,
+                    "source": command.source,
+                    "description": command.description,
+                    "canonical": command.canonical or command.name,
+                }
+                for command in catalog.commands
+            ]
+        }
 
     @app.post("/agent")
     async def agent(request: Request) -> StreamingResponse:

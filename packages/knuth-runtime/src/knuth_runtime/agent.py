@@ -13,6 +13,7 @@ from knuth.core.events import (
 from knuth.core.invocations import Approval, ToolInvocation
 from knuth.core.messages import InferenceMessage, InferenceRole
 from knuth.core.runs import AgentRun
+from knuth.core.skills import SkillInfo
 from knuth.core.runtime_events import (
     ApprovalResolvedDraft,
     RunPausedDraft,
@@ -308,6 +309,12 @@ class AgentRuntime:
     async def tools(self) -> list[dict]:
         return await self._services.tool_broker.list_visible_tools("cli")
 
+    async def skills(self) -> list[SkillInfo]:
+        manager = self._services.skill_manager
+        if manager is None:
+            return []
+        return manager.to_skill_infos()
+
     async def pending_approvals(self, run_id: str | None = None) -> list[Approval]:
         return await self._services.ledger.pending_approvals(run_id)
 
@@ -541,6 +548,7 @@ def build_sqlite_runtime(
         artifact_store=artifact_store,
         message_middleware_runner=message_middleware_runner,
         projection_checkpoint_writer=ProjectionCheckpointWriter(ledger),
+        skill_manager=skill_manager,
         skill_hot_reload_service=skill_hot_reload_service,
         context_builder=ContextBuilder(
             ledger,
@@ -619,6 +627,7 @@ def build_memory_runtime(
         artifact_store=artifact_store,
         message_middleware_runner=message_middleware_runner,
         projection_checkpoint_writer=ProjectionCheckpointWriter(ledger),
+        skill_manager=skill_manager,
         skill_hot_reload_service=skill_hot_reload_service,
         context_builder=ContextBuilder(
             ledger,

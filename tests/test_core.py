@@ -1,6 +1,11 @@
 import unittest
 from typing import get_args
 
+from knuth.core.commands import (
+    CommandSpec,
+    build_command_catalog,
+    parse_slash_invocation,
+)
 from knuth.core.events import (
     ContextSystemPreambleBuilt,
     ContextSystemPreambleBuiltDraft,
@@ -19,6 +24,7 @@ from knuth.core.events import (
 )
 from knuth.core.runtime_events import RunCancelledDraft
 from knuth.core.messages import InferenceMessage, InferenceRole, ToolCall
+from knuth.core.skills import SkillInfo, SkillMetadata, SkillSource
 from knuth.core.types import EventDurability
 
 
@@ -169,6 +175,64 @@ class CoreModelTests(unittest.TestCase):
 
         self.assertEqual(event.id, "evt-tool-started")
         self.assertEqual(event.tool_call_id, "call-1")
+
+    def test_known_slash_invocation_preserves_raw_args_and_unknown_is_prompt(self) -> None:
+        catalog = build_command_catalog(
+            [
+                CommandSpec(
+                    name="usage",
+                    description="Show token usage",
+                    source="builtin",
+                )
+            ],
+            skill_infos=[],
+        )
+
+        invocation = parse_slash_invocation(
+            "  /usage run_1\nignored by parser", catalog, surface="cli.slash"
+        )
+
+        self.assertIsNotNone(invocation)
+        assert invocation is not None
+        self.assertEqual(invocation.name, "usage")
+        self.assertEqual(invocation.raw_args, "run_1\nignored by parser")
+        self.assertEqual(invocation.surface, "cli.slash")
+        self.assertIsNone(parse_slash_invocation("/missing args", catalog))
+
+    def test_skill_commands_keep_canonical_name_when_alias_conflicts(self) -> None:
+        catalog = build_command_catalog(
+            [
+                CommandSpec(
+                    name="usage",
+                    description="Show token usage",
+                    source="builtin",
+                )
+            ],
+            skill_infos=[
+                SkillInfo(
+                    metadata=SkillMetadata(
+                        name="usage",
+                        description="Skill named like a builtin.",
+                    ),
+                    source=SkillSource.PROJECT,
+                    file_path="/tmp/usage/SKILL.md",
+                ),
+                SkillInfo(
+                    metadata=SkillMetadata(
+                        name="writer",
+                        description="Write with care.",
+                    ),
+                    source=SkillSource.USER,
+                    file_path="/tmp/writer/SKILL.md",
+                ),
+            ],
+        )
+
+        names = [command.name for command in catalog.commands]
+
+        self.assertEqual(names, ["usage", "skill:usage", "skill:writer", "writer"])
+        self.assertEqual(catalog.resolve("skill:usage").skill_name, "usage")
+        self.assertEqual(catalog.resolve("writer").canonical, "skill:writer")
 
 
 if __name__ == "__main__":
