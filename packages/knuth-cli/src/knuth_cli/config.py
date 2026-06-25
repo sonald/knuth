@@ -68,6 +68,8 @@ def load_agent_config_from_env(environ: Mapping[str, str] | None = None) -> Agen
 def _agent_config_from_values(values: Mapping[str, Any]) -> AgentConfig:
     model = str(values.get("model") or "")
     auth_mode = _auth_mode(values.get("auth_mode"), model)
+    if auth_mode == "chatgpt" and "/" not in model:
+        model = f"chatgpt/{model}"
     required_config_keys = {"model"}
     if auth_mode == "api_key":
         required_config_keys.update({"api_key", "base_url"})

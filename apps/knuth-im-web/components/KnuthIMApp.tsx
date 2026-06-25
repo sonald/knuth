@@ -790,6 +790,34 @@ export function KnuthIMApp() {
   const verifyChatgptLogin = useCallback(() => {
     setSettingsError(undefined);
     setSettingsMessage("Waiting for ChatGPT login…");
+    if (window.knuthDesktop?.restartBackend) {
+      void window.knuthDesktop
+        .restartBackend()
+        .then((backend) => {
+          const next = desktopConnectionFrom(backend);
+          setDesktopConnection(next);
+          setBaseUrl(next.baseUrl);
+          if (backend.chatgptLogin) {
+            setSettingsMessage(undefined);
+          }
+          void fetch(`${next.baseUrl}/agent`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              ...(next.headers ?? {}),
+            },
+            body: JSON.stringify({
+              messages: [{ role: "user", content: "Reply with ok." }],
+            }),
+          }).catch(() => {
+            setSettingsError("ChatGPT login check failed");
+          });
+        })
+        .catch((err) => {
+          setSettingsError(err instanceof Error ? err.message : String(err));
+        });
+      return;
+    }
     void fetch(`${agentConnection.baseUrl}/agent`, {
       method: "POST",
       headers: {

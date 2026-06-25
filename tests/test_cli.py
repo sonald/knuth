@@ -300,6 +300,18 @@ class AgentConfigTests(unittest.TestCase):
         self.assertIsNone(config.api_key)
         self.assertIsNone(config.base_url)
 
+    def test_load_config_prefixes_bare_chatgpt_model(self) -> None:
+        config = anyio.run(
+            load_config,
+            Path("does-not-exist.yaml"),
+            {
+                "KNUTH_AUTH_MODE": "chatgpt",
+                "KNUTH_MODEL": "gpt-5.3-codex-spark",
+            },
+        )
+
+        self.assertEqual(config.model, "chatgpt/gpt-5.3-codex-spark")
+
     def test_load_config_rejects_unknown_auth_mode(self) -> None:
         with self.assertRaisesRegex(ValueError, "KNUTH_AUTH_MODE"):
             anyio.run(
