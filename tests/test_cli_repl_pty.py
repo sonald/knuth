@@ -187,6 +187,17 @@ class CliReplOptInPtyTests(unittest.TestCase):
             self.assertIn(b"approval-1", output)
             repl.exit()
 
+    def test_active_turn_sigint_interrupts_running_session(self) -> None:
+        with _spawn_driver() as repl:
+            repl.expect(b"knuth")
+            repl.send(b"interrupt\r")
+            repl.expect(b"ACTIVE_TURN_READY")
+            os.killpg(repl.process.pid, signal.SIGINT)
+            output = repl.expect(b"run run-interrupt", timeout=10)
+            self.assertIn(b"interrupting", output)
+            self.assertIn(b"interrupted", output)
+            repl.exit()
+
 
 class _PtyRepl:
     def __init__(
