@@ -280,6 +280,29 @@ class AgentConfigTests(unittest.TestCase):
             self.assertEqual(config.timeout, 90.5)
             self.assertEqual(config.system_prompt, "env prompt")
 
+    def test_litellm_callbacks_feed_provider_options(self) -> None:
+        config = anyio.run(
+            load_config,
+            Path("does-not-exist.yaml"),
+            {
+                "KNUTH_API_KEY": "env-key",
+                "KNUTH_BASE_URL": "https://env.test/v1",
+                "KNUTH_MODEL": "env-model",
+                "KNUTH_LITELLM_CALLBACKS": "langfuse_otel,opik",
+                "KNUTH_LITELLM_SUCCESS_CALLBACKS": "langfuse",
+                "KNUTH_LITELLM_FAILURE_CALLBACKS": "langfuse",
+            },
+        )
+
+        self.assertEqual(
+            config.provider_options,
+            {
+                "callbacks": ["langfuse_otel", "opik"],
+                "success_callback": ["langfuse"],
+                "failure_callback": ["langfuse"],
+            },
+        )
+
     def test_load_config_fails_when_required_values_are_missing(self) -> None:
         with self.assertRaisesRegex(ValueError, "KNUTH_API_KEY"):
             anyio.run(load_config, Path("does-not-exist.yaml"), {})

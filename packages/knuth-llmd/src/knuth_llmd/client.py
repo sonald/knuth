@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import warnings
 from collections.abc import Callable
 from typing import Any, AsyncIterator, Mapping, Protocol, Sequence
@@ -508,7 +509,8 @@ class LiteLLMInferenceClient:
             }
         )
         if _is_chatgpt_model(str(kwargs["model"])):
-            kwargs["no-log"] = True
+            if "no-log" not in kwargs and not _litellm_callbacks_enabled(kwargs):
+                kwargs["no-log"] = True
         if tools:
             kwargs["tools"] = [_to_responses_tool(tool) for tool in tools]
             kwargs["tool_choice"] = "auto"
@@ -523,6 +525,41 @@ def _litellm_model_name(model: str) -> str:
 
 def _is_chatgpt_model(model: str) -> bool:
     return model.startswith("chatgpt/")
+
+
+_LITELLM_CALLBACK_ENV = {
+    "KNUTH_LITELLM_CALLBACKS": "callbacks",
+    "KNUTH_LITELLM_SUCCESS_CALLBACKS": "success_callback",
+    "KNUTH_LITELLM_FAILURE_CALLBACKS": "failure_callback",
+}
+_CALLBACK_SPLIT_RE = re.compile(r"[\s,]+")
+
+
+def _parse_callback_env(value: str | None) -> list[str]:
+    return [item for item in _CALLBACK_SPLIT_RE.split(value or "") if item]
+
+
+def _litellm_callbacks_enabled(kwargs: Mapping[str, object] | None = None) -> bool:
+    if kwargs is not None:
+        for key in ("callbacks", "success_callback", "failure_callback"):
+            callbacks = kwargs.get(key)
+            if isinstance(callbacks, Sequence) and not isinstance(callbacks, str):
+                if len(callbacks) > 0:
+                    return True
+            elif callbacks:
+                return True
+    return any(_parse_callback_env(os.environ.get(env_key)) for env_key in _LITELLM_CALLBACK_ENV)
+
+
+def _configure_litellm_callbacks_from_env(litellm: object) -> None:
+    for env_key, attr in _LITELLM_CALLBACK_ENV.items():
+        callbacks = _parse_callback_env(os.environ.get(env_key))
+        target = getattr(litellm, attr, None)
+        if not isinstance(target, list):
+            continue
+        for callback in callbacks:
+            if callback not in target:
+                target.append(callback)
 
 
 _CHATGPT_STREAMING_PATCH_LOCK = anyio.Lock()
@@ -569,6 +606,7 @@ async def _default_completion_fn(**kwargs: object) -> object:
     from litellm import acompletion
 
     litellm.suppress_debug_info = True  # keep "Give Feedback" banners out of the CLI
+    _configure_litellm_callbacks_from_env(litellm)
     return await acompletion(**kwargs)
 
 
@@ -577,6 +615,7 @@ async def _default_responses_fn(**kwargs: object) -> object:
     from litellm import aresponses
 
     litellm.suppress_debug_info = True  # keep "Give Feedback" banners out of the CLI
+    _configure_litellm_callbacks_from_env(litellm)
     model = kwargs.get("model")
     if not isinstance(model, str) or not _is_chatgpt_model(model):
         return await aresponses(**kwargs)

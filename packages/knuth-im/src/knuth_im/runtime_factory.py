@@ -40,7 +40,10 @@ def build_runtime(
             api_key=config.api_key,
             timeout=config.timeout,
         ),
-        inference_config=InferenceConfig(timeout_s=config.timeout),
+        inference_config=InferenceConfig(
+            timeout_s=config.timeout,
+            provider_options=config.provider_options or {},
+        ),
         db_path=db_path or Path("~/.knuth/knuth-im.db"),
         section_providers=build_cli_system_sections(config.system_prompt),
         message_middlewares=build_cli_message_middlewares(),

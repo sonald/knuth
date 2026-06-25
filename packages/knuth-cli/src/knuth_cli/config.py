@@ -25,6 +25,7 @@ class AgentConfig:
     skill_roots: list[SkillRoot] | None = None
     skill_hot_reload: bool = True
     skill_hot_reload_debounce_ms: int = 1000
+    provider_options: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,7 @@ def _agent_config_from_values(values: Mapping[str, Any]) -> AgentConfig:
     timeout = float(values.get("timeout") or 60.0)
     system_prompt = values.get("system_prompt")
     skill_config = parse_agent_skill_config(values)
+    provider_options = _provider_options(values)
     return AgentConfig(
         api_key=str(values["api_key"]) if values.get("api_key") else None,
         base_url=str(values["base_url"]) if values.get("base_url") else None,
@@ -101,6 +103,7 @@ def _agent_config_from_values(values: Mapping[str, Any]) -> AgentConfig:
         skill_roots=skill_config.roots,
         skill_hot_reload=skill_config.hot_reload,
         skill_hot_reload_debounce_ms=skill_config.hot_reload_debounce_ms,
+        provider_options=provider_options or None,
     )
 
 
@@ -118,6 +121,9 @@ _ENV_TO_CONFIG_KEY = {
     "KNUTH_CHATGPT_TOKEN_DIR": "chatgpt_token_dir",
     "KNUTH_TIMEOUT": "timeout",
     "KNUTH_SYSTEM_PROMPT": "system_prompt",
+    "KNUTH_LITELLM_CALLBACKS": "litellm_callbacks",
+    "KNUTH_LITELLM_SUCCESS_CALLBACKS": "litellm_success_callbacks",
+    "KNUTH_LITELLM_FAILURE_CALLBACKS": "litellm_failure_callbacks",
     **_SKILL_ENV_TO_CONFIG_KEY,
 }
 
@@ -126,6 +132,9 @@ _OPTIONAL_CONFIG_KEYS = {
     "system_prompt",
     "auth_mode",
     "chatgpt_token_dir",
+    "litellm_callbacks",
+    "litellm_success_callbacks",
+    "litellm_failure_callbacks",
     "skill_roots",
     "skill_hot_reload",
     "skill_hot_reload_debounce_ms",
@@ -154,6 +163,29 @@ def _default_skill_roots() -> list[SkillRoot]:
             path=str(Path.home() / ".agents" / "skills"),
         ),
     ]
+
+
+def _provider_options(values: Mapping[str, Any]) -> dict[str, Any]:
+    options: dict[str, Any] = {}
+    for config_key, provider_key in {
+        "litellm_callbacks": "callbacks",
+        "litellm_success_callbacks": "success_callback",
+        "litellm_failure_callbacks": "failure_callback",
+    }.items():
+        callbacks = _parse_callback_list(values.get(config_key))
+        if callbacks:
+            options[provider_key] = callbacks
+    return options
+
+
+def _parse_callback_list(value: object) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item for item in value.replace(",", " ").split() if item]
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item)]
+    raise ValueError("litellm callbacks must be a string or list")
 
 
 def parse_agent_skill_config(

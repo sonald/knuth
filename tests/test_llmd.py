@@ -19,7 +19,10 @@ from knuth_llmd import (
     InferenceConfig,
     LiteLLMInferenceClient,
 )
-from knuth_llmd.client import _import_litellm_preserving_knuth_env
+from knuth_llmd.client import (
+    _configure_litellm_callbacks_from_env,
+    _import_litellm_preserving_knuth_env,
+)
 
 
 class AsyncChunks:
@@ -73,6 +76,13 @@ class CapturingResponsesCompletion:
     async def __call__(self, **kwargs: object) -> AsyncChunks:
         self.kwargs = kwargs
         return AsyncChunks(self._chunks)
+
+
+class FakeLiteLLMModule:
+    def __init__(self) -> None:
+        self.callbacks: list[str] = []
+        self.success_callback: list[str] = []
+        self.failure_callback: list[str] = []
 
 
 class LiteLLMInferenceClientTests(unittest.TestCase):
@@ -336,6 +346,51 @@ class LiteLLMInferenceClientTests(unittest.TestCase):
         self.assertEqual(completed[0].tool_call.name, "read_file")
         self.assertEqual(completed[0].tool_call.arguments, {"path": "README.md"})
         self.assertEqual(completed[0].tool_call.raw["responses_call_id"], "call-1")
+
+    def test_chatgpt_provider_keeps_logging_when_litellm_callback_is_configured(self) -> None:
+        responses = CapturingResponsesCompletion(
+            [{"type": "response.output_text.delta", "delta": "ok"}]
+        )
+        client = LiteLLMInferenceClient(
+            model="chatgpt/gpt-5.4-mini",
+            responses_fn=responses,
+        )
+
+        async def collect():
+            return [
+                event
+                async for event in client.stream(
+                    messages=[InferenceMessage(role=InferenceRole.USER, content="hi")],
+                    tools=[],
+                    config=InferenceConfig(
+                        provider_options={"callbacks": ["langfuse_otel"]}
+                    ),
+                )
+            ]
+
+        anyio.run(collect)
+
+        kwargs = responses.kwargs or {}
+        self.assertEqual(kwargs["callbacks"], ["langfuse_otel"])
+        self.assertNotIn("no-log", kwargs)
+
+    def test_litellm_callbacks_can_be_configured_from_env(self) -> None:
+        fake_litellm = FakeLiteLLMModule()
+        with patch.dict(
+            os.environ,
+            {
+                "KNUTH_LITELLM_CALLBACKS": "langfuse_otel,opik",
+                "KNUTH_LITELLM_SUCCESS_CALLBACKS": "langfuse",
+                "KNUTH_LITELLM_FAILURE_CALLBACKS": "langfuse",
+            },
+            clear=True,
+        ):
+            _configure_litellm_callbacks_from_env(fake_litellm)
+            _configure_litellm_callbacks_from_env(fake_litellm)
+
+        self.assertEqual(fake_litellm.callbacks, ["langfuse_otel", "opik"])
+        self.assertEqual(fake_litellm.success_callback, ["langfuse"])
+        self.assertEqual(fake_litellm.failure_callback, ["langfuse"])
 
     def test_chatgpt_provider_reads_arguments_from_output_item_done(self) -> None:
         responses = CapturingResponsesCompletion(
