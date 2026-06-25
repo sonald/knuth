@@ -251,6 +251,8 @@ class StreamAccumulator:
             arguments = _get(raw_function, "arguments")
             if isinstance(arguments, str):
                 current["arguments_json"] += arguments
+            # raw is an accumulated view across tool-call chunks; Responses uses
+            # one event for call_id and a later event for arguments.
             current["raw"] = {**current["raw"], **_to_plain(raw_call)}
             if isinstance(name, str) or isinstance(arguments, str):
                 events.append(

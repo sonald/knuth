@@ -27,6 +27,9 @@ const backendManager = new BackendManager({
   app,
   appRoot: APP_ROOT,
   settingsStore,
+  onChatgptLogin: (login) => {
+    void shell.openExternal(login.url);
+  },
 });
 let backendReady = null;
 let debugWindow = null;

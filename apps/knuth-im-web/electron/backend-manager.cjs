@@ -121,13 +121,22 @@ function parseChatgptDeviceCode(text) {
 }
 
 class BackendManager {
-  constructor({ app, appRoot, logger = console, settingsStore = null }) {
+  constructor({
+    app,
+    appRoot,
+    logger = console,
+    settingsStore = null,
+    onChatgptLogin = null,
+  }) {
     this.app = app;
     this.appRoot = appRoot;
     this.logger = logger;
     this.settingsStore = settingsStore;
+    this.onChatgptLogin = onChatgptLogin;
     this.child = null;
     this.outputBuffer = "";
+    this.deviceCodeParseWarningLogged = false;
+    this.openedChatgptLoginKey = "";
     this.state = {
       status: "starting",
       baseUrl: process.env.NEXT_PUBLIC_KNUTH_AGUI_URL || DEFAULT_EXTERNAL_URL,
@@ -164,6 +173,9 @@ class BackendManager {
       };
       return this.state;
     }
+    this.outputBuffer = "";
+    this.deviceCodeParseWarningLogged = false;
+    this.openedChatgptLoginKey = "";
 
     const settings = this.resolveModelSettings();
     if (!settings.ready) {
@@ -333,12 +345,31 @@ class BackendManager {
     this.outputBuffer = `${this.outputBuffer}${text}`.slice(-2000);
     const login = parseChatgptDeviceCode(this.outputBuffer);
     if (login) {
+      const loginKey = `${login.url} ${login.code}`;
+      if (this.onChatgptLogin && this.openedChatgptLoginKey !== loginKey) {
+        this.openedChatgptLoginKey = loginKey;
+        try {
+          this.onChatgptLogin(login);
+        } catch (error) {
+          this.logger.warn(
+            `[knuth-im] Failed to open ChatGPT login URL: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+      }
       this.state = {
         ...this.state,
         status: "login_required",
         chatgptLogin: login,
         error: "ChatGPT login required",
       };
+    } else if (
+      !this.deviceCodeParseWarningLogged &&
+      /device code|auth\.openai\.com/i.test(this.outputBuffer)
+    ) {
+      this.deviceCodeParseWarningLogged = true;
+      this.logger.warn("[knuth-im] ChatGPT device-code output did not match parser");
     }
   }
 }
