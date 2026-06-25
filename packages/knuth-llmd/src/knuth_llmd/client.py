@@ -24,6 +24,7 @@ from knuth.core.events import (
     InferenceToolCallCompleted,
     InferenceToolCallDelta,
     InferenceToolCallStarted,
+    UsageInfo,
 )
 from knuth.core.messages import InferenceMessage, InferenceRole, ToolCall as CoreToolCall
 from knuth.core.types import ErrorInfo, KnuthModel
@@ -193,10 +194,17 @@ class StreamAccumulator:
         self.reasoning_parts: list[str] = []
         self.tool_calls: dict[int, dict[str, Any]] = {}
         self.finish_reason: str | None = None
+        self.usage: UsageInfo | None = None
         self._think = _ThinkTagSplitter()
 
     def feed_chunk(self, chunk: object) -> list[tuple[type, dict[str, Any]]]:
         events: list[tuple[type, dict[str, Any]]] = []
+        # OpenAI-compatible streaming with ``include_usage`` emits a trailing
+        # chunk whose ``choices`` is empty and whose ``usage`` carries the
+        # final token counts. Capture it before short-circuiting.
+        usage = _get(chunk, "usage")
+        if usage is not None:
+            self.usage = _coerce_usage(usage)
         choice = _first_choice(chunk)
         if choice is None:
             return events
@@ -426,6 +434,7 @@ class LiteLLMInferenceClient:
                 {
                     "finish_reason": accumulator.finish_reason,
                     "message": accumulator.to_message(),
+                    "usage": accumulator.usage,
                 },
             )
         except Exception as exc:
@@ -473,6 +482,10 @@ class LiteLLMInferenceClient:
                 "parallel_tool_calls": False,
             }
         )
+        if stream:
+            # OpenAI-compatible providers only emit a final usage chunk when
+            # the caller opts in. Without this, /usage shows "unavailable".
+            kwargs["stream_options"] = {"include_usage": True}
         if tools:
             kwargs["tools"] = list(tools)
             kwargs["tool_choice"] = "auto"
@@ -739,7 +752,16 @@ def _responses_event_to_completion_chunks(event: object) -> list[dict[str, Any]]
             }
         ]
     if event_type == "response.completed":
-        return [{"choices": [{"delta": {}, "finish_reason": "stop"}]}]
+        # Responses streaming attaches usage to the terminal event. Forward it
+        # as a trailing chunk so the same accumulator path captures it.
+        response = _get(event, "response") or {}
+        usage = _get(response, "usage")
+        chunks: list[dict[str, Any]] = [
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+        ]
+        if usage is not None:
+            chunks.append({"choices": [], "usage": _to_plain(usage)})
+        return chunks
     if event_type in {"response.failed", "response.incomplete"}:
         error = _get(event, "error") or _get(_get(event, "response") or {}, "error")
         raise RuntimeError(str(_to_plain(error or event)))
@@ -757,6 +779,47 @@ def _first_choice(response: object) -> object | None:
     if isinstance(choices, Sequence) and not isinstance(choices, str) and choices:
         return choices[0]
     return None
+
+
+def _coerce_int(value: object) -> int | None:
+    """Return ``value`` as int if it looks like a number; tolerate strings."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_usage(usage: object) -> UsageInfo | None:
+    """Normalize a LiteLLM/OpenAI usage payload into a :class:`UsageInfo`.
+
+    LiteLLM exposes ``prompt_tokens`` / ``completion_tokens`` (OpenAI shape) and
+    some providers add ``input_tokens`` / ``output_tokens``. Accept either."""
+    if usage is None:
+        return None
+    input_tokens = _coerce_int(
+        _get(usage, "input_tokens") or _get(usage, "prompt_tokens")
+    )
+    output_tokens = _coerce_int(
+        _get(usage, "output_tokens") or _get(usage, "completion_tokens")
+    )
+    total_tokens = _coerce_int(_get(usage, "total_tokens"))
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+    if input_tokens is None and output_tokens is None and total_tokens is None:
+        return None
+    return UsageInfo(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+    )
 
 
 def _string_or_none(value: object) -> str | None:

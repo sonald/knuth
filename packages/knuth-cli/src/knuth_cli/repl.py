@@ -367,6 +367,11 @@ async def _resume_existing_run(
     if status_fn is not None:
         try:
             status = await status_fn(run_id)
+        except KeyError:
+            # Surface an unknown run as a ledger error so the caller's
+            # existing handler renders it as a friendly message instead of
+            # letting the later ``runtime.resume()`` crash the task group.
+            raise LedgerError(f"unknown run: {run_id}") from None
         except Exception:
             status = None
     if status == RunStatus.INTERRUPTED:
@@ -660,7 +665,10 @@ async def _handle_slash(
             console.print(
                 Text(f"Cannot resume run {target_run_id}: {exc}", style="bold red")
             )
-            return target_run_id
+            # Resume failed — keep the previously-attached run as the
+            # session run, so a stray ``/resume <typo>`` cannot rebind
+            # subsequent ``/resume`` (no args) to a nonexistent id.
+            return session_run_id
         if result is not None:
             status = result.status
             console.print(

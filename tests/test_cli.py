@@ -710,6 +710,34 @@ class CliTests(unittest.TestCase):
         self.assertIn("real-ish: resumed", output.getvalue())
         self.assertIn("run run-2 · succeeded", output.getvalue())
 
+    def test_interactive_resume_unknown_run_prints_error_and_continues(self) -> None:
+        """`/resume <unknown>` must NOT crash the REPL — it must print a
+        friendly error and return to the prompt."""
+        output = io.StringIO()
+        input_stream = io.StringIO("/resume nope\n/exit\n")
+
+        class _UnknownRunRuntime(_StreamingFakeRuntime):
+            async def status(self, run_id: str):
+                raise KeyError(run_id)
+
+            async def pending_approvals(self, run_id=None):
+                raise KeyError(run_id)
+
+        async def runtime_factory() -> _UnknownRunRuntime:
+            return _UnknownRunRuntime()
+
+        with (
+            patch("sys.stdin", input_stream),
+            contextlib.redirect_stdout(output),
+        ):
+            exit_code = main(["run"], runtime_factory=runtime_factory)
+
+        text = output.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Cannot resume run nope", text)
+        self.assertNotIn("KeyError", text)
+        self.assertNotIn("Traceback", text)
+
     def test_unknown_leading_slash_is_sent_as_prompt(self) -> None:
         output = io.StringIO()
         input_stream = io.StringIO("/not-a-command explain this\n/exit\n")

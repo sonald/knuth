@@ -172,6 +172,55 @@ class LiteLLMInferenceClientTests(unittest.TestCase):
         self.assertEqual(kwargs["api_key"], "test-key")
         self.assertEqual(kwargs["parallel_tool_calls"], False)
         self.assertEqual(kwargs["tool_choice"], "auto")
+        # Streaming must opt-in to the trailing usage chunk so /usage can
+        # report token counts.
+        self.assertEqual(kwargs.get("stream_options"), {"include_usage": True})
+
+    def test_stream_captures_usage_from_trailing_chunk(self) -> None:
+        """OpenAI-style streaming emits a trailing chunk with empty choices
+        and a populated ``usage`` block. The accumulator forwards those tokens
+        to the final ``InferenceGenerationCompleted`` event."""
+        completion = CapturingStreamCompletion(
+            [
+                {"choices": [{"delta": {"content": "hi"}}]},
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                {
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 42,
+                        "completion_tokens": 7,
+                        "total_tokens": 49,
+                    },
+                },
+            ]
+        )
+        client = LiteLLMInferenceClient(
+            model="test-model",
+            base_url="https://example.test/v1",
+            api_key="test-key",
+            completion_fn=completion,
+        )
+
+        async def collect():
+            return [
+                event
+                async for event in client.stream(
+                    messages=[InferenceMessage(role=InferenceRole.USER, content="hi")],
+                    tools=[],
+                    config=InferenceConfig(run_id="run-1"),
+                )
+            ]
+
+        events = anyio.run(collect)
+        completed = [
+            event for event in events if isinstance(event, InferenceGenerationCompleted)
+        ]
+        self.assertEqual(len(completed), 1)
+        usage = completed[0].usage
+        self.assertIsNotNone(usage)
+        self.assertEqual(usage.input_tokens, 42)
+        self.assertEqual(usage.output_tokens, 7)
+        self.assertEqual(usage.total_tokens, 49)
 
     def test_chatgpt_provider_omits_api_credentials_and_token_limit(self) -> None:
         responses = CapturingResponsesCompletion(
